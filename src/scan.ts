@@ -65,48 +65,69 @@ export async function scan(opts: ScanOptions): Promise<ScanResult> {
     `Discover the application surface (pages, JS bundles, API endpoints, parameters) and identify UNAUTHENTICATED vulnerabilities first. ` +
     `Probe with http_request. Then report findings as the JSON array described in your instructions.`;
 
-  const result = await runner.run("recon", objective);
-  const findings = [];
-  for (const finding of result.findings) {
-    findings.push({ finding, verdict: await axiom.verify(finding as never) });
-  }
+  // Run the agent loop and finding-verification INSIDE a Langfuse root trace so
+  // every LLM turn (generation), tool call (span) and Axiom verdict (span) is
+  // captured as a child observation — the full end-to-end tree, one per run.
+  const tracer = opts.langfuse ? new LangfuseTracer(opts.langfuse) : null;
+  const findings: Array<{ finding: unknown; verdict: Awaited<ReturnType<Axiom["verify"]>> }> = [];
+
+  const doRun = async (rec?: import("./langfuse.js").SpanRecorder) => {
+    const result = await runner.run("recon", objective, rec);
+    for (const finding of result.findings) {
+      const verdict = await axiom.verify(finding as never);
+      findings.push({ finding, verdict });
+      await rec?.toolSpan("axiom:verify", {
+        input: finding,
+        output: { status: verdict.status, confidence: verdict.confidence, decided_by: verdict.decided_by, reason: verdict.reason },
+      });
+    }
+    rec?.setOutput({ finalText: result.finalText, findingsCount: findings.length });
+    return result;
+  };
+
+  const result = tracer
+    ? await tracer.traceTree(
+        {
+          name: "sahw-recon",
+          input: objective,
+          model: opts.model,
+          sessionId: opts.sessionId,
+          metadata: { inScopeUrls: opts.inScopeUrls },
+        },
+        (rec) => doRun(rec),
+      )
+    : await doRun();
 
   // Persist findings + endpoints to the Neo4j security fabric (canonical state).
+  // Non-fatal: a graph write failure must not lose findings or tracing.
   if (opts.neo4j) {
-    const fabric = new SecurityFabric(opts.neo4j);
-    for (const { finding, verdict } of findings) {
-      const f = finding as { finding_id?: string; title?: string; vuln_class?: string; affected?: { url?: string } };
-      const fid = f.finding_id ?? `sahw-${Math.random().toString(36).slice(2, 8)}`;
-      const url = f.affected?.url ?? "";
-      await fabric.upsertVuln({
-        vuln_id: fid,
-        vuln_class: f.vuln_class ?? "",
-        title: f.title ?? "",
-        verdict: verdict.status,
-        confidence: verdict.confidence,
-        decided_by: verdict.decided_by,
-      });
-      if (url) {
-        await fabric.upsertAsset({ asset_key: url, type: "endpoint", url });
-        await fabric.linkAssetHasVuln(url, fid);
+    try {
+      const fabric = new SecurityFabric(opts.neo4j);
+      for (const { finding, verdict } of findings) {
+        const f = finding as { finding_id?: string; title?: string; vuln_class?: string; affected?: { url?: string } };
+        const fid = f.finding_id ?? `sahw-${Math.random().toString(36).slice(2, 8)}`;
+        const url = f.affected?.url ?? "";
+        await fabric.upsertVuln({
+          vuln_id: fid,
+          vuln_class: f.vuln_class ?? "",
+          title: f.title ?? "",
+          verdict: verdict.status,
+          confidence: verdict.confidence,
+          decided_by: verdict.decided_by,
+        });
+        if (url) {
+          await fabric.upsertAsset({ asset_key: url, type: "endpoint", url });
+          await fabric.linkAssetHasVuln(url, fid);
+        }
       }
+      await fabric.close();
+    } catch (e) {
+      console.error(`[neo4j] write failed (non-fatal): ${(e as Error).message}`);
     }
-    await fabric.close();
   }
 
-  if (opts.langfuse) {
-    const tracer = new LangfuseTracer(opts.langfuse);
-    await tracer.trace({
-      name: "sahw-recon",
-      input: objective,
-      output: result.finalText,
-      model: opts.model,
-      cost: result.costUsd,
-      tokens: { input: result.tokens.input, output: result.tokens.output },
-      metadata: { inScopeUrls: opts.inScopeUrls, findingsCount: findings.length },
-      sessionId: opts.sessionId,
-    });
-  }
+  // Flush the trace tree (non-fatal — export failure must not lose findings).
+  if (tracer) await tracer.flush();
 
   return {
     objective,

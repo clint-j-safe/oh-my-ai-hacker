@@ -13,4 +13,4 @@ COPY .opencode ./.opencode
 COPY skills ./skills
 
 ENV NODE_ENV=production
-CMD ["node", "dist/cli.js"]
+CMD ["node", "dist/scan-cli.js"]

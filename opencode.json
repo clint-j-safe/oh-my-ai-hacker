@@ -1,6 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
+  "experimental": {
+    "openTelemetry": true
+  },
+
   "provider": {
     "openrouter": {
       "npm": "@ai-sdk/openai-compatible",
@@ -33,9 +37,10 @@
     "mcp-oast_*": "allow"
   },
 
-  "plugin": [
+  "plugins": [
     ".opencode/plugin/tether.js",
     ".opencode/plugin/ledger.js",
-    "opencode-skills"
+    "opencode-skills",
+    "@langfuse/opencode-observability-plugin@latest"
   ]
 }

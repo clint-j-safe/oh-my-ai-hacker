@@ -21,6 +21,13 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // Unique Langfuse session per run: engagement ref + a run stamp, so each scan
+  // is its own session (SAHW_RUN_ID overrides for reproducible/CI runs).
+  const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const runId = process.env.SAHW_RUN_ID || `${runStamp}-${Math.random().toString(36).slice(2, 6)}`;
+  const sessionId = cfg.authorization.ref ? `${cfg.authorization.ref}/${runId}` : `run/${runId}`;
+  console.log(`[sahw] run session: ${sessionId}`);
+
   const res = await scan({
     apiKey: cfg.model.apiKey,
     model: cfg.model.model,
@@ -33,7 +40,7 @@ async function main(): Promise<void> {
     baseUrl: cfg.model.baseUrl,
     workspaceRoot: cfg.tether.workspaceRoot,
     judgeThreshold: cfg.axiom.judgeThreshold,
-    sessionId: cfg.authorization.ref || undefined,
+    sessionId,
   });
 
   console.log("\n=== FINAL REPORT ===\n" + res.finalText);

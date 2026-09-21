@@ -7,6 +7,7 @@
  */
 
 import type { LlmMessage, OpenRouterLlm, ToolDef } from "./llm.js";
+import type { SpanRecorder } from "./langfuse.js";
 
 export interface AgentLoopOptions {
   llm: OpenRouterLlm;
@@ -17,6 +18,8 @@ export interface AgentLoopOptions {
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
   maxTurns?: number;
   temperature?: number;
+  /** Optional Langfuse recorder — emits a generation per turn and a span per tool call. */
+  rec?: SpanRecorder;
 }
 
 export interface AgentLoopResult {
@@ -41,6 +44,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let toolCalls = 0;
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    const promptSnapshot = messages.map((m) => ({ role: m.role, content: m.content, name: m.name, tool_calls: m.tool_calls }));
     const resp = await opts.llm.complete({
       model: opts.model,
       messages,
@@ -51,6 +55,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     promptTokens += resp.promptTokens;
     completionTokens += resp.completionTokens;
 
+    await opts.rec?.generation(`turn-${turn}`, {
+      input: promptSnapshot,
+      output: { content: resp.content, tool_calls: resp.toolCalls, finish_reason: resp.finishReason },
+      model: opts.model,
+      tokens: { input: resp.promptTokens, output: resp.completionTokens },
+      metadata: { turn, toolCallCount: resp.toolCalls.length },
+    });
+
     if (resp.toolCalls.length === 0) {
       return { finalText: resp.content, cost, promptTokens, completionTokens, turns: turn + 1, toolCalls };
     }
@@ -58,22 +70,38 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     messages.push({ role: "assistant", content: resp.content, tool_calls: resp.toolCalls });
     for (const tc of resp.toolCalls) {
       let result: string;
+      let parsedArgs: unknown;
       try {
         const args = JSON.parse(tc.function.arguments || "{}");
+        parsedArgs = args;
         result = await opts.executeTool(tc.function.name, args);
       } catch (e) {
         result = `ERROR: ${(e as Error).message}`;
+        parsedArgs = tc.function.arguments;
       }
       toolCalls++;
+      await opts.rec?.toolSpan(`tool:${tc.function.name}`, {
+        input: parsedArgs,
+        output: result.slice(0, 16_000),
+        metadata: { turn, toolCallId: tc.id },
+      });
       messages.push({ role: "tool", content: result.slice(0, 16_000), tool_call_id: tc.id, name: tc.function.name });
     }
   }
 
   // Turn budget exhausted — force a final synthesis without tools.
+  const finalMessages: LlmMessage[] = [...messages, { role: "user", content: "Turn budget exhausted. Provide your final findings now as a concise report." }];
   const final = await opts.llm.complete({
     model: opts.model,
-    messages: [...messages, { role: "user", content: "Turn budget exhausted. Provide your final findings now as a concise report." }],
+    messages: finalMessages,
     tools: [],
+  });
+  await opts.rec?.generation("final-synthesis", {
+    input: finalMessages.map((m) => ({ role: m.role, content: m.content, name: m.name, tool_calls: m.tool_calls })),
+    output: { content: final.content, finish_reason: final.finishReason },
+    model: opts.model,
+    tokens: { input: final.promptTokens, output: final.completionTokens },
+    metadata: { phase: "final-synthesis" },
   });
   return {
     finalText: final.content,

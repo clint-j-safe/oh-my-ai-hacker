@@ -71,7 +71,14 @@ export class SecurityFabric {
     await this.driver.run(
       `MERGE (a:Asset {asset_key: $asset_key})
        SET a.type = $type, a.host = $host, a.port = $port, a.url = $url, a.tech = $tech`,
-      a as unknown as Record<string, unknown>,
+      {
+        asset_key: a.asset_key,
+        type: a.type,
+        host: a.host ?? null,
+        port: a.port ?? null,
+        url: a.url ?? null,
+        tech: a.tech ?? null,
+      },
     );
   }
 
@@ -81,7 +88,16 @@ export class SecurityFabric {
        SET v.vuln_class = $vuln_class, v.title = $title, v.severity = $severity,
            v.verdict = $verdict, v.confidence = $confidence,
            v.decided_by = $decided_by, v.cwe = $cwe`,
-      v as unknown as Record<string, unknown>,
+      {
+        vuln_id: v.vuln_id,
+        vuln_class: v.vuln_class,
+        title: v.title ?? null,
+        severity: v.severity ?? null,
+        verdict: v.verdict,
+        confidence: v.confidence,
+        decided_by: v.decided_by ?? null,
+        cwe: v.cwe ?? null,
+      },
     );
   }
 
@@ -90,7 +106,14 @@ export class SecurityFabric {
       `MERGE (id:Identity {identity_id: $identity_id})
        SET id.type = $type, id.userid = $userid, id.name = $name,
            id.role = $role, id.compromised = $compromised`,
-      i as unknown as Record<string, unknown>,
+      {
+        identity_id: i.identity_id,
+        type: i.type,
+        userid: i.userid ?? null,
+        name: i.name ?? null,
+        role: i.role ?? null,
+        compromised: i.compromised ?? null,
+      },
     );
   }
 

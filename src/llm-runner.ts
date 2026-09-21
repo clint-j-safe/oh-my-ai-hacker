@@ -15,6 +15,7 @@ import { Scope } from "./scope.js";
 import { httpRequest } from "./http.js";
 import { parseFindings } from "./sdk-runner.js";
 import type { AgentResult } from "./orchestrator.js";
+import type { SpanRecorder } from "./langfuse.js";
 
 export interface LlmRunnerOptions {
   apiKey: string;
@@ -100,7 +101,7 @@ export class LlmRunner {
     return `UNKNOWN TOOL: ${name}`;
   }
 
-  async run(agent: string, objective: string): Promise<AgentResult & { finalText: string }> {
+  async run(agent: string, objective: string, rec?: SpanRecorder): Promise<AgentResult & { finalText: string }> {
     const result = await runAgentLoop({
       llm: this.llm,
       model: this.model,
@@ -110,6 +111,7 @@ export class LlmRunner {
       executeTool: (n, a) => this.executeTool(n, a),
       maxTurns: this.maxTurns,
       temperature: this.temperature,
+      ...(rec ? { rec } : {}),
     });
 
     const findings = parseFindings([{ type: "text", text: result.finalText }]);
