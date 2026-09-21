@@ -29,3 +29,5 @@
 - [ ] Task 10: Deploy to root@143.244.130.163
 Task 1: complete (commits fdad0a8..HEAD, tests: npx vitest run src/scope.test.ts -> 13/13 pass)
 Task 2: complete (tests: npx vitest run src/tether.test.ts -> 22/22 pass)
+Task 3: complete (tests: npx vitest run src/axiom.test.ts -> 13/13 pass)
+  Ruling: body_contains "marker in both exploit+control" -> FALSE_POSITIVE (was NEEDS_REVIEW). Differential test failing disproves the claim. jev cross-check agreed (0.91). Cost if wrong: a real finding whose control was mis-built would be auto-dismissed; mitigated by exploit-constructor emitting a proper control.
