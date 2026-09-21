@@ -28,3 +28,4 @@
 - [ ] Task 9: OOB + reverse-shell listener
 - [ ] Task 10: Deploy to root@143.244.130.163
 Task 1: complete (commits fdad0a8..HEAD, tests: npx vitest run src/scope.test.ts -> 13/13 pass)
+Task 2: complete (tests: npx vitest run src/tether.test.ts -> 22/22 pass)
