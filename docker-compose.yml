@@ -1,0 +1,57 @@
+# SAFE AI Hacker — deployment compose.
+# Control plane + OOB listener + disposable per-tool Alpine containers.
+# External infra (Langfuse, Redis, Neo4j, ClickHouse) already runs on the host
+# and is reached over the shared `sahw` network / host ports.
+
+services:
+  control-plane:
+    build: .
+    env_file:
+      - .env
+    environment:
+      OPENCODE_URL: http://engine:4096
+      SAHW_WORKSPACE: /tmp/sahw-sandbox
+    depends_on:
+      - oob
+    networks: [sahw]
+
+  oob:
+    build: ./docker/oob
+    environment:
+      OOB_ANSWER_IP: ${OOB_ANSWER_IP:-127.0.0.1}
+      OOB_DNS_PORT: 53
+      OOB_HTTP_PORT: 80
+      OOB_SHELL_PORT: 4444
+    ports:
+      - "${OOB_DNS_HOST_PORT:-53}:53/udp"
+      - "${OOB_DNS_HOST_PORT:-53}:53/tcp"
+      - "${OOB_HTTP_HOST_PORT:-8080}:80"
+      - "${OOB_SHELL_HOST_PORT:-4444}:4444"
+    networks: [sahw]
+
+  # Disposable per-tool Alpine containers (build: docker compose --profile tools build).
+  # Invoked by the control plane via `docker run --rm --network sahw tools-<name> ...`.
+  tools-curl:
+    build: ./docker/tools/curl
+    profiles: [tools]
+    networks: [sahw]
+  tools-nmap:
+    build: ./docker/tools/nmap
+    profiles: [tools]
+    networks: [sahw]
+  tools-ffuf:
+    build: ./docker/tools/ffuf
+    profiles: [tools]
+    networks: [sahw]
+  tools-dig:
+    build: ./docker/tools/dig
+    profiles: [tools]
+    networks: [sahw]
+  tools-whatweb:
+    build: ./docker/tools/whatweb
+    profiles: [tools]
+    networks: [sahw]
+
+networks:
+  sahw:
+    name: sahw
