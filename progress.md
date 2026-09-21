@@ -39,3 +39,4 @@ Task 6b: Ruling — SDK/server version mismatch. Installed `opencode` CLI v2.0.1
 Task 7: complete (tests: 76/76). opencode.json + .opencode/agents/* (black-box clean) + tether/ledger plugins (tether plugin verified end-to-end: deny/allow/escalate) + runEngagement contract.
 Task 9: complete (tests: 88/88). OOB/OAST listener (src/oob.ts + src/dns.ts + src/oob-server.ts): DNS UDP/TCP (A-record + canary log), HTTP (path/?c= canary), TCP connect-back. Verified LIVE: dig -> 127.0.0.1, HTTP + TCP callbacks logged.
 Task 8: complete. Docker: control-plane Dockerfile, docker/oob Dockerfile, per-tool Alpine images (curl/nmap/ffuf/dig/whatweb), docker-compose.yml, mcp stubs, CLI (dry-run verified).
+Task 10 (partial): OOB listener DEPLOYED live on root@143.244.130.163 (container sahw-oob; DNS 5353->53, HTTP 80, shell 4445->4444). Verified DNS/HTTP/TCP callbacks. Control-plane→engine wiring deferred (SDK/server version mismatch; documented in DEPLOYMENT.md).
