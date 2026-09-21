@@ -33,6 +33,7 @@ async function main(): Promise<void> {
     baseUrl: cfg.model.baseUrl,
     workspaceRoot: cfg.tether.workspaceRoot,
     judgeThreshold: cfg.axiom.judgeThreshold,
+    sessionId: cfg.authorization.ref || undefined,
   });
 
   console.log("\n=== FINAL REPORT ===\n" + res.finalText);

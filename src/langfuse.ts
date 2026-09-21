@@ -24,6 +24,8 @@ export interface TraceInput {
   cost?: number;
   tokens?: { input: number; output: number; reasoning?: number };
   metadata?: Record<string, unknown>;
+  sessionId?: string; // groups traces into a Langfuse session
+  userId?: string;
 }
 
 interface OtlpAttribute {
@@ -57,6 +59,8 @@ export class LangfuseTracer {
       { key: "langfuse.trace.name", value: { stringValue: input.name } },
       { key: "langfuse.observation.type", value: { stringValue: "generation" } },
     ];
+    if (input.sessionId) attributes.push({ key: "langfuse.session.id", value: { stringValue: input.sessionId } });
+    if (input.userId) attributes.push({ key: "langfuse.user.id", value: { stringValue: input.userId } });
     if (input.input !== undefined) attributes.push({ key: "langfuse.observation.input", value: { stringValue: toJson(input.input) } });
     if (input.output !== undefined) attributes.push({ key: "langfuse.observation.output", value: { stringValue: toJson(input.output) } });
     if (input.model) attributes.push({ key: "gen_ai.response.model", value: { stringValue: input.model } });

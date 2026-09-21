@@ -28,6 +28,7 @@ export interface ScanOptions {
   model: string;
   judgeModel?: string;
   inScopeUrls: string[];
+  sessionId?: string; // Langfuse session grouping (engagement id)
   langfuse?: { host: string; publicKey: string; secretKey: string };
   maxTurns?: number;
   temperature?: number;
@@ -103,6 +104,7 @@ export async function scan(opts: ScanOptions): Promise<ScanResult> {
       cost: result.costUsd,
       tokens: { input: result.tokens.input, output: result.tokens.output },
       metadata: { inScopeUrls: opts.inScopeUrls, findingsCount: findings.length },
+      sessionId: opts.sessionId,
     });
   }
 
