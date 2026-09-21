@@ -95,7 +95,7 @@ export class Orchestrator {
       }
 
       for (const finding of result.findings) {
-        findings.push({ finding, verdict: this.axiom.verify(finding) });
+        findings.push({ finding, verdict: await this.axiom.verify(finding) });
       }
 
       // Stop 3: no-progress (stall) reported by the phase.

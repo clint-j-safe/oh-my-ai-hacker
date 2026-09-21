@@ -16,7 +16,8 @@
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.18.31"
+    "@opencode-ai/sdk": "^1.18.31",
+    "neo4j-driver": "^6.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

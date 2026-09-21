@@ -1,12 +1,15 @@
 /**
- * Axiom — the deterministic validation core ("AI Hacker Axiom").
+ * Axiom — the validation core ("AI Hacker Axiom").
  *
- * Decides whether a result counts as a finding by replaying the finding's
- * invariant against verbatim evidence. Pure deterministic code. A configurable
- * judge model is used only for fuzzy calls (severity band), never to decide the
- * invariant. Below the confidence threshold the verdict is NEEDS_REVIEW, handed
- * to the adjudicator (or a human). (jev is not ingested into the framework.)
+ * Deterministic invariant replay runs first (fast, exact). For anything that
+ * is not a clean deterministic CONFIRMED, an autonomous LLM judge re-evaluates
+ * the verbatim exploit/control evidence. Strict false-positive elimination:
+ * a deterministic no-differential veto can never be overridden, the judge's
+ * CONFIRMED requires confidence >= judgeThreshold, and ambiguity falls to
+ * NEEDS_REVIEW. (jev is not ingested into the framework.)
  */
+
+import type { Judge } from "./judge.js";
 
 export type InvariantType =
   | "body_contains"
@@ -151,25 +154,32 @@ function replay(invariant: Invariant, evidence: Evidence): Replay {
 
 export class Axiom {
   readonly confidenceThreshold: number;
+  readonly judgeThreshold: number;
+  private readonly judge?: Judge;
 
-  constructor(opts: { confidenceThreshold?: number } = {}) {
+  constructor(opts: { confidenceThreshold?: number; judgeThreshold?: number; judge?: Judge } = {}) {
     this.confidenceThreshold = opts.confidenceThreshold ?? 0.75;
+    this.judgeThreshold = opts.judgeThreshold ?? 0.8;
+    this.judge = opts.judge;
   }
 
-  verify(input: AxiomInput): AxiomVerdict {
+  async verify(input: AxiomInput): Promise<AxiomVerdict> {
     const r = replay(input.invariant, input.evidence);
 
-    if (r.confidence < this.confidenceThreshold) {
+    // Hard deterministic false-positive veto (cannot be overridden): the
+    // marker appears in BOTH exploit and control — no differential.
+    if (r.reason.startsWith("marker present in control too")) {
       return {
-        status: "NEEDS_REVIEW",
-        decided_by: "adjudicator_escalation",
-        invariant_violated: r.violated,
+        status: "FALSE_POSITIVE",
+        decided_by: "axiom_deterministic",
+        invariant_violated: false,
         confidence: r.confidence,
-        reason: `${r.reason} (below confidence threshold ${this.confidenceThreshold})`,
+        reason: r.reason,
       };
     }
 
-    if (r.violated) {
+    // Clean deterministic CONFIRMED (fast path, no judge needed).
+    if (r.violated && r.confidence >= this.confidenceThreshold) {
       return {
         status: "CONFIRMED",
         decided_by: "axiom_deterministic",
@@ -179,12 +189,52 @@ export class Axiom {
       };
     }
 
+    // Autonomous judge path — re-evaluates prose/ambiguous evidence.
+    if (this.judge) {
+      const j = await this.judge.judge(input);
+      if (j.verdict === "CONFIRMED" && j.confidence >= this.judgeThreshold) {
+        return {
+          status: "CONFIRMED",
+          decided_by: "axiom_open_model",
+          invariant_violated: true,
+          confidence: j.confidence,
+          reason: j.reasoning,
+        };
+      }
+      if (j.verdict === "FALSE_POSITIVE") {
+        return {
+          status: "FALSE_POSITIVE",
+          decided_by: "axiom_open_model",
+          invariant_violated: false,
+          confidence: j.confidence,
+          reason: j.reasoning,
+        };
+      }
+      return {
+        status: "NEEDS_REVIEW",
+        decided_by: "adjudicator_escalation",
+        invariant_violated: j.invariant_violated,
+        confidence: j.confidence,
+        reason: j.reasoning || "judge uncertain",
+      };
+    }
+
+    // Deterministic-only fallback.
+    if (r.confidence >= this.confidenceThreshold && !r.violated) {
+      return {
+        status: "FALSE_POSITIVE",
+        decided_by: "axiom_deterministic",
+        invariant_violated: false,
+        confidence: r.confidence,
+        reason: r.reason,
+      };
+    }
     return {
-      status: "FALSE_POSITIVE",
-      decided_by: "axiom_deterministic",
-      invariant_violated: false,
+      status: "NEEDS_REVIEW",
+      decided_by: "adjudicator_escalation",
+      invariant_violated: r.violated,
       confidence: r.confidence,
-      reason: r.reason,
+      reason: `${r.reason} (below confidence threshold ${this.confidenceThreshold})`,
     };
   }
 }

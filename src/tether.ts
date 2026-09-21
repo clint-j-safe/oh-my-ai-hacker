@@ -33,24 +33,18 @@ export interface TetherOptions {
   authorizedTiers?: ImpactTier[]; // tiers the operator has authorized (e.g. via Ed25519 token)
 }
 
-const DEFAULT_AUTHORIZED: ImpactTier[] = ["read", "probe", "state_change"];
+const DEFAULT_AUTHORIZED: ImpactTier[] = ["read", "probe", "state_change", "shell"];
 
 const URL_RE = /https?:\/\/[^\s'"`;&|)]+/g;
 
-/** Deny-list of destructive / persistence command patterns (conservative). */
+/** Deny-list: DoS / destructive-to-availability only. Persistence, reverse/forward shells, and pivoting are authorized red-team actions (no DoS). */
 const DESTRUCTIVE_RULES: { re: RegExp; label: string }[] = [
   { re: /\bdd\s+[^;&|]*\bof=\/dev\//, label: "dd write to block device" },
   { re: /\bmkfs\S*\s+\/dev\//, label: "mkfs on block device" },
   { re: /\bwipefs\b/, label: "wipefs" },
   { re: /(^|[;&|]\s*)(shutdown|reboot|halt|poweroff)(\s|$)/, label: "system shutdown/reboot" },
   { re: /:\s*\(\s*\)\s*\{/, label: "fork bomb" },
-  { re: /\|\s*(ba)?sh\b/, label: "pipe to shell" },
-];
-
-const PERSISTENCE_RULES: { re: RegExp; label: string }[] = [
-  { re: />>\s*[^;&|]*(?:authorized_keys|\/etc\/cron\w*|crontab|\.bashrc|\.profile|\.zshrc|systemd)/, label: "persistence append" },
-  { re: /tee\s+-a\s*[^;&|]*(?:authorized_keys|\/etc\/cron\w*|crontab|\.bashrc|\.profile|\.zshrc|systemd)/, label: "persistence tee -a" },
-  { re: /\bauthorized_keys\b[^;&|]*(?:>>|tee)/, label: "authorized_keys write" },
+  { re: /(^|[;&|]\s*)iptables\s+-F\b/, label: "flush firewall (network DoS)" },
 ];
 
 function destructiveRm(command: string, workspaceRoot: string): boolean {
@@ -98,16 +92,11 @@ export class Tether {
       };
     }
 
-    // Destructive-command AST check (bash only).
+    // DoS / destructive-command AST check (bash only).
     if (action.tool === "bash" && action.command) {
       for (const rule of DESTRUCTIVE_RULES) {
         if (rule.re.test(action.command)) {
-          return { decision: "deny", reason: `destructive command (${rule.label})`, tier };
-        }
-      }
-      for (const rule of PERSISTENCE_RULES) {
-        if (rule.re.test(action.command)) {
-          return { decision: "deny", reason: `persistence action (${rule.label})`, tier };
+          return { decision: "deny", reason: `DoS / destructive command (${rule.label})`, tier };
         }
       }
       if (destructiveRm(action.command, this.workspaceRoot)) {
