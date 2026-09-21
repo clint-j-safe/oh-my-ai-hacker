@@ -1,9 +1,14 @@
 /**
- * Langfuse tracer — sends traces + generation observations to a running
- * Langfuse instance (legacy /api/public/ingestion endpoint, HTTP Basic auth).
- * This is "The Ledger" observability plane: every agent run becomes a trace
- * with cost/tokens, linking provenance back to the finding.
+ * Langfuse tracer — sends traces as OpenTelemetry (OTLP/HTTP) to Langfuse v4.
+ *
+ * The legacy /api/public/ingestion endpoint is deprecated under the v4
+ * data model. The updated method is the OTel endpoint with the
+ * `x-langfuse-ingestion-version: 4` header (writes directly, no dual-write
+ * staging delay). Langfuse maps `langfuse.*` and `gen_ai.*` attributes to
+ * traces/observations/generations.
  */
+
+import { randomBytes } from "node:crypto";
 
 export interface LangfuseOptions {
   host: string; // e.g. http://143.244.130.163:3000
@@ -21,8 +26,17 @@ export interface TraceInput {
   metadata?: Record<string, unknown>;
 }
 
-function uid(): string {
-  return (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`) as string;
+interface OtlpAttribute {
+  key: string;
+  value: { stringValue?: string; intValue?: number };
+}
+
+function hexBytes(n: number): string {
+  return randomBytes(n).toString("hex");
+}
+
+function toJson(v: unknown): string {
+  return typeof v === "string" ? v : JSON.stringify(v);
 }
 
 export class LangfuseTracer {
@@ -35,57 +49,62 @@ export class LangfuseTracer {
   }
 
   async trace(input: TraceInput): Promise<void> {
-    const traceId = uid();
-    const obsId = uid();
-    const now = new Date().toISOString();
+    const traceId = hexBytes(16);
+    const spanId = hexBytes(8);
+    const start = Date.now() * 1_000_000;
 
-    const batch = [
-      {
-        id: traceId,
-        type: "trace-create",
-        timestamp: now,
-        body: {
-          name: input.name,
-          input: input.input,
-          output: input.output,
-          metadata: input.metadata,
-        },
-      },
-      {
-        id: obsId,
-        type: "observation-create",
-        timestamp: now,
-        body: {
-          traceId,
-          name: `${input.name} (generation)`,
-          type: "GENERATION",
-          model: input.model,
-          input: input.input,
-          output: input.output,
-          usage: input.tokens
-            ? { input: input.tokens.input, output: input.tokens.output, ...(input.tokens.reasoning ? { reasoning: input.tokens.reasoning } : {}) }
-            : undefined,
-          metadata: { ...(input.metadata ?? {}), cost: input.cost },
-        },
-      },
+    const attributes: OtlpAttribute[] = [
+      { key: "langfuse.trace.name", value: { stringValue: input.name } },
+      { key: "langfuse.observation.type", value: { stringValue: "generation" } },
     ];
+    if (input.input !== undefined) attributes.push({ key: "langfuse.observation.input", value: { stringValue: toJson(input.input) } });
+    if (input.output !== undefined) attributes.push({ key: "langfuse.observation.output", value: { stringValue: toJson(input.output) } });
+    if (input.model) attributes.push({ key: "gen_ai.response.model", value: { stringValue: input.model } });
+    if (input.tokens) {
+      attributes.push({ key: "gen_ai.usage.input_tokens", value: { intValue: input.tokens.input } });
+      attributes.push({ key: "gen_ai.usage.output_tokens", value: { intValue: input.tokens.output } });
+    }
+    if (input.cost !== undefined) attributes.push({ key: "langfuse.trace.metadata.cost", value: { stringValue: String(input.cost) } });
+    for (const [k, v] of Object.entries(input.metadata ?? {})) {
+      attributes.push({ key: `langfuse.trace.metadata.${k}`, value: { stringValue: toJson(v) } });
+    }
+
+    const body = {
+      resourceSpans: [
+        {
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  traceId,
+                  spanId,
+                  name: input.name,
+                  startTimeUnixNano: start,
+                  endTimeUnixNano: start + 1_000_000,
+                  attributes,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
 
     try {
-      const res = await fetch(`${this.host}/api/public/ingestion`, {
+      const res = await fetch(`${this.host}/api/public/otel/v1/traces`, {
         method: "POST",
-        headers: { "authorization": this.auth, "content-type": "application/json" },
-        body: JSON.stringify({ batch }),
+        headers: {
+          authorization: this.auth,
+          "content-type": "application/json",
+          "x-langfuse-ingestion-version": "4",
+        },
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
-        console.error(`[langfuse] ingest ${res.status}: ${(await res.text()).slice(0, 200)}`);
-        return;
-      }
-      const body = (await res.json().catch(() => null)) as { errors?: unknown[] } | null;
-      if (body?.errors?.length) {
-        console.error(`[langfuse] ingest batch errors: ${JSON.stringify(body.errors).slice(0, 400)}`);
+        console.error(`[langfuse] otel ingest ${res.status}: ${(await res.text()).slice(0, 300)}`);
       }
     } catch (e) {
-      console.error(`[langfuse] ingest failed: ${(e as Error).message}`);
+      console.error(`[langfuse] otel ingest failed: ${(e as Error).message}`);
     }
   }
 }
