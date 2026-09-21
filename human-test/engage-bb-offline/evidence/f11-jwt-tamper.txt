@@ -1,0 +1,2 @@
+HTTP 200
+{"status":"Failed","status_code":"ERRO06","message":"Session is invalid","timestamp":1789883990,"data":{}}

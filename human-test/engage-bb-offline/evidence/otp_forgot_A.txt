@@ -1,0 +1,2 @@
+HTTP 200 POST /api/password/forgot
+{"status":"Success","status_code":"OTP001","message":"OTP Generated Successfully","timestamp":1789881867,"data":{"response":"RpLahE4uhEGDBlkEFz\/QNg=="}}

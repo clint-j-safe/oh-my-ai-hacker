@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "waf-evasion-mastery artifact",
+  "type": "object",
+  "required": ["bypass_successful", "effective_encoding"],
+  "additionalProperties": true,
+  "properties": {
+    "bypass_successful": { "type": "boolean" },
+    "effective_encoding": { "type": "string" },
+    "mutated_payload": { "type": "string" },
+    "registry_spill_id": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "waf": { "type": "string" },
+        "mode": { "enum": ["live", "dry_run", "error"] },
+        "in_scope": { "type": "boolean" },
+        "requests_sent": { "type": "integer" },
+        "mutation_budget": { "type": "integer" },
+        "candidates_generated": { "type": "integer" },
+        "candidates_spill_id": { "type": "string" },
+        "credential_hash": { "type": "string" },
+        "canary_enforced": { "type": "boolean" },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "encoding": { "type": "string" },
+              "sent": { "type": "boolean" },
+              "status": { "type": "integer" },
+              "blocked": { "type": "boolean" },
+              "chunked": { "type": "boolean" },
+              "waf_now": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

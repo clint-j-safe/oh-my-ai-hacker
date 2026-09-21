@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "poc-hardening-self-verification artifact",
+  "type": "object",
+  "required": ["verdict", "run1_hash", "run2_hash"],
+  "additionalProperties": true,
+  "properties": {
+    "verdict": { "enum": ["reproduced", "flaky", "regressed", "error"] },
+    "run1_hash": { "type": "string" },
+    "run2_hash": { "type": "string" },
+    "diff_summary": { "type": "string" },
+    "logs_spill_id": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "language": { "type": "string" },
+        "expected_output_hash": { "type": "string" },
+        "matches_expected": { "type": "boolean" },
+        "stable": { "type": "boolean" },
+        "sandbox": { "type": "string" },
+        "safety": {
+          "type": "object",
+          "properties": {
+            "revetted_before_run": { "type": "boolean" },
+            "rlimits_applied": { "type": "boolean" },
+            "env_scrubbed": { "type": "boolean" },
+            "network_none": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

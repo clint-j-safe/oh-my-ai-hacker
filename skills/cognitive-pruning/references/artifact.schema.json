@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cognitive-pruning artifact",
+  "type": "object",
+  "required": ["pruned_hypotheses", "killed_hypotheses", "folded_memory", "context_savings_estimate"],
+  "additionalProperties": true,
+  "properties": {
+    "pruned_hypotheses": {
+      "type": "array",
+      "description": "Hypotheses that survived pruning. Full context preserved.",
+      "items": {
+        "type": "object",
+        "required": ["id", "claim", "evidence_for", "evidence_against", "next_step"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "claim": { "type": "string" },
+          "evidence_for": { "type": "integer" },
+          "evidence_against": { "type": "integer" },
+          "cost_tokens": { "type": "integer" },
+          "survival_score": { "type": "number" },
+          "next_step": { "type": "string" }
+        }
+      }
+    },
+    "killed_hypotheses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kill_reason"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "claim": { "type": "string" },
+          "kill_reason": { "type": "string" },
+          "tokens_saved": { "type": "integer" },
+          "survival_score": { "type": "number" }
+        }
+      }
+    },
+    "folded_memory": {
+      "type": "array",
+      "description": "Dense paragraphs (<50 tokens each) summarizing closed threads.",
+      "items": { "type": "string" }
+    },
+    "context_savings_estimate": {
+      "type": "integer",
+      "description": "Estimated tokens saved by this pruning pass."
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "trigger": { "type": "string" },
+        "target_interaction": { "type": "string" },
+        "source": { "enum": ["input", "neo4j"] },
+        "kill_threshold": { "type": "number" },
+        "fold_max_tokens": { "type": "integer" },
+        "sends_traffic": { "type": "boolean" },
+        "counts": { "type": "object" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

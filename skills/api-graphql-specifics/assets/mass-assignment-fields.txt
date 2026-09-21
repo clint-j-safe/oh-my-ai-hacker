@@ -1,0 +1,34 @@
+# mass-assignment-fields.txt
+# Privilege/state fields commonly vulnerable to mass assignment (over-posting).
+# The skill adds these to POST/PUT bodies (only under mutation authorization) to
+# test whether the server binds fields it should not. Values are chosen to be
+# unambiguous-but-benign proof (e.g. role=admin) so acceptance is detectable.
+# One field per line; '#'/blank ignored. Format: field=value
+role=admin
+roles=["admin"]
+is_admin=true
+isAdmin=true
+admin=true
+is_staff=true
+is_superuser=true
+is_verified=true
+verified=true
+email_verified=true
+is_active=true
+active=true
+account_type=admin
+accountType=admin
+plan=enterprise
+tier=premium
+subscription=pro
+permissions=["*"]
+scopes=["admin"]
+group=admins
+group_id=1
+org_role=owner
+balance=999999
+credit=999999
+discount=100
+price=0
+approved=true
+status=approved

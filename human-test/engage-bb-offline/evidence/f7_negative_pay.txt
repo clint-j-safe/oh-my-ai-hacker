@@ -1,0 +1,2 @@
+HTTP 200 /api/beneficiary/pay
+{"status":"Success","status_code":"BNF015","message":"Payment done Successfully","timestamp":1789883610,"data":{"transaction_id":"6825005384","updated_balance":631738.69}}

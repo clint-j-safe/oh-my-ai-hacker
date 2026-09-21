@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "business-logic-state artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["flaw_type", "workflow", "evidence_spill_id"],
+        "additionalProperties": true,
+        "properties": {
+          "flaw_type": { "enum": ["race_condition", "step_skipping", "negative_quantity", "price_manipulation"] },
+          "workflow": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "detail": { "type": "object" },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "authorization_required": { "type": "boolean" },
+        "safety": {
+          "type": "object",
+          "properties": {
+            "mutations_authorized": { "type": "boolean" },
+            "race_capped_at": { "type": "integer" },
+            "race_hard_max": { "type": "integer" }
+          }
+        },
+        "mutations": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test output
+coverage/
+
+# Workspaces / scratch (superpowers SDD + git worktrees)
+.superpowers/
+.worktrees/
+worktrees/
+
+# Secrets / runtime state
+.env
+.env.*
+!.env.example
+spill_store/
+secrets/
+
+# OS / editor
+.DS_Store
+*.log

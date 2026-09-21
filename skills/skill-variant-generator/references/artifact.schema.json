@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "skill-variant-generator artifact",
+  "type": "object",
+  "required": ["variant_name", "variant_path", "base_skill", "context"],
+  "additionalProperties": true,
+  "properties": {
+    "variant_name": { "type": "string" },
+    "variant_path": { "type": "string" },
+    "base_skill": { "type": "string" },
+    "context": { "type": "string" },
+    "artifact_contract_preserved": { "type": "boolean" },
+    "registered": { "type": "boolean" },
+    "changes_made": { "type": "array", "items": { "type": "string" } },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "skills_dir": { "type": "string" },
+        "client_lib": { "type": "string" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

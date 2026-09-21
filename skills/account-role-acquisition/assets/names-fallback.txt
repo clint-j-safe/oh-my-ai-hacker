@@ -1,0 +1,56 @@
+# names-fallback.txt
+# Realistic first names for TEST-identity registration (one per line).
+# For a larger pool, point config.names_wordlist (or env ACCT_NAMES) at:
+#   https://github.com/danielmiessler/SecLists/blob/master/Usernames/Names/names.txt
+# These identities are throwaway accounts the engagement creates on the
+# in-scope target; they are never real people and never reuse real credentials.
+Alex
+Jordan
+Taylor
+Morgan
+Casey
+Riley
+Jamie
+Avery
+Quinn
+Parker
+Drew
+Reese
+Skylar
+Cameron
+Rowan
+Sawyer
+Emerson
+Finley
+Harper
+Kendall
+Logan
+Marlowe
+Nova
+Oakley
+Peyton
+Remy
+Sage
+Tatum
+Blake
+Charlie
+Dakota
+Ellis
+Frankie
+Gray
+Hayden
+Indigo
+June
+Kai
+Lane
+Micah
+Noel
+Ocean
+Phoenix
+River
+Shiloh
+Toby
+Val
+Wren
+Zion
+Ari

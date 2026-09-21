@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sqli-database-injection artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["parameter", "injection_type", "confidence"],
+        "additionalProperties": true,
+        "properties": {
+          "parameter": { "type": "string" },
+          "injection_type": { "enum": ["error", "boolean", "time", "oob", "union"] },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "dbms": { "type": "string" },
+          "waf_bypass_used": { "type": "string" },
+          "raw_log_spill_id": { "type": "string" },
+          "proof": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "banner": { "type": "string" },
+              "current_user": { "type": "string" },
+              "current_db": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "meta": { "type": "object" },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

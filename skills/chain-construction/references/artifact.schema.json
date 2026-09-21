@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chain-construction artifact",
+  "type": "object",
+  "required": ["chains"],
+  "additionalProperties": true,
+  "properties": {
+    "chains": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["chain_id", "steps", "impact_score"],
+        "additionalProperties": true,
+        "properties": {
+          "chain_id": { "type": "string" },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vuln_class": { "type": "string" },
+                "action": { "type": "string" },
+                "yields": { "type": "string" },
+                "endpoint": { "type": "string" }
+              }
+            }
+          },
+          "impact_score": { "type": "integer" },
+          "rationale": { "type": "string" },
+          "targets": { "type": "array", "items": { "type": "string" } },
+          "links": { "type": "integer" }
+        }
+      }
+    },
+    "meta": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

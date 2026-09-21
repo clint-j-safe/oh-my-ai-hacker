@@ -1,0 +1,2 @@
+HTTP 200 POST /api/beneficiary/fetch
+{"status":"Success","status_code":"BNF012","message":"Bank Details of Beneficiary","timestamp":1789881865,"data":{"alias":"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ''BOB''\n                    AND\n                    user_id_fk = 23' at line 9","email":"NULL","accountNumber":"NULL","ifscCode":"NULL","creationDateTime":"NULL"}}

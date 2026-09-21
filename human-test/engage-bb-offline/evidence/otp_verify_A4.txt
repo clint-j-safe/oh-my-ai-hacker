@@ -1,0 +1,2 @@
+HTTP 200 /api/password/verifyuser
+{"status":"Success","status_code":"OTP003","message":"OTP Verification Successful","timestamp":1789882585,"data":{"response":"327156108224815"}}

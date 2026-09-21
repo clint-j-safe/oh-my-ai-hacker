@@ -1,0 +1,2 @@
+HTTP 200 /api/beneficiary/list
+{"status":"Success","status_code":"BNF011","message":"List of Beneficiaries","timestamp":1789884014,"data":{"alias":["Vipul","John","Kevin","John"]}}

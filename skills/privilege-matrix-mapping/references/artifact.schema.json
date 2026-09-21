@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "privilege-matrix-mapping artifact",
+  "type": "object",
+  "required": ["matrix_inline", "matrix_spill_id", "summary"],
+  "additionalProperties": true,
+  "properties": {
+    "matrix_spill_id": {
+      "type": ["string", "null"],
+      "description": "Spill ID of the full matrix. Set when > 100 endpoints; null when inlined."
+    },
+    "matrix_inline": {
+      "type": ["array", "null"],
+      "description": "Inline matrix for small apps (<= 100 endpoints). Null when offloaded.",
+      "items": {
+        "type": "object",
+        "required": ["endpoint", "method", "access_map"],
+        "properties": {
+          "endpoint": { "type": "string" },
+          "method": { "type": "string" },
+          "access_map": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "status": { "type": "integer" },
+                "verdict": { "enum": ["allowed", "denied", "idorsuspect", "skipped", "error"] },
+                "response_hash": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_endpoints_tested", "roles_tested"],
+      "properties": {
+        "total_endpoints_tested": { "type": "integer" },
+        "roles_tested": { "type": "array", "items": { "type": "string" } },
+        "idor_suspects_count": { "type": "integer" },
+        "unauthorized_access_count": { "type": "integer" }
+      }
+    },
+    "meta": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

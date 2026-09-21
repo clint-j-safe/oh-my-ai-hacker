@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "file-upload-path-traversal artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["vuln_class", "endpoint", "payload"],
+        "additionalProperties": true,
+        "properties": {
+          "vuln_class": { "enum": ["malicious_upload", "LFI", "RFI"] },
+          "endpoint": { "type": "string" },
+          "payload": { "type": "string" },
+          "accessed_file": { "type": "string" },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "code_executed": { "type": "boolean" },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "uploads_authorization_required": { "type": "boolean" },
+        "safety": {
+          "type": "object",
+          "properties": {
+            "uploads_authorized": { "type": "boolean" },
+            "webshell_payloads": { "type": "boolean" },
+            "lfi_targets_benign": { "type": "boolean" },
+            "rfi_shell_served": { "type": "boolean" }
+          }
+        },
+        "mutations": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

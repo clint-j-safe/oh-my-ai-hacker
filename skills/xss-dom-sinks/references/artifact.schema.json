@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "xss-dom-sinks artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["url", "xss_type", "payload", "evidence_spill_id"],
+        "additionalProperties": true,
+        "properties": {
+          "url": { "type": "string" },
+          "xss_type": { "enum": ["reflected", "stored", "dom"] },
+          "payload": { "type": "string" },
+          "context": { "type": "string" },
+          "parameter": { "type": "string" },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "executed": { "type": "boolean" },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "mutations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string" },
+              "canary": { "type": "string" },
+              "store_url": { "type": "string" },
+              "param": { "type": "string" }
+            }
+          }
+        },
+        "safety": { "type": "object" }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

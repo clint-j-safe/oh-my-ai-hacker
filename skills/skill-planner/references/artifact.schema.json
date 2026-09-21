@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engineered-pentest/skills/skill-planner/artifact.schema.json",
+  "title": "SkillPlannerArtifact",
+  "type": "object",
+  "required": ["plan", "meta"],
+  "additionalProperties": true,
+  "properties": {
+    "plan": {
+      "type": "array",
+      "description": "The SkillExecutionPlan: an ordered list of proposed skill steps.",
+      "items": {
+        "type": "object",
+        "required": ["skill_name", "priority"],
+        "additionalProperties": true,
+        "properties": {
+          "skill_name": {"type": "string"},
+          "target_endpoint_id": {"type": ["string", "null"]},
+          "hypothesis_id": {"type": ["string", "null"]},
+          "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+          "rationale": {"type": "string"},
+          "chaining_from": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["skill", "status", "sends_traffic"],
+      "additionalProperties": true,
+      "properties": {
+        "skill": {"const": "skill-planner"},
+        "version": {"type": "string"},
+        "phase": {"type": "string"},
+        "loop_component": {"type": "string"},
+        "status": {"type": "string", "enum": ["ok", "error"]},
+        "generated_at": {"type": "string"},
+        "sends_traffic": {"const": false},
+        "phase_planned": {"type": "integer"},
+        "step_count": {"type": "integer"}
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {"type": "object"}
+    }
+  }
+}

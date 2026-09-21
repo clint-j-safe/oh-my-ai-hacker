@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "js-spa-reverse artifact",
+  "type": "object",
+  "required": ["endpoints", "secrets", "framework"],
+  "additionalProperties": true,
+  "properties": {
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "source_js", "confidence"],
+        "additionalProperties": true,
+        "properties": {
+          "path": { "type": "string" },
+          "method": { "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "WS", "unknown"] },
+          "params": { "type": "array", "items": { "type": "string" } },
+          "source_js": { "type": "string" },
+          "confidence": { "enum": ["high", "medium", "low"] },
+          "is_api": { "type": "boolean" }
+        }
+      }
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "value_hash", "context"],
+        "additionalProperties": true,
+        "properties": {
+          "type": { "enum": ["AWS", "GCP", "Azure", "JWT", "Firebase", "Slack", "GitHub", "Generic"] },
+          "value_hash": { "type": "string", "description": "SHA-256 of the secret value, never raw" },
+          "context": { "type": "string", "description": "Surrounding chars with the secret itself redacted" },
+          "source_js": { "type": "string" },
+          "detector": { "type": "string" }
+        }
+      }
+    },
+    "framework": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "routing_type": { "enum": ["client", "server", "hybrid", "unknown"] },
+        "graphql_detected": { "type": "boolean" }
+      }
+    },
+    "raw_bundles_spill_id": { "type": ["string", "null"] },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "skill": { "const": "js-spa-reverse" },
+        "status": { "enum": ["ok", "error"] },
+        "endpoint_count": { "type": "integer" },
+        "secret_count": { "type": "integer" },
+        "endpoints_overflow_spill_id": { "type": ["string", "null"] },
+        "secrets_overflow_spill_id": { "type": ["string", "null"] },
+        "param_inventory": {
+          "type": "object",
+          "properties": {
+            "spill_id": { "type": ["string", "null"] },
+            "count": { "type": "integer" },
+            "preview": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+          }
+        },
+        "esprima_available": { "type": "boolean" }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

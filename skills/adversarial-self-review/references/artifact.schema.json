@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "adversarial-self-review artifact",
+  "type": "object",
+  "required": ["reviews"],
+  "additionalProperties": true,
+  "properties": {
+    "reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "verdict", "challenges"],
+        "additionalProperties": true,
+        "properties": {
+          "finding_id": { "type": "string" },
+          "verdict": { "enum": ["survives", "downgraded", "rejected"] },
+          "challenges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "challenge": { "type": "string" },
+                "resolution": { "enum": ["ruled_out", "unresolved"] },
+                "evidence_cited": { "type": "string" }
+              }
+            }
+          },
+          "severity_adjustment": { "type": ["string", "null"] },
+          "rejection_reason": { "type": ["string", "null"] },
+          "vuln_class": { "type": "string" }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "total_reviewed": { "type": "integer" },
+        "survived": { "type": "integer" },
+        "downgraded": { "type": "integer" },
+        "rejected": { "type": "integer" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "posture": { "type": "string" },
+        "target_interaction": { "type": "string" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

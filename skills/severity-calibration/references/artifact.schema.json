@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "severity-calibration artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "cvss_score", "severity", "confidence", "reproducibility"],
+        "additionalProperties": true,
+        "properties": {
+          "finding_id": { "type": "string" },
+          "cvss_score": { "type": "number", "minimum": 0, "maximum": 10 },
+          "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+          "confidence": { "enum": ["confirmed", "high", "medium", "low"] },
+          "reproducibility": { "enum": ["deterministic", "conditional", "unstable"] },
+          "demonstrated_impact": { "type": "string" },
+          "theoretical_max_impact": { "type": "string" },
+          "gap_explanation": { "type": "string", "description": "Why demonstrated < theoretical, if applicable" },
+          "cvss_vector": { "type": "string" },
+          "vuln_class": { "type": "string" },
+          "existence_only": { "type": "boolean" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "scoring": { "type": "string" },
+        "count": { "type": "integer" },
+        "target_interaction": { "type": "string" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

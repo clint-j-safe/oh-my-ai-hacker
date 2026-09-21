@@ -1,0 +1,2 @@
+HTTP 200 /api/otp/verify
+{"status":"Success","status_code":"OTP003","message":"OTP Verification Successful","timestamp":1789883552,"data":{"response":"314544392819330"}}

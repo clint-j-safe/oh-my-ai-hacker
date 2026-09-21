@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "token-session-forensics artifact",
+  "type": "object",
+  "required": ["cookies", "jwts", "session_fixation"],
+  "additionalProperties": true,
+  "properties": {
+    "cookies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "name": { "type": "string" },
+          "missing_httponly": { "type": "boolean" },
+          "missing_secure": { "type": "boolean" },
+          "samesite_value": { "type": "string" },
+          "domain_too_broad": { "type": "boolean" }
+        }
+      }
+    },
+    "jwts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "header": { "type": "object" },
+          "payload": { "type": "object" },
+          "algorithm": { "type": "string" },
+          "vulnerabilities": {
+            "type": "array",
+            "items": {
+              "enum": ["none_alg_possible", "weak_secret_cracked", "jku_injection",
+                       "kid_injection", "alg_confusion_possible", "expired_but_accepted"]
+            }
+          },
+          "forged_token_none_alg": { "type": ["string", "null"] },
+          "cracked_secret_hash": { "type": ["string", "null"] },
+          "cracked_secret_spill_id": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "session_fixation": {
+      "type": "object",
+      "properties": {
+        "vulnerable": { "type": "boolean" },
+        "evidence": { "type": "string" }
+      }
+    },
+    "meta": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

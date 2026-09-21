@@ -1,0 +1,2 @@
+HTTP 200 POST /api/beneficiary/fetch
+{"status":"Failed","status_code":"BNF013","message":"bob does not exist","timestamp":1789881864,"data":{"alias":null,"accountNumber":null,"ifscCode":null,"creationDateTime":null}}

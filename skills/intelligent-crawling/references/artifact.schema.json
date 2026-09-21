@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "intelligent-crawling artifact",
+  "type": "object",
+  "required": ["sitemap", "forms_discovered", "crawl_stats"],
+  "additionalProperties": true,
+  "properties": {
+    "sitemap": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["url", "method", "captured_request_spill_id"],
+        "additionalProperties": true,
+        "properties": {
+          "url": { "type": "string" },
+          "method": { "type": "string" },
+          "requires_auth": { "type": "boolean" },
+          "role_used": { "type": "string" },
+          "content_type": { "type": "string" },
+          "captured_request_spill_id": { "type": "string" },
+          "discovered_by": { "enum": ["navigation", "xhr", "fetch", "websocket", "form_action"] }
+        }
+      }
+    },
+    "forms_discovered": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "url": { "type": "string" },
+          "action": { "type": "string" },
+          "method": { "type": "string" },
+          "input_fields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "type": { "type": "string" },
+                "required": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "crawl_stats": {
+      "type": "object",
+      "required": ["pages_crawled", "requests_captured"],
+      "properties": {
+        "pages_crawled": { "type": "integer" },
+        "requests_captured": { "type": "integer" },
+        "budget_remaining_pct": { "type": "number" },
+        "roles_completed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "har_spill_id": { "type": ["string", "null"] },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "skill": { "const": "intelligent-crawling" },
+        "status": { "enum": ["ok", "error"] },
+        "budget_exhausted": { "type": "boolean" },
+        "sitemap_overflow_spill_id": { "type": ["string", "null"] },
+        "playwright_available": { "type": "boolean" }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

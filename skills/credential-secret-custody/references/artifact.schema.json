@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "credential-secret-custody artifact",
+  "type": "object",
+  "required": ["secret_hash", "encrypted_spill_id", "custody_log"],
+  "additionalProperties": true,
+  "properties": {
+    "secret_hash": { "type": "string", "description": "SHA-256 hash of the secret. Safe for LLM context." },
+    "encrypted_spill_id": { "type": "string", "description": "Path to the encrypted .enc file under spill_store/secrets/" },
+    "secret_type": { "enum": ["AWS", "GCP", "Azure", "JWT_Private_Key", "DB_Password", "API_Key", "Generic"] },
+    "custody_log": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "discovered_at": { "type": "string", "format": "date-time" },
+        "discovered_by": { "type": "string" },
+        "cleanup_status": { "enum": ["pending", "rotated", "revoked"] }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "status": { "type": "string" },
+        "action": { "enum": ["custody", "update_status"] },
+        "encryption": { "enum": ["fernet", "unavailable"] },
+        "key_source": { "enum": ["env", "keyfile", "generated", "unavailable"] },
+        "key_fingerprint": { "type": "string" },
+        "input_channel": { "type": "string" },
+        "secret_length": { "type": "integer" },
+        "context_fingerprint": { "type": "string" },
+        "raw_secret_in_output": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

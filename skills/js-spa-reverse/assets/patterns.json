@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "description": "Compiled regex library for js-spa-reverse. Secret patterns adapted from the public gitleaks/trufflehog rule sets and SecLists/Regex; endpoint/route/param/env/graphql/ws patterns from the skill spec and SecLists. All patterns are Python `re` compatible.",
+    "sources": [
+      "https://github.com/danielmiessler/SecLists/tree/master/Regex",
+      "https://github.com/gitleaks/gitleaks (rule inspiration)",
+      "https://github.com/trufflesecurity/trufflehog (detector inspiration)"
+    ],
+    "version": "1.0"
+  },
+
+  "endpoints": {
+    "api_paths": [
+      "\\/api\\/[a-zA-Z0-9_\\-\\/.]+",
+      "\\/v[0-9]+\\/[a-zA-Z0-9_\\-\\/.]+",
+      "\\/rest\\/[a-zA-Z0-9_\\-\\/.]+",
+      "\\/graphql[a-zA-Z0-9_\\-\\/.]*"
+    ],
+    "absolute_urls": [
+      "https?:\\/\\/[a-zA-Z0-9.\\-]+(?::[0-9]+)?\\/[a-zA-Z0-9_\\-\\/.]*(?:\\?[^\\s\"'`<>]*)?"
+    ]
+  },
+
+  "routes": [
+    "path\\s*:\\s*['\"]([^'\"]+)['\"]",
+    "route\\s*:\\s*['\"]([^'\"]+)['\"]",
+    "component\\s*:\\s*[A-Za-z0-9_]+\\s*,\\s*path\\s*:\\s*['\"]([^'\"]+)['\"]",
+    "<Route[^>]*\\bpath=['\"]([^'\"]+)['\"]",
+    "(?:to|href)\\s*=\\s*['\"](\\/[^'\"]*)['\"]"
+  ],
+
+  "params": [
+    "[?&]([a-zA-Z0-9_]+)="
+  ],
+
+  "env_keys": [
+    "process\\.env\\.([A-Z0-9_]+)",
+    "import\\.meta\\.env\\.([A-Z0-9_]+)",
+    "__ENV__\\.([A-Z0-9_]+)"
+  ],
+
+  "graphql_introspection": [
+    "IntrospectionQuery",
+    "__schema",
+    "__typename",
+    "query\\s+IntrospectionQuery",
+    "queryType\\s*\\{",
+    "mutationType\\s*\\{"
+  ],
+
+  "websocket": [
+    "wss?:\\/\\/[a-zA-Z0-9.\\-]+(?::[0-9]+)?\\/[a-zA-Z0-9_\\-\\/.]*",
+    "new\\s+WebSocket\\(\\s*['\"]([^'\"]+)['\"]"
+  ],
+
+  "secrets": [
+    { "type": "AWS", "name": "AWS Access Key ID", "pattern": "\\b(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\\b" },
+    { "type": "AWS", "name": "AWS Secret Access Key", "pattern": "(?i)aws[_\\-. ]?(?:secret|sk)[a-z0-9_\\-. ]{0,20}['\"][0-9a-zA-Z\\/+]{40}['\"]" },
+    { "type": "GCP", "name": "GCP OAuth Access Token", "pattern": "\\bya29\\.[0-9A-Za-z_\\-]{20,}\\b" },
+    { "type": "GCP", "name": "GCP Service Account Private Key", "pattern": "-----BEGIN (?:RSA )?PRIVATE KEY-----" },
+    { "type": "Firebase", "name": "Google/Firebase API Key", "pattern": "\\bAIza[0-9A-Za-z_\\-]{35}\\b" },
+    { "type": "Firebase", "name": "Firebase Database URL", "pattern": "https:\\/\\/[a-z0-9\\-]+\\.firebaseio\\.com" },
+    { "type": "Azure", "name": "Azure Storage Connection String", "pattern": "DefaultEndpointsProtocol=https;AccountName=[a-z0-9]+;AccountKey=[A-Za-z0-9+\\/=]{88}" },
+    { "type": "Azure", "name": "Azure AD Client Secret (heuristic)", "pattern": "(?i)(?:client[_\\-. ]?secret)['\"\\s:=]{1,6}[0-9A-Za-z\\-._~]{32,44}" },
+    { "type": "JWT", "name": "JSON Web Token", "pattern": "\\beyJ[A-Za-z0-9_\\-]{8,}\\.eyJ[A-Za-z0-9_\\-]{8,}\\.[A-Za-z0-9_\\-]{8,}\\b" },
+    { "type": "Slack", "name": "Slack Token", "pattern": "\\bxox[baprs]-[0-9A-Za-z\\-]{10,72}\\b" },
+    { "type": "Slack", "name": "Slack Webhook", "pattern": "https:\\/\\/hooks\\.slack\\.com\\/services\\/T[A-Z0-9]+\\/B[A-Z0-9]+\\/[A-Za-z0-9]{20,}" },
+    { "type": "GitHub", "name": "GitHub Personal/OAuth/App Token", "pattern": "\\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{36}\\b" },
+    { "type": "GitHub", "name": "GitHub Fine-grained PAT", "pattern": "\\bgithub_pat_[0-9A-Za-z_]{60,}\\b" },
+    { "type": "Generic", "name": "Stripe Secret Key", "pattern": "\\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}\\b" },
+    { "type": "Generic", "name": "Twilio API Key", "pattern": "\\bSK[0-9a-fA-F]{32}\\b" },
+    { "type": "Generic", "name": "SendGrid API Key", "pattern": "\\bSG\\.[0-9A-Za-z_\\-]{22}\\.[0-9A-Za-z_\\-]{43}\\b" },
+    { "type": "Generic", "name": "Google OAuth Client Secret", "pattern": "\\bGOCSPX-[0-9A-Za-z_\\-]{28}\\b" },
+    { "type": "Generic", "name": "Generic high-entropy secret assignment", "pattern": "(?i)(?:api[_\\-]?key|secret|token|passwd|password|auth)['\"\\s:=]{1,6}['\"][0-9A-Za-z_\\-+\\/=]{24,}['\"]" }
+  ],
+
+  "framework_fingerprints": [
+    { "name": "Next.js", "routing_type": "hybrid", "markers": ["__NEXT_DATA__", "/_next/static/", "next/dist/", "__NEXT_P"], "version": "\"next\"\\s*:\\s*\"[^\"]*?([0-9]+\\.[0-9]+\\.[0-9]+)" },
+    { "name": "Nuxt.js", "routing_type": "hybrid", "markers": ["__NUXT__", "/_nuxt/", "nuxt.config"], "version": "\"nuxt\"\\s*:\\s*\"[^\"]*?([0-9]+\\.[0-9]+\\.[0-9]+)" },
+    { "name": "Angular", "routing_type": "client", "markers": ["ng-version=", "platformBrowserDynamic", "@angular/core", "\\u0275fac", "zone.js"], "version": "ng-version=\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" },
+    { "name": "React", "routing_type": "client", "markers": ["__REACT_DEVTOOLS_GLOBAL_HOOK__", "react-dom", "React.createElement", "data-reactroot", "_reactListening"], "version": "\"react\"\\s*:\\s*\"[^\"]*?([0-9]+\\.[0-9]+\\.[0-9]+)" },
+    { "name": "Vue.js", "routing_type": "client", "markers": ["__VUE__", "__vue_app__", "vue-router", "createApp(", "Vue.config"], "version": "\"vue\"\\s*:\\s*\"[^\"]*?([0-9]+\\.[0-9]+\\.[0-9]+)" },
+    { "name": "Svelte", "routing_type": "client", "markers": ["__svelte", "SvelteComponent", "svelte/internal"], "version": "\"svelte\"\\s*:\\s*\"[^\"]*?([0-9]+\\.[0-9]+\\.[0-9]+)" },
+    { "name": "Ember.js", "routing_type": "client", "markers": ["Ember.Application", "ember-cli", "window.Ember"], "version": "Ember.VERSION\\s*=\\s*['\"]([0-9]+\\.[0-9]+\\.[0-9]+)" }
+  ]
+}

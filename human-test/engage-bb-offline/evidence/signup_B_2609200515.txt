@@ -1,0 +1,6 @@
+HTTP 200  POST /api/signup
+  Server: Apache/2.4.33 (Unix)
+  X-Powered-By: PHP/7.2.7
+  Access-Control-Allow-Origin: *
+  Access-Control-Allow-Credentials: true
+{"status":"Failed","status_code":"ERR010","message":"Host parameter format is not valid","timestamp":1789881357,"data":{}}

@@ -1,0 +1,583 @@
+{
+  "_meta": {
+    "description": "Fingerprint signatures for tech-fingerprinting. Header/cookie/HTML signatures inspired by Wappalyzer and wafw00f; version regexes are Python `re` compatible. OSV ecosystem map drives api.osv.dev CVE lookups.",
+    "sources": [
+      "https://github.com/wappalyzer/wappalyzer/tree/master/src/technologies",
+      "https://github.com/EnableSecurity/wafw00f",
+      "https://osv.dev",
+      "vendor-published response headers for CDN and cloud providers"
+    ],
+    "version": "1.1"
+  },
+  "headers": [
+    {
+      "header": "server",
+      "match": "(?i)nginx",
+      "component": "nginx",
+      "category": "server",
+      "version": "nginx/([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)",
+      "osv": "nginx"
+    },
+    {
+      "header": "server",
+      "match": "(?i)apache",
+      "component": "Apache httpd",
+      "category": "server",
+      "version": "Apache/([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)",
+      "osv": null
+    },
+    {
+      "header": "server",
+      "match": "(?i)microsoft-iis",
+      "component": "Microsoft IIS",
+      "category": "server",
+      "version": "IIS/([0-9]+\\.[0-9]+)",
+      "osv": null
+    },
+    {
+      "header": "server",
+      "match": "(?i)cloudflare",
+      "component": "Cloudflare",
+      "category": "cdn",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "server",
+      "match": "(?i)envoy",
+      "component": "Envoy",
+      "category": "server",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "server",
+      "match": "(?i)caddy",
+      "component": "Caddy",
+      "category": "server",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "server",
+      "match": "(?i)gunicorn",
+      "component": "Gunicorn",
+      "category": "server",
+      "version": "gunicorn/([0-9.]+)",
+      "osv": "gunicorn"
+    },
+    {
+      "header": "server",
+      "match": "(?i)werkzeug",
+      "component": "Werkzeug",
+      "category": "framework",
+      "version": "Werkzeug/([0-9.]+)",
+      "osv": "Werkzeug"
+    },
+    {
+      "header": "x-powered-by",
+      "match": "(?i)php",
+      "component": "PHP",
+      "category": "language",
+      "version": "PHP/([0-9]+\\.[0-9]+\\.[0-9]+)",
+      "osv": null
+    },
+    {
+      "header": "x-powered-by",
+      "match": "(?i)express",
+      "component": "Express",
+      "category": "framework",
+      "version": null,
+      "osv": "express"
+    },
+    {
+      "header": "x-powered-by",
+      "match": "(?i)asp\\.net",
+      "component": "ASP.NET",
+      "category": "framework",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "x-powered-by",
+      "match": "(?i)next\\.js",
+      "component": "Next.js",
+      "category": "framework",
+      "version": null,
+      "osv": "next"
+    },
+    {
+      "header": "x-powered-by",
+      "match": "(?i)servlet",
+      "component": "Java Servlet",
+      "category": "language",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "x-aspnet-version",
+      "match": ".+",
+      "component": ".NET Framework",
+      "category": "language",
+      "version": "([0-9]+\\.[0-9]+\\.[0-9]+)",
+      "osv": null
+    },
+    {
+      "header": "x-aspnetmvc-version",
+      "match": ".+",
+      "component": "ASP.NET MVC",
+      "category": "framework",
+      "version": "([0-9]+\\.[0-9]+)",
+      "osv": null
+    },
+    {
+      "header": "x-generator",
+      "match": "(?i)drupal",
+      "component": "Drupal",
+      "category": "framework",
+      "version": "Drupal ([0-9]+)",
+      "osv": null
+    },
+    {
+      "header": "x-drupal-cache",
+      "match": ".+",
+      "component": "Drupal",
+      "category": "framework",
+      "version": null,
+      "osv": null
+    },
+    {
+      "header": "x-django",
+      "match": ".+",
+      "component": "Django",
+      "category": "framework",
+      "version": null,
+      "osv": "Django"
+    }
+  ],
+  "cookies": [
+    {
+      "name": "JSESSIONID",
+      "component": "Java (Servlet)",
+      "category": "language",
+      "osv": null
+    },
+    {
+      "name": "ASP.NET_SessionId",
+      "component": "ASP.NET",
+      "category": "framework",
+      "osv": null
+    },
+    {
+      "name": "connect.sid",
+      "component": "Express (Node.js)",
+      "category": "framework",
+      "osv": "express"
+    },
+    {
+      "name": "PHPSESSID",
+      "component": "PHP",
+      "category": "language",
+      "osv": null
+    },
+    {
+      "name": "laravel_session",
+      "component": "Laravel",
+      "category": "framework",
+      "osv": "laravel/framework"
+    },
+    {
+      "name": "XSRF-TOKEN",
+      "component": "Laravel/Angular",
+      "category": "framework",
+      "osv": null
+    },
+    {
+      "name": "_session_id",
+      "component": "Ruby on Rails",
+      "category": "framework",
+      "osv": null
+    },
+    {
+      "name": "ci_session",
+      "component": "CodeIgniter",
+      "category": "framework",
+      "osv": null
+    },
+    {
+      "name": "csrftoken",
+      "component": "Django",
+      "category": "framework",
+      "osv": "Django"
+    },
+    {
+      "name": "sessionid",
+      "component": "Django",
+      "category": "framework",
+      "osv": "Django"
+    },
+    {
+      "name": "wordpress_logged_in",
+      "component": "WordPress",
+      "category": "framework",
+      "osv": null
+    },
+    {
+      "name": "AWSALB",
+      "component": "AWS ALB",
+      "category": "cdn",
+      "osv": null
+    }
+  ],
+  "html": [
+    {
+      "pattern": "__NEXT_DATA__",
+      "component": "Next.js",
+      "category": "framework",
+      "version": null,
+      "osv": "next"
+    },
+    {
+      "pattern": "__NUXT__",
+      "component": "Nuxt.js",
+      "category": "framework",
+      "version": null,
+      "osv": "nuxt"
+    },
+    {
+      "pattern": "ng-version=\"([0-9.]+)\"",
+      "component": "Angular",
+      "category": "framework",
+      "version": "ng-version=\"([0-9]+\\.[0-9]+\\.[0-9]+)\"",
+      "osv": "@angular/core"
+    },
+    {
+      "pattern": "data-v-[0-9a-f]{8}",
+      "component": "Vue.js",
+      "category": "framework",
+      "version": null,
+      "osv": "vue"
+    },
+    {
+      "pattern": "data-reactroot|__REACT_DEVTOOLS_GLOBAL_HOOK__",
+      "component": "React",
+      "category": "library",
+      "version": null,
+      "osv": "react"
+    },
+    {
+      "pattern": "<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']([^\"']+)",
+      "component": "__META_GENERATOR__",
+      "category": "framework",
+      "version": "content=[\"']([^\"']+)",
+      "osv": null
+    },
+    {
+      "pattern": "/wp-content/|/wp-includes/",
+      "component": "WordPress",
+      "category": "framework",
+      "version": null,
+      "osv": null
+    },
+    {
+      "pattern": "jquery[.-]?([0-9]+\\.[0-9]+\\.[0-9]+)(?:\\.min)?\\.js",
+      "component": "jQuery",
+      "category": "library",
+      "version": "jquery[.-]?([0-9]+\\.[0-9]+\\.[0-9]+)",
+      "osv": "jquery"
+    },
+    {
+      "pattern": "bootstrap[.-]?([0-9]+\\.[0-9]+\\.[0-9]+)(?:\\.min)?\\.(?:js|css)",
+      "component": "Bootstrap",
+      "category": "library",
+      "version": "bootstrap[.-]?([0-9]+\\.[0-9]+\\.[0-9]+)",
+      "osv": "bootstrap"
+    },
+    {
+      "pattern": "Laravel|csrf-token",
+      "component": "Laravel",
+      "category": "framework",
+      "version": null,
+      "osv": "laravel/framework"
+    }
+  ],
+  "waf": [
+    {
+      "product": "Cloudflare",
+      "headers": {
+        "server": "(?i)cloudflare",
+        "cf-ray": ".+",
+        "cf-cache-status": ".+"
+      },
+      "cookies": [
+        "__cfduid",
+        "__cf_bm"
+      ],
+      "body": [
+        "Attention Required! \\| Cloudflare",
+        "cloudflare-nginx"
+      ]
+    },
+    {
+      "product": "AWS WAF / CloudFront",
+      "headers": {
+        "x-amzn-requestid": ".+",
+        "x-amz-cf-id": ".+",
+        "server": "(?i)awselb|cloudfront"
+      },
+      "cookies": [],
+      "body": []
+    },
+    {
+      "product": "Akamai",
+      "headers": {
+        "server": "(?i)akamaighost",
+        "x-akamai-transformed": ".+"
+      },
+      "cookies": [
+        "ak_bmsc",
+        "_abck",
+        "bm_sz"
+      ],
+      "body": [
+        "Reference #[0-9a-f.]+"
+      ]
+    },
+    {
+      "product": "Imperva Incapsula",
+      "headers": {
+        "x-iinfo": ".+",
+        "x-cdn": "(?i)incapsula"
+      },
+      "cookies": [
+        "incap_ses",
+        "visid_incap"
+      ],
+      "body": [
+        "Incapsula incident ID",
+        "_Incapsula_Resource"
+      ]
+    },
+    {
+      "product": "F5 BIG-IP ASM",
+      "headers": {
+        "server": "(?i)big-?ip",
+        "x-wa-info": ".+"
+      },
+      "cookies": [
+        "TS[0-9a-f]{6,}",
+        "BIGipServer"
+      ],
+      "body": [
+        "The requested URL was rejected"
+      ]
+    },
+    {
+      "product": "Sucuri CloudProxy",
+      "headers": {
+        "server": "(?i)sucuri",
+        "x-sucuri-id": ".+",
+        "x-sucuri-cache": ".+"
+      },
+      "cookies": [],
+      "body": [
+        "Access Denied - Sucuri Website Firewall"
+      ]
+    },
+    {
+      "product": "ModSecurity",
+      "headers": {
+        "server": "(?i)mod_security|NAXSI"
+      },
+      "cookies": [],
+      "body": [
+        "This error was generated by Mod_Security",
+        "Not Acceptable!"
+      ]
+    },
+    {
+      "product": "Barracuda",
+      "headers": {},
+      "cookies": [
+        "barra_counter_session"
+      ],
+      "body": [
+        "You have been blocked",
+        "Barracuda"
+      ]
+    },
+    {
+      "product": "Wordfence",
+      "headers": {},
+      "cookies": [
+        "wfvt_",
+        "wordfence_verifiedHuman"
+      ],
+      "body": [
+        "Generated by Wordfence"
+      ]
+    },
+    {
+      "product": "Fastly",
+      "headers": {
+        "x-served-by": "(?i)cache-.*fastly",
+        "x-fastly-request-id": ".+",
+        "via": "(?i)fastly"
+      },
+      "cookies": [],
+      "body": []
+    }
+  ],
+  "osv_ecosystem": {
+    "nginx": "OSS-Fuzz",
+    "Werkzeug": "PyPI",
+    "gunicorn": "PyPI",
+    "Django": "PyPI",
+    "express": "npm",
+    "next": "npm",
+    "nuxt": "npm",
+    "@angular/core": "npm",
+    "vue": "npm",
+    "react": "npm",
+    "jquery": "npm",
+    "bootstrap": "npm",
+    "laravel/framework": "Packagist",
+    "spring-boot": "Maven",
+    "org.springframework:spring-core": "Maven"
+  },
+  "cdn": [
+    {
+      "product": "Cloudflare",
+      "kind": "cdn",
+      "headers": {
+        "server": "(?i)cloudflare",
+        "cf-ray": ".+",
+        "cf-cache-status": ".+"
+      },
+      "cookies": [
+        "__cfduid",
+        "__cf_bm"
+      ]
+    },
+    {
+      "product": "Amazon CloudFront",
+      "kind": "cdn",
+      "headers": {
+        "x-amz-cf-id": ".+",
+        "x-amz-cf-pop": ".+",
+        "via": "(?i)cloudfront"
+      }
+    },
+    {
+      "product": "Akamai",
+      "kind": "cdn",
+      "headers": {
+        "x-akamai-transformed": ".+",
+        "x-akamai-request-id": ".+",
+        "server": "(?i)akamaighost"
+      }
+    },
+    {
+      "product": "Fastly",
+      "kind": "cdn",
+      "headers": {
+        "x-served-by": "(?i)cache-.*",
+        "x-fastly-request-id": ".+",
+        "fastly-debug-digest": ".+"
+      }
+    },
+    {
+      "product": "Sucuri",
+      "kind": "cdn",
+      "headers": {
+        "x-sucuri-id": ".+",
+        "x-sucuri-cache": ".+"
+      }
+    },
+    {
+      "product": "Vercel",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)^vercel$",
+        "x-vercel-id": ".+",
+        "x-vercel-cache": ".+"
+      }
+    },
+    {
+      "product": "Netlify",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)netlify",
+        "x-nf-request-id": ".+"
+      }
+    },
+    {
+      "product": "Amazon S3",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)^amazons3$",
+        "x-amz-bucket-region": ".+",
+        "x-amz-request-id": ".+"
+      }
+    },
+    {
+      "product": "Amazon Web Services",
+      "kind": "cloud",
+      "headers": {
+        "x-amzn-requestid": ".+",
+        "x-amzn-trace-id": ".+",
+        "x-amzn-remapped-host": ".+"
+      }
+    },
+    {
+      "product": "Google Cloud",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)^(gse|gws|google frontend)$",
+        "x-goog-generation": ".+",
+        "x-cloud-trace-context": ".+"
+      }
+    },
+    {
+      "product": "Microsoft Azure",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)microsoft-azure",
+        "x-azure-ref": ".+",
+        "x-ms-request-id": ".+"
+      }
+    },
+    {
+      "product": "Heroku",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)^cowboy$",
+        "via": "(?i)vegur"
+      }
+    },
+    {
+      "product": "DigitalOcean App Platform",
+      "kind": "cloud",
+      "headers": {
+        "x-do-app-origin": ".+",
+        "x-do-orig-status": ".+"
+      }
+    },
+    {
+      "product": "GitHub Pages",
+      "kind": "cloud",
+      "headers": {
+        "server": "(?i)^github\\.com$",
+        "x-github-request-id": ".+"
+      }
+    },
+    {
+      "product": "Varnish",
+      "kind": "cdn",
+      "headers": {
+        "x-varnish": ".+",
+        "via": "(?i)varnish"
+      }
+    }
+  ]
+}

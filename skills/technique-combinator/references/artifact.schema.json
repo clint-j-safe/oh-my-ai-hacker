@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "technique-combinator artifact",
+  "type": "object",
+  "required": ["combinations"],
+  "additionalProperties": true,
+  "properties": {
+    "combinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["chain_id", "techniques", "impact_score", "action_plan"],
+        "additionalProperties": true,
+        "properties": {
+          "chain_id": { "type": "string" },
+          "techniques": { "type": "array", "items": { "type": "string" } },
+          "data_flow": { "type": "string" },
+          "impact_score": { "type": "integer" },
+          "impact_category": { "enum": ["RCE", "PrivEsc", "DataExfil", "InfoDisclosure"] },
+          "action_plan": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "step": { "type": "integer" },
+                "technique": { "type": "string" },
+                "input": { "type": "string" },
+                "expected_output": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "findings_in": { "type": "integer" },
+        "capabilities_in": { "type": "integer" },
+        "chains_found": { "type": "integer" },
+        "planning_only": { "type": "boolean" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

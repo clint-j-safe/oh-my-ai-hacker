@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.94SVN scan initiated Sun Sep 20 04:58:58 2026 as: nmap -sV -T3 -&#45;max-rate 500 -p 1-65535 -sC -&#45;open -oX /opt/engage-bb/scans/nmap-139.59.15.10-sV.xml -oG - -oN /opt/engage-bb/scans/nmap-139.59.15.10-sV.txt 139.59.15.10 -->
+<nmaprun scanner="nmap" args="nmap -sV -T3 -&#45;max-rate 500 -p 1-65535 -sC -&#45;open -oX /opt/engage-bb/scans/nmap-139.59.15.10-sV.xml -oG - -oN /opt/engage-bb/scans/nmap-139.59.15.10-sV.txt 139.59.15.10" start="1789880338" startstr="Sun Sep 20 04:58:58 2026" version="7.94SVN" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="65535" services="1-65535"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<hosthint><status state="up" reason="unknown-response" reason_ttl="0"/>
+<address addr="139.59.15.10" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</hosthint>
+<host starttime="1789880339" endtime="1789880486"><status state="up" reason="reset" reason_ttl="62"/>
+<address addr="139.59.15.10" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports><extraports state="closed" count="65529">
+<extrareasons reason="reset" count="65529" proto="tcp" ports="1-21,23-24,26-79,81-464,466-586,588-2999,3001-65535"/>
+</extraports>
+<extraports state="filtered" count="3">
+<extrareasons reason="no-response" count="3" proto="tcp" ports="25,465,587"/>
+</extraports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="63"/><service name="ssh" product="OpenSSH" version="9.6p1 Ubuntu 3ubuntu13.19" extrainfo="Ubuntu Linux; protocol 2.0" ostype="Linux" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:9.6p1</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service><script id="ssh-hostkey" output="&#xa;  256 f2:7f:83:a4:f8:67:0a:86:37:7b:39:2b:d0:e4:66:00 (ECDSA)&#xa;  256 33:d5:60:b1:d4:cb:66:d5:af:39:9d:40:82:64:3a:a2 (ED25519)"><table>
+<elem key="key">AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI/tX66uVgBcOUbAlyHRn/bbk4SJHbrJr+qUQ1999y9cr3XWJW0PiM1wmXdGxRnl0z6KG9dpF8+oARtzB3s0zT8=</elem>
+<elem key="type">ecdsa-sha2-nistp256</elem>
+<elem key="fingerprint">f27f83a4f8670a86377b392bd0e46600</elem>
+<elem key="bits">256</elem>
+</table>
+<table>
+<elem key="key">AAAAC3NzaC1lZDI1NTE5AAAAIHe/Pv+75CeXc1cAAPLN6CVO8Yfuw1j/DEbqx2aCUKY0</elem>
+<elem key="type">ssh-ed25519</elem>
+<elem key="fingerprint">33d560b1d4cb66d5af399d4082643aa2</elem>
+<elem key="bits">256</elem>
+</table>
+</script></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="62"/><service name="http" product="Apache httpd" method="probed" conf="10"><cpe>cpe:/a:apache:http_server</cpe></service><script id="http-server-header" output="Apache"><elem>Apache</elem>
+</script><script id="http-title" output="404 Not Found"><elem key="title">404 Not Found</elem>
+</script></port>
+<port protocol="tcp" portid="3000"><state state="open" reason="syn-ack" reason_ttl="62"/><service name="http" product="nginx" version="1.31.6" method="probed" conf="10"><cpe>cpe:/a:igor_sysoev:nginx:1.31.6</cpe></service><script id="http-title" output="UnSAFE Bank"><elem key="title">UnSAFE Bank</elem>
+</script><script id="http-server-header" output="nginx/1.31.6"><elem>nginx/1.31.6</elem>
+</script><script id="http-methods" output="&#xa;  Potentially risky methods: TRACE"><table key="Potentially risky methods">
+<elem>TRACE</elem>
+</table>
+</script></port>
+</ports>
+<times srtt="531" rttvar="60" to="100000"/>
+</host>
+<runstats><finished time="1789880486" timestr="Sun Sep 20 05:01:26 2026" summary="Nmap done at Sun Sep 20 05:01:26 2026; 1 IP address (1 host up) scanned in 147.90 seconds" elapsed="147.90" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

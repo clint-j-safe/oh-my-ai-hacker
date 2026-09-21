@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scope-discipline artifact",
+  "type": "object",
+  "required": ["verdict", "reason"],
+  "additionalProperties": true,
+  "properties": {
+    "verdict": { "enum": ["proceed", "modify", "abort"] },
+    "reason": { "type": "string" },
+    "modified_action": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "url": { "type": "string" },
+        "method": { "type": "string" },
+        "follow_redirects": { "type": "boolean" }
+      }
+    },
+    "scope_rule_matched": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "advisory_only": { "type": "boolean" },
+        "audited_url": { "type": "string" },
+        "method": { "type": "string" },
+        "in_scope_rules": { "type": "array", "items": { "type": "string" } },
+        "deny_rules": { "type": "array", "items": { "type": "string" } },
+        "sends_traffic": { "type": "boolean" },
+        "final_authority": { "type": "string" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

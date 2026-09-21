@@ -1,0 +1,2 @@
+HTTP 200 /api/login
+{"status":"Failed","status_code":"PSW003","message":"Password format is incorrect","timestamp":1789882586,"data":{}}

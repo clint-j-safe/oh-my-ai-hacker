@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "delegation-collaboration artifact",
+  "type": "object",
+  "required": ["decision"],
+  "additionalProperties": true,
+  "properties": {
+    "decision": { "enum": ["inline", "delegate"] },
+    "reason": { "type": "string" },
+    "sub_agent_spec": {
+      "type": ["object", "null"],
+      "description": "Only present if decision is 'delegate' (spawn).",
+      "required": ["mailbox_id", "scope", "budget", "exit_condition"],
+      "additionalProperties": true,
+      "properties": {
+        "mailbox_id": { "type": "string" },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "endpoints": { "type": "array", "items": { "type": "string" } },
+            "parameters": { "type": "array", "items": { "type": "string" } },
+            "roles": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "max_tokens": { "type": "integer" },
+            "max_time_seconds": { "type": "integer" }
+          }
+        },
+        "exit_condition": { "type": "string" },
+        "entry_state_query": { "type": "string", "description": "Neo4j Cypher query to load sub-agent context" }
+      }
+    },
+    "merge_protocol": {
+      "type": ["object", "null"],
+      "description": "Only present when merging completed sub-agent results.",
+      "additionalProperties": true,
+      "properties": {
+        "findings_merged": { "type": "integer" },
+        "duplicates_removed": { "type": "integer" },
+        "provenance_tag": { "type": "string" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "target_interaction": { "type": "string" },
+        "action": { "enum": ["decide", "merge"] },
+        "active_sub_agents": { "type": "integer" },
+        "max_concurrent_sub_agents": { "type": "integer" },
+        "mailbox_id": { "type": "string" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

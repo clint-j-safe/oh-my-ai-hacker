@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload-mutator artifact",
+  "type": "object",
+  "required": ["mutations", "total_count"],
+  "additionalProperties": true,
+  "properties": {
+    "mutations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["base_payload", "mutated_payload", "level", "mutation_type", "seed"],
+        "additionalProperties": true,
+        "properties": {
+          "base_payload": { "type": "string" },
+          "mutated_payload": { "type": "string" },
+          "level": { "type": "integer", "minimum": 1, "maximum": 4 },
+          "mutation_type": { "type": "string" },
+          "seed": { "type": "integer" },
+          "encoding_chain": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "total_count": { "type": "integer" },
+    "spill_id": { "type": ["string", "null"] },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "seed": { "type": "integer" },
+        "blocked_by": { "type": "string" },
+        "levels_applied": { "type": "array", "items": { "type": "integer" } },
+        "max_mutations_per_level": { "type": "integer" },
+        "inlined": { "type": "integer" },
+        "offloaded": { "type": "boolean" },
+        "deterministic": { "type": "boolean" },
+        "sends_traffic": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

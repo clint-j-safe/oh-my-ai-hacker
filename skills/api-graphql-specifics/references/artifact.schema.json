@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "api-graphql-specifics artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["vuln_class", "endpoint"],
+        "additionalProperties": true,
+        "properties": {
+          "vuln_class": { "enum": ["graphql_introspection", "mass_assignment", "batching_abuse", "id_enumeration"] },
+          "endpoint": { "type": "string" },
+          "schema_spill_id": { "type": ["string", "null"] },
+          "detail": { "type": "object" },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "mass_assignment_authorization_required": { "type": "boolean" },
+        "safety": {
+          "type": "object",
+          "properties": {
+            "mass_assignment_authorized": { "type": "boolean" },
+            "batch_capped_at": { "type": "integer" },
+            "id_enum_capped_at": { "type": "integer" }
+          }
+        },
+        "mutations": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

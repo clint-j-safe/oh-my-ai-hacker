@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "stall-ambiguity-resolution artifact",
+  "type": "object",
+  "required": ["root_cause", "diagnosis", "revised_plan", "lesson_learned"],
+  "additionalProperties": true,
+  "properties": {
+    "root_cause": {
+      "enum": ["TOOL_BROKEN", "HYPOTHESIS_WRONG", "WAF_BLOCKING", "TARGET_DOWN", "AMBIGUOUS_OUTPUT"]
+    },
+    "diagnosis": { "type": "string" },
+    "revised_plan": {
+      "type": "object",
+      "required": ["action", "reason"],
+      "additionalProperties": true,
+      "properties": {
+        "action": {
+          "enum": ["quarantine_tool", "kill_hypothesis", "switch_to_waf_evasion",
+                   "pause_and_cooldown", "switch_detection_method"]
+        },
+        "reason": { "type": "string" },
+        "new_hypothesis": { "type": ["object", "null"] },
+        "new_tool": { "type": ["string", "null"] },
+        "cooldown_s": { "type": "integer" }
+      }
+    },
+    "lesson_learned": {
+      "type": "string",
+      "description": "One-sentence lesson for the Provenance Ledger."
+    },
+    "stall_duration_steps": { "type": "integer" },
+    "tokens_wasted": { "type": "integer" },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "trigger": { "type": "string" },
+        "target_interaction": { "type": "string" },
+        "stalled_action": { "type": ["string", "null"] },
+        "revised_differs_from_stalled": { "type": "boolean" },
+        "no_restart": { "type": "boolean" },
+        "sends_traffic": { "type": "boolean" },
+        "distinct_actions": { "type": "integer" },
+        "trace_len": { "type": "integer" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

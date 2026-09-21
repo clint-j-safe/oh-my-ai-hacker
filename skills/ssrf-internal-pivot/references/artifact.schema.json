@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ssrf-internal-pivot artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["parameter", "ssrf_type", "evidence_spill_id"],
+        "additionalProperties": true,
+        "properties": {
+          "parameter": { "type": "string" },
+          "ssrf_type": { "enum": ["full_response", "blind_oob", "cloud_metadata"] },
+          "payload": { "type": "string" },
+          "internal_ip_reached": { "type": "string" },
+          "server_fingerprint": { "type": "string" },
+          "status": { "type": "integer" },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "safety": {
+          "type": "object",
+          "properties": {
+            "credential_paths_probed": { "type": "boolean" },
+            "internal_exploitation": { "type": "boolean" },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

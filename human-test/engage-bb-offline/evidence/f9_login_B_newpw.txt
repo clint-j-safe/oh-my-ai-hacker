@@ -1,0 +1,2 @@
+HTTP 200 /api/login
+{"status":"Failed","status_code":"LGN005","message":"Already logged in. Wait for some time","timestamp":1789883622,"data":{}}

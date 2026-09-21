@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh root@143.244.130.163:*)",
+      "Bash(ssh -o ConnectTimeout=* root@143.244.130.163:*)",
+      "Bash(scp root@143.244.130.163:*)",
+      "Bash(scp -r root@143.244.130.163:*)"
+    ]
+  }
+}

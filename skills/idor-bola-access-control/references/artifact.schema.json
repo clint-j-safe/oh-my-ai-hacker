@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "idor-bola-access-control artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["endpoint", "resource_id", "attacker_role", "victim_role"],
+        "additionalProperties": true,
+        "properties": {
+          "endpoint": { "type": "string" },
+          "resource_id": { "type": "string" },
+          "attacker_role": { "type": "string" },
+          "victim_role": { "type": "string" },
+          "access_type": { "enum": ["horizontal", "vertical"] },
+          "method": { "type": "string" },
+          "attacker_status": { "type": "integer" },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "safety": {
+          "type": "object",
+          "properties": {
+            "read_only": { "type": "boolean" },
+            "mutating_allowed": { "type": "boolean" },
+            "protected_resource_discriminator": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

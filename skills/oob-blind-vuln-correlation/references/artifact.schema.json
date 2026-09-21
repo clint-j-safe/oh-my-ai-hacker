@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "oob-blind-vuln-correlation artifact",
+  "type": "object",
+  "required": ["correlated_callbacks"],
+  "additionalProperties": true,
+  "properties": {
+    "correlated_callbacks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["request_id", "canary", "protocol", "latency_ms"],
+        "additionalProperties": true,
+        "properties": {
+          "request_id": { "type": "string" },
+          "canary": { "type": "string" },
+          "protocol": { "enum": ["dns", "http", "smtp"] },
+          "latency_ms": { "type": "integer" },
+          "raw_log_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "pending_count": { "type": "integer" },
+        "correlated_count": { "type": "integer" },
+        "timed_out": { "type": "array", "items": { "type": "string" } },
+        "uncorrelated_interactions": { "type": "array" },
+        "observer_only": { "type": "boolean" },
+        "sends_target_traffic": { "type": "boolean" },
+        "mutates": { "type": "boolean" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

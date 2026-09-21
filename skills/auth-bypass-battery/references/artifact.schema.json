@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "auth-bypass-battery artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["endpoint", "vector", "bypass_class", "status", "confidence"],
+        "additionalProperties": true,
+        "properties": {
+          "endpoint": { "type": "string" },
+          "vector": { "type": "string" },
+          "bypass_class": { "type": "string" },
+          "method": { "type": "string" },
+          "url_requested": { "type": "string" },
+          "sent_headers": { "type": "object" },
+          "mutating": { "type": "boolean" },
+          "status": { "type": "integer" },
+          "verdict": {
+            "enum": ["confirmed", "likely", "denied", "absent", "other", "error"]
+          },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "body_hash": { "type": "string" },
+          "body_bytes": { "type": "integer" },
+          "baseline_status": { "enum": [401, 403] },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["endpoint", "vectors_total", "vectors_attempted", "vectors_exhausted"],
+        "additionalProperties": true,
+        "properties": {
+          "endpoint": { "type": "string" },
+          "method": { "type": "string" },
+          "baseline_status": { "type": ["integer", "null"] },
+          "vectors_total": { "type": "integer", "minimum": 0 },
+          "vectors_attempted": { "type": "integer", "minimum": 0 },
+          "vectors_exhausted": { "type": "boolean" },
+          "class_results": { "type": "object" },
+          "confirmed": { "type": "integer", "minimum": 0 },
+          "likely": { "type": "integer", "minimum": 0 },
+          "skipped": {
+            "type": ["string", "null"],
+            "enum": ["out_of_scope", "baseline_error", "not_protected", null]
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "skill": { "const": "auth-bypass-battery" },
+        "phase": { "const": "5" },
+        "status": {
+          "enum": ["bypass_confirmed", "exhausted_no_bypass", "no_protected_endpoints", "error"]
+        },
+        "all_vectors_exhausted": { "type": "boolean" },
+        "bypass_classes": { "type": "array", "items": { "type": "string" } },
+        "safety": {
+          "type": "object",
+          "properties": {
+            "read_only": { "type": "boolean" },
+            "mutating_allowed": { "type": "boolean" },
+            "bounded_vectors": { "type": "boolean" },
+            "max_requests_per_endpoint": { "type": "integer" },
+            "scope_gated": { "type": "boolean" },
+            "soft_404_discriminator": { "type": "boolean" },
+            "baseline_denial_required": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

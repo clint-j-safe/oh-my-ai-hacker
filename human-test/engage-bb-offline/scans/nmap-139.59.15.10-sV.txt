@@ -1,0 +1,22 @@
+# Nmap 7.94SVN scan initiated Sun Sep 20 04:58:58 2026 as: nmap -sV -T3 --max-rate 500 -p 1-65535 -sC --open -oX /opt/engage-bb/scans/nmap-139.59.15.10-sV.xml -oG - -oN /opt/engage-bb/scans/nmap-139.59.15.10-sV.txt 139.59.15.10
+Nmap scan report for 139.59.15.10
+Host is up (0.00053s latency).
+Not shown: 65529 closed tcp ports (reset), 3 filtered tcp ports (no-response)
+Some closed ports may be reported as filtered due to --defeat-rst-ratelimit
+PORT     STATE SERVICE VERSION
+22/tcp   open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.19 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey: 
+|   256 f2:7f:83:a4:f8:67:0a:86:37:7b:39:2b:d0:e4:66:00 (ECDSA)
+|_  256 33:d5:60:b1:d4:cb:66:d5:af:39:9d:40:82:64:3a:a2 (ED25519)
+80/tcp   open  http    Apache httpd
+|_http-server-header: Apache
+|_http-title: 404 Not Found
+3000/tcp open  http    nginx 1.31.6
+|_http-title: UnSAFE Bank
+|_http-server-header: nginx/1.31.6
+| http-methods: 
+|_  Potentially risky methods: TRACE
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+
+Service detection performed. Please report any incorrect results at https://nmap.org/submit/ .
+# Nmap done at Sun Sep 20 05:01:26 2026 -- 1 IP address (1 host up) scanned in 147.90 seconds

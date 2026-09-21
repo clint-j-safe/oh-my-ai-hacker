@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "blast-radius-estimation artifact",
+  "type": "object",
+  "required": ["risk_grade", "gentle_probe", "justification"],
+  "additionalProperties": true,
+  "properties": {
+    "risk_grade": { "enum": ["read_only", "mutating", "destructive", "account_creating"] },
+    "gentle_probe": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "payload": { "type": "string" },
+        "method": { "type": "string" }
+      }
+    },
+    "justification": { "type": "string" },
+    "estimated_mutation_cost": { "type": "integer" },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "advisory_only": { "type": "boolean" },
+        "vuln_class": { "type": "string" },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "proposed_grade": { "type": "string" },
+        "probe_grade": { "type": "string" },
+        "requires_oob": { "type": "boolean" },
+        "recommend_abort_original": { "type": "boolean" },
+        "original_impact": { "enum": ["bounded", "irreversible"] },
+        "mutation_budget_units": { "type": "integer" },
+        "sends_traffic": { "type": "boolean" },
+        "final_authority": { "type": "string" },
+        "canary": { "type": "string" }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

@@ -1,0 +1,2 @@
+HTTP 200 /api/logout
+{"status":"Success","status_code":"LGT001","message":"Logged out Successfully","timestamp":1789883645,"data":{}}

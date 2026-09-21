@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tech-fingerprinting artifact",
+  "type": "object",
+  "required": ["stack", "waf", "edge"],
+  "additionalProperties": true,
+  "properties": {
+    "stack": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["component", "confidence"],
+        "additionalProperties": true,
+        "properties": {
+          "component": { "type": "string" },
+          "version": { "type": ["string", "null"] },
+          "category": { "enum": ["server", "framework", "language", "database", "cdn", "library"] },
+          "confidence": { "enum": ["high", "medium", "low"] },
+          "evidence": { "type": "string" },
+          "known_cves": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "severity": { "enum": ["critical", "high", "medium", "low"] },
+                "summary": { "type": "string" }
+              }
+            }
+          },
+          "cves_overflow_spill_id": { "type": ["string", "null"] },
+          "known_cves_total": { "type": "integer" }
+        }
+      }
+    },
+    "waf": {
+      "type": "object",
+      "properties": {
+        "detected": { "type": "boolean" },
+        "product": { "type": ["string", "null"] },
+        "evidence": { "type": "string" },
+        "checked": { "type": "boolean" },
+        "responses_examined": { "type": "integer" }
+      }
+    },
+    "edge": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["product", "kind"],
+        "properties": {
+          "product": { "type": "string" },
+          "kind": { "enum": ["cdn", "cloud"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "meta": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}

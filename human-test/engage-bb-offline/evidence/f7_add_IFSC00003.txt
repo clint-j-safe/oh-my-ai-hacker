@@ -1,0 +1,2 @@
+HTTP 200 /api/beneficiary/add
+{"status":"Failed","status_code":"BNF007","message":"Account Number or IFSC Code is Incorrect","timestamp":1789883551,"data":{}}

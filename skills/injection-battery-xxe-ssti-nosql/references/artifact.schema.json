@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "injection-battery-xxe-ssti-nosql artifact",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": true,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["vuln_class", "parameter", "payload"],
+        "additionalProperties": true,
+        "properties": {
+          "vuln_class": { "enum": ["XXE", "SSTI", "NoSQL"] },
+          "parameter": { "type": "string" },
+          "payload": { "type": "string" },
+          "engine_identified": { "type": "string" },
+          "confidence": { "enum": ["confirmed", "suspected"] },
+          "rce_capable": { "type": "boolean" },
+          "rce_executed": { "type": "boolean" },
+          "rce_poc": { "type": ["string", "null"] },
+          "evidence_spill_id": { "type": "string" }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "safety": {
+          "type": "object",
+          "properties": {
+            "rce_executed": { "type": "boolean" },
+            "dos_entities": { "type": "boolean" },
+            "where_js_exec": { "type": "boolean" },
+            "read_only_proof": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "scope_summary": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "error"],
+        "properties": { "stage": { "type": "string" }, "error": { "type": "string" } }
+      }
+    }
+  }
+}
