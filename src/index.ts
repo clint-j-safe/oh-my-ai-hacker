@@ -14,3 +14,8 @@ export { SdkRunner, parseFindings } from "./sdk-runner.js";
 export type { SdkRunnerOptions } from "./sdk-runner.js";
 export { runEngagement } from "./run-engagement.js";
 export type { EngagementInput, EngagementResult } from "./run-engagement.js";
+export { makeCanary, extractCanaryFromDns, extractCanaryFromHttpPath, CallbackLog } from "./oob.js";
+export type { CallbackEvent, CallbackType } from "./oob.js";
+export { parseDnsQuery, buildDnsResponse } from "./dns.js";
+export type { DnsQuery } from "./dns.js";
+export { startOob } from "./oob-server.js";
