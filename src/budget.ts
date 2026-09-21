@@ -62,6 +62,15 @@ export class Budget {
     return { ok: true };
   }
 
+  /** True only while strictly under every limit (safe to take another turn). */
+  canContinue(): boolean {
+    return (
+      this.state.usd < this.limits.usd &&
+      this.state.turns < this.limits.turns &&
+      this.state.tokens < this.limits.tokens
+    );
+  }
+
   reset(): void {
     this.state = { usd: 0, turns: 0, tokens: 0 };
   }

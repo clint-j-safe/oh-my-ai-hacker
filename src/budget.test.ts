@@ -52,4 +52,13 @@ describe("Budget", () => {
     expect(b.usage()).toEqual({ usd: 0, turns: 0, tokens: 0 });
     expect(b.check().ok).toBe(true);
   });
+
+  it("canContinue() is false at (or past) any limit, true strictly under", () => {
+    const b = new Budget({ usd: 1, turns: 2, tokens: 1000 });
+    expect(b.canContinue()).toBe(true);
+    b.record(turn(0.5, 500));
+    expect(b.canContinue()).toBe(true); // 0.5 < 1, 1 < 2, 500 < 1000
+    b.record(turn(0.5, 500));
+    expect(b.canContinue()).toBe(false); // usd=1.0 (at limit), turns=2 (at limit), tokens=1000 (at limit)
+  });
 });
