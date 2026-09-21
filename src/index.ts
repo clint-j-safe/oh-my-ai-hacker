@@ -1,0 +1,16 @@
+export { Scope, ScopeError, parseScope } from "./scope.js";
+export type { ScopeInput, ScopeEndpoint } from "./scope.js";
+export { Tether, createTether } from "./tether.js";
+export type { ToolAction, TetherResult, TetherDecision, ImpactTier, TetherOptions } from "./tether.js";
+export { Axiom } from "./axiom.js";
+export type { Invariant, InvariantType, Evidence, AxiomVerdict, VerdictStatus, DecidedBy } from "./axiom.js";
+export { ArtifactStore, hash } from "./artifact-store.js";
+export type { ProvenanceEntry, StoredArtifact } from "./artifact-store.js";
+export { Budget, tokenTotal } from "./budget.js";
+export type { BudgetLimits, BudgetUsage, TokenUsage, BudgetCheck, BreachKind } from "./budget.js";
+export { Orchestrator } from "./orchestrator.js";
+export type { Phase, PhaseSpec, Finding, AgentResult, AgentRunner, RunResult, RunExit, VerdictedFinding } from "./orchestrator.js";
+export { SdkRunner, parseFindings } from "./sdk-runner.js";
+export type { SdkRunnerOptions } from "./sdk-runner.js";
+export { runEngagement } from "./run-engagement.js";
+export type { EngagementInput, EngagementResult } from "./run-engagement.js";
