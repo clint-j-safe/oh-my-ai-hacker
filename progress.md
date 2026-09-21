@@ -32,3 +32,4 @@ Task 2: complete (tests: npx vitest run src/tether.test.ts -> 22/22 pass)
 Task 3: complete (tests: npx vitest run src/axiom.test.ts -> 13/13 pass)
   Ruling: body_contains "marker in both exploit+control" -> FALSE_POSITIVE (was NEEDS_REVIEW). Differential test failing disproves the claim. jev cross-check agreed (0.91). Cost if wrong: a real finding whose control was mis-built would be auto-dismissed; mitigated by exploit-constructor emitting a proper control.
 Task 4: complete (tests: npx vitest run src/artifact-store.test.ts -> 7/7 pass)
+Task 5: complete (tests: npx vitest run src/budget.test.ts -> 6/6 pass)
