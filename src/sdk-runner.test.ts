@@ -40,8 +40,8 @@ describe("SdkRunner", () => {
           calls.push("create");
           return { data: { id: "sess-1" } };
         },
-        prompt: async (args: { path: { id: string }; body?: { agent?: string; parts?: Array<{ type: string; text: string }> } }) => {
-          calls.push(`prompt:${args.path.id}:${args.body?.agent}`);
+        prompt: async (args: { sessionID: string; agent?: string; parts?: Array<{ type: string; text: string }> }) => {
+          calls.push(`prompt:${args.sessionID}:${args.agent}`);
           return {
             data: {
               info: { cost: 0.042, tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },

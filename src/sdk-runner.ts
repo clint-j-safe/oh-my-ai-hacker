@@ -6,7 +6,7 @@
  * AssistantMessage.cost/.tokens → parse proposed findings from text parts).
  */
 
-import type { OpencodeClient } from "@opencode-ai/sdk";
+import { type OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { AgentResult, Finding } from "./orchestrator.js";
 import type { TokenUsage } from "./budget.js";
 
@@ -96,21 +96,19 @@ export class SdkRunner {
   }
 
   async run(agent: string, objective: string): Promise<AgentResult> {
-    const created = await this.client.session.create();
+    const created = await this.client.session.create({ directory: this.directory });
     const sessionId = created.data?.id;
     if (!sessionId) {
       throw new Error(`session.create() failed: ${JSON.stringify(created.error ?? "no session id")}`);
     }
 
     const resp = await this.client.session.prompt({
-      path: { id: sessionId },
-      query: { directory: this.directory },
-      body: {
-        agent,
-        ...(this.model ? { model: this.model } : {}),
-        ...(this.system ? { system: this.system } : {}),
-        parts: [{ type: "text", text: objective }],
-      },
+      sessionID: sessionId,
+      directory: this.directory,
+      agent,
+      ...(this.model ? { model: this.model } : {}),
+      ...(this.system ? { system: this.system } : {}),
+      parts: [{ type: "text", text: objective }],
     });
 
     if (resp.error) {
