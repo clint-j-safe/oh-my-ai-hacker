@@ -4,7 +4,7 @@ description: >-
   HTTP service surface, and emits a structured attack-surface map. Black-box:
   works from the provided in-scope URLs only.
 kind: agent
-model: "{{FAST_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{FAST_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.2
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —

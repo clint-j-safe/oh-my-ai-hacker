@@ -5,7 +5,7 @@ description: >-
   vulnerability. Emits deterministic, replayable, Axiom-verifiable chains.
   Black-box; proposes, never executes.
 kind: agent
-model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{REASONING_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.4
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —

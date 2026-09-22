@@ -5,7 +5,7 @@ description: >-
   request envelopes, serialization gadgets, crypto routines, and hardcoded
   secret references. Black-box; uses only target-delivered assets.
 kind: agent
-model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{REASONING_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.2
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —

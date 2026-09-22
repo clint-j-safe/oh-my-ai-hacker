@@ -4,7 +4,7 @@ description: >-
   into a single graph of authentication flows, business workflows, forms, and
   file-upload paths that Phase 2 reasons over. Black-box.
 kind: agent
-model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{REASONING_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.2
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —

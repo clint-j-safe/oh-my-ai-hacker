@@ -5,7 +5,7 @@ description: >-
   requests, and responses and returns a strictly-formatted verdict. No network,
   no writes.
 kind: agent
-model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{REASONING_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.0
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —

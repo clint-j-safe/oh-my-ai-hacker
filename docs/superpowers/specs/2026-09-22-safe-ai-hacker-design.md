@@ -1,7 +1,8 @@
 # SAFE AI Hacker — Architecture Design Document
 
 **Version:** 2.0 · **Date:** 2026-09-22
-**Runtime:** OpenAI **TypeScript** SDK as a stateless client → self-hosted **GLM 5.3 on Amazon SageMaker** (OpenAI-compatible endpoint)
+**Runtime:** OpenAI **TypeScript** SDK as a stateless client
+**Provider:** **OpenRouter** while building and testing → **self-hosted GLM 5.3 on Amazon SageMaker** for production. Both are OpenAI-compatible; the swap is a profile, not a rewrite.
 **Paradigm:** Client-side loop engineering + adversarial verification
 **Status:** *Documentation only.* No code, no runtime wiring, no engagement run in this phase.
 
@@ -92,9 +93,10 @@ CONTROL PLANE  (TypeScript, openai npm SDK)  —  the Big Loop
   Spine             progress + rules files; read first, written last, each beat
   Artifact Store    content-addressed (SHA-256), immutable, indexed by trace id
 
-MODEL LAYER
-  AI Gateway → short-lived per-engagement credential
-             → SageMaker GLM 5.3   (OpenAI-compatible baseURL)
+MODEL LAYER   (one client, two profiles — selected by env, never by code)
+  test  → OpenRouter            baseURL https://openrouter.ai/api/v1
+  prod  → AI Gateway → SageMaker GLM 5.3   baseURL https://<endpoint>/openai/v1
+          (short-lived per-engagement credential from a scoped IAM role)
 
 EXECUTION PLANE  (ephemeral Docker per agent/iteration, disposable volumes) — Small Loops
   Agent instructions   docs/agents/*.md   (core.md prepended to each)
@@ -108,6 +110,42 @@ STATE & OBSERVABILITY
 
 - **AI Hacker Tether** = the scope/safety gate — decides whether an action may run.
 - **AI Hacker Axiom** = the validation core — decides whether a result is a finding.
+
+### 4.1 Provider profiles
+
+The whole point of targeting the OpenAI-compatible surface is that the provider is
+configuration. **No agent, prompt, skill, tool or verdict logic changes between profiles.**
+
+| | `test` (now) | `prod` (later) |
+|---|---|---|
+| Provider | OpenRouter | SageMaker, self-hosted GLM 5.3 |
+| `baseURL` | `https://openrouter.ai/api/v1` | `https://<endpoint>/openai/v1` |
+| Auth | `OPENROUTER_API_KEY` | short-lived per-engagement credential from the AI Gateway |
+| `{{REASONING_MODEL}}` | any capable OpenRouter slug | `glm-5.3` |
+| `{{FAST_MODEL}}` | a cheap OpenRouter slug | `glm-5.3` |
+| Cost signal | real per-token USD, returned by the provider | **none — see below** |
+| Data egress | third party sees engagement traffic | stays inside the VPC |
+
+Agent files already reference **logical** model names (`{{REASONING_MODEL}}`,
+`{{FAST_MODEL}}`), resolved by the orchestrator at dispatch. That indirection is what makes
+the cutover a config change: no agent file is edited when the provider moves.
+
+**Two things genuinely differ, and both must be handled before the cutover:**
+
+1. **The budget stop loses its unit.** OpenRouter bills per token, so `maxBudgetUsd` is real.
+   A self-hosted SageMaker endpoint bills for *uptime* — there is no per-token price, and a
+   naive cost accumulator reads **`cost: 0` forever**, silently disabling the budget stop.
+   The ceiling is therefore defined in **tokens and turns**, which both profiles report, with
+   USD derived only when the profile supplies a price. See §12.
+2. **Scope discipline must survive the profile.** Under `test`, engagement traffic — including
+   recovered `{{secret:ref}}` context — transits a third party. Only authorized targets whose
+   rules of engagement permit third-party model routing may run under `test`; anything else
+   waits for `prod`. This is a scope decision, not a performance one.
+
+The shared assumption is the OpenAI-compatible surface itself: `tools`, `parallel_tool_calls`,
+`response_format`, and a populated `usage`. OpenRouter supports all four, so building on
+`test` does **not** prove the SageMaker shim does — that verification is a cutover gate, not a
+Phase 1 gate.
 
 ---
 
@@ -126,13 +164,13 @@ orchestrator drives this loop itself — the SDK is a stateless transport.
 implement `/chat/completions` only. Agent prompts therefore travel as a `system` message,
 never as an `instructions` field.
 
-> **To verify against the deployed endpoint before Phase 1.** This design assumes the GLM 5.3
-> shim supports `tools` (function calling), `parallel_tool_calls`, `response_format:
-> {type: "json_object"}`, and a populated `usage` object. `response_format` combined with
-> `tools` is the least likely to be supported. If it is not, the orchestrator falls back to
-> schema-validating the terminal message content and re-prompting on a parse failure — the
-> budget and verdict logic are unaffected, since both read `usage` and the artifact store,
-> not the response format.
+> **Cutover gate, not a Phase 1 gate.** OpenRouter supports `tools`, `parallel_tool_calls`,
+> `response_format: {type: "json_object"}` and a populated `usage`, so `test` runs prove
+> nothing about the SageMaker shim. Before the `prod` cutover, verify all four against the
+> deployed GLM 5.3 endpoint — `response_format` combined with `tools` is the least likely to
+> survive. If it does not, the orchestrator falls back to schema-validating the terminal
+> message content and re-prompting on a parse failure; the budget and verdict logic are
+> unaffected, since both read `usage` and the artifact store, not the response format.
 
 ### 5.2 Outer loop (the orchestrator owns it)
 
@@ -463,8 +501,11 @@ imagined evidence.
 
 - **Untrusted target by definition.** Every execution happens in an ephemeral container with
   no route to internal networks and no orchestrator credentials mounted.
-- **Credentials.** SageMaker access is a short-lived, per-engagement credential issued by the
-  AI Gateway from a scoped IAM role. Never hardcoded, never in the workspace, never in a trace.
+- **Credentials.** Under `prod`, SageMaker access is a short-lived, per-engagement credential
+  issued by the AI Gateway from a scoped IAM role. Under `test`, it is `OPENROUTER_API_KEY`.
+  Either way: never hardcoded, never in the workspace, never in a trace.
+- **Profile is a scope decision.** `test` routes engagement traffic through a third party. Only
+  targets whose rules of engagement permit that may run under it (§4.1).
 - **MCP servers** are version-pinned and audited; custom verification tools are preferred over
   third-party plugins; each runs least-privilege and scoped to the engagement target.
 - **Secrets never materialise** in prompts, the graph, traces, or reports — only
@@ -483,7 +524,7 @@ The SDK defaults are wrong for this workload and must be overridden explicitly:
 | Timeout | Default is 10 minutes. Set a multi-hour `timeout` for long dynamic sequences, wrapped in an orchestrator `AbortSignal` that trips first |
 | Retries | Default is 2 with exponential backoff. Keep retries for transport errors; set `maxRetries: 0` on any call whose tool execution is **not** idempotent |
 | Streaming | Treat streamed content as progress, not as data of record. The terminal non-streamed response object is the source of truth |
-| Budget | Read `usage` off every completion; the accumulated USD figure is the abort trigger |
+| Budget | Read `usage` off every completion. The ceiling is **tokens and turns** — both profiles report those. USD is derived only when the profile supplies a price, so a self-hosted endpoint reporting `cost: 0` cannot silently disable the stop |
 | Idempotence | Every tool is designed to be safely re-run, because retries and replays both re-run it |
 
 ---
@@ -531,21 +572,38 @@ import { observeOpenAI } from "@langfuse/openai";
 const sdk = new NodeSDK({ spanProcessors: [new LangfuseSpanProcessor()] });
 sdk.start();
 
-// Provider-agnostic: GLM 5.3 behind an OpenAI-compatible SageMaker endpoint.
+// One client, two profiles. Nothing below this line knows which provider is live.
+const PROFILES = {
+  test: {                                     // building and testing, today
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey:  process.env.OPENROUTER_API_KEY,
+    models:  { REASONING_MODEL: process.env.OR_REASONING, FAST_MODEL: process.env.OR_FAST },
+    pricedPerToken: true,                     // real USD → maxBudgetUsd is meaningful
+  },
+  prod: {                                     // self-hosted, later
+    baseURL: process.env.SAGEMAKER_GLM_ENDPOINT_URL,   // https://<endpoint>/openai/v1
+    apiKey:  await gateway.issueEngagementCredential(engagementId),  // short-lived
+    models:  { REASONING_MODEL: "glm-5.3", FAST_MODEL: "glm-5.3" },
+    pricedPerToken: false,                    // endpoint bills for uptime → token/turn ceilings
+  },
+} as const;
+
+const profile = PROFILES[process.env.SAHW_PROFILE ?? "test"];
+
 const client = observeOpenAI(
   new OpenAI({
-    baseURL: process.env.SAGEMAKER_GLM_ENDPOINT_URL,  // https://<endpoint>/openai/v1
-    apiKey: engagementKey,                            // short-lived, from the AI Gateway
-    timeout: 60 * 60 * 1000,                          // default is 10 min — far too short
-    maxRetries: 0,                                    // orchestrator owns retry policy
+    baseURL: profile.baseURL,
+    apiKey:  profile.apiKey,
+    timeout: 60 * 60 * 1000,                  // default is 10 min — far too short
+    maxRetries: 0,                            // orchestrator owns retry policy
   }),
-  { traceName: "sahw-beat", sessionId: engagementId }
+  { traceName: "sahw-beat", sessionId: engagementId, tags: [process.env.SAHW_PROFILE ?? "test"] }
 );
 
 // The adjudicator's capability boundary IS this tools array.
 const verdict = await client.chat.completions.create(
   {
-    model: "glm-5.3",
+    model: profile.models.REASONING_MODEL,   // logical name → profile-resolved slug
     messages: [
       { role: "system", content: CORE_PREAMBLE + ADJUDICATOR_INSTRUCTIONS },
       { role: "user", content: JSON.stringify(findingPayload) },
@@ -569,6 +627,10 @@ OpenRouter routing and an `opencode.json` config. That config file is deleted an
 frontmatter has been rewritten from OpenCode's schema (`mode`, `permission`, tool toggles) to
 the OpenAI SDK request shape (`tools`, `skills`, `sandbox`). The *target, hard constraints,
 prompts, skills and artifact schemas are unchanged* — only the runtime moved.
+
+Note that OpenRouter is **not** gone: v1 used it as the primary router, and v2 keeps it as the
+`test` provider profile (§4.1) while SageMaker GLM 5.3 becomes the `prod` target. What v1 got
+wrong was binding the *runtime* to OpenCode, not the choice of router.
 
 ---
 

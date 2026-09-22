@@ -5,7 +5,7 @@ description: >-
   prioritized, per-endpoint set of at most 3 test strategies. Does NOT emit an
   endpoint × vuln-class matrix. Black-box.
 kind: agent
-model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
+model: "{{REASONING_MODEL}}"           # logical name; resolved per provider profile (OpenRouter now, SageMaker later)
 temperature: 0.3
 
 # OpenAI SDK request shape. `tools` below IS the request's tools array —
