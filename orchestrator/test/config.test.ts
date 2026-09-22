@@ -52,3 +52,37 @@ test("refuses a phase timeout that does not trip before the transport", () => {
 test("rejects a non-http scheme in scope", () => {
   assert.throws(() => loadEngagement({ ...base, SAHW_SCOPE: "ftp://10.0.0.1" }, NOW), ConfigError);
 });
+
+test("budgetUsd is null when unset — it means \"not priced per token\", not zero", () => {
+  const e = loadEngagement(base, NOW);
+  assert.equal(e.budgetUsd, null);
+});
+
+test("budgetUsd parses a valid value", () => {
+  const e = loadEngagement({ ...base, SAHW_BUDGET_USD: "25" }, NOW);
+  assert.equal(e.budgetUsd, 25);
+});
+
+test("refuses a malformed budgetUsd instead of silently disabling the spend cap", () => {
+  assert.throws(() => loadEngagement({ ...base, SAHW_BUDGET_USD: "abc" }, NOW), ConfigError);
+});
+
+test("budgetTokens applies its default and parses an override", () => {
+  const withDefault = loadEngagement(base, NOW);
+  assert.equal(withDefault.budgetTokens, 2_000_000);
+  const withOverride = loadEngagement({ ...base, SAHW_BUDGET_TOKENS: "500000" }, NOW);
+  assert.equal(withOverride.budgetTokens, 500_000);
+});
+
+test("outOfScope is empty by default and parses a provided list", () => {
+  const withDefault = loadEngagement(base, NOW);
+  assert.deepEqual(withDefault.outOfScope, []);
+  const e = loadEngagement({ ...base, SAHW_OUT_OF_SCOPE: "http://10.0.0.1/admin" }, NOW);
+  assert.equal(e.outOfScope.length, 1);
+  assert.equal(e.outOfScope[0].pathname, "/admin");
+});
+
+test("treats a whitespace-only numeric field as unset instead of silently coercing it to zero", () => {
+  const e = loadEngagement({ ...base, SAHW_MAX_TURNS: "  " }, NOW);
+  assert.equal(e.maxTurns, 40, "must fall back to the default, not Number(\" \") === 0");
+});

@@ -20,7 +20,15 @@ type Env = Record<string, string | undefined>;
 
 function num(env: Env, key: string, fallback: number): number {
   const raw = env[key];
-  if (raw === undefined || raw === "") return fallback;
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new ConfigError(`${key} is not a number: ${raw}`);
+  return n;
+}
+
+function numOrNull(env: Env, key: string): number | null {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) throw new ConfigError(`${key} is not a number: ${raw}`);
   return n;
@@ -74,8 +82,6 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
   if (profileRaw !== "test" && profileRaw !== "prod") {
     throw new ConfigError(`SAHW_PROFILE must be "test" or "prod", got ${profileRaw}`);
   }
-  const usd = env.SAHW_BUDGET_USD;
-
   return {
     scope,
     outOfScope: urls(env.SAHW_OUT_OF_SCOPE, "SAHW_OUT_OF_SCOPE"),
@@ -85,7 +91,7 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
     maxTurns: num(env, "SAHW_MAX_TURNS", 40),
     budgetTurns: num(env, "SAHW_BUDGET_TURNS", 200),
     budgetTokens: num(env, "SAHW_BUDGET_TOKENS", 2_000_000),
-    budgetUsd: usd === undefined || usd === "" ? null : Number(usd),
+    budgetUsd: numOrNull(env, "SAHW_BUDGET_USD"),
     requestTimeoutMs,
     phaseTimeoutMs,
     maxRetries: num(env, "SAHW_MAX_RETRIES", 0),
