@@ -47,12 +47,71 @@ test("tool schemas are in chat.completions shape with required fields", () => {
 
 test("http_request captures request and response and stores an artifact", async () => {
   const r = await runner(okFetch);
-  const out = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/x" });
+  const sentHeaders = { "x-test-header": "abc123" };
+  const sentBody = "hello-body";
+  const out = await r.execute("http_request", {
+    method: "POST",
+    url: "http://10.0.0.1:3000/x",
+    headers: sentHeaders,
+    body: sentBody,
+  });
   assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
   const cap = out.result as any;
+  // Request half — asserted explicitly. Previously this test only checked the response
+  // half and the artifact hash format, so `capture.request` could have been `{}` (or
+  // otherwise wrong) and every assertion here would still have passed; "captures request
+  // AND response" was met in code but unverified. A dropped/mangled request half would
+  // be an evidence-integrity defect (the artifact is supposed to be the verbatim
+  // exchange), so pin it directly.
+  assert.equal(cap.request.method, "POST");
+  assert.equal(cap.request.url, "http://10.0.0.1:3000/x");
+  assert.equal(cap.request.headers["x-test-header"], "abc123");
+  assert.equal(cap.request.body, sentBody);
+  // Response half.
   assert.equal(cap.response.status, 200);
   assert.equal(cap.response.body, "BODY-OK");
   assert.match(cap.artifact.sha256, /^[0-9a-f]{64}$/);
+});
+
+test("a 3xx response is captured verbatim and NOT auto-followed", async () => {
+  // What this test can and cannot prove, honestly stated:
+  // - `lastOptions?.redirect === "manual"` is the load-bearing assertion. It pins that
+  //   ToolRunner actually asks the transport for manual redirect handling instead of
+  //   relying on the WHATWG default ("follow"). Delete `redirect: "manual"` from
+  //   tools.ts and THIS assertion fails.
+  // - `status === 302` / `headers["location"] === ...` prove a 3xx is captured usefully
+  //   (status + Location visible), not silently discarded or swallowed.
+  // - `callCount === 1` is shape-only here: `redirectFetch` is a hand-written mock that
+  //   never follows anything regardless of what `options.redirect` says, so this
+  //   assertion cannot fail no matter what ToolRunner passes. It does NOT demonstrate
+  //   "the redirect target was never contacted" — that property depends on undici's
+  //   real behaviour under `redirect: "manual"`, which cannot be exercised here without
+  //   a real network call (forbidden by this project's test constraints). That real
+  //   no-follow behaviour was verified empirically against a local 302 server by the
+  //   reviewer who requested this fix (see the fix-round report addendum), not by this
+  //   test suite.
+  let callCount = 0;
+  let lastOptions: RequestInit | undefined;
+  const redirectFetch = (async (_url: unknown, options?: RequestInit) => {
+    callCount++;
+    lastOptions = options;
+    return new Response("moved", {
+      status: 302,
+      headers: { Location: "http://evil.test/reached" },
+    });
+  }) as unknown as typeof fetch;
+
+  const r = await runner(redirectFetch);
+  const out = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/redirect" });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const cap = out.result as any;
+  assert.equal(cap.response.status, 302);
+  // The Headers API lower-cases header names on iteration.
+  assert.equal(cap.response.headers["location"], "http://evil.test/reached");
+  assert.equal(callCount, 1, "the redirect target must not be auto-followed");
+  assert.equal(lastOptions?.redirect, "manual", "ToolRunner must request manual redirect handling");
 });
 
 test("http_request is denied out of scope and never calls fetch", async () => {
@@ -61,7 +120,9 @@ test("http_request is denied out of scope and never calls fetch", async () => {
   const r = await runner(spy);
   const out = await r.execute("http_request", { method: "GET", url: "http://evil.test/" });
   assert.equal(out.ok, false);
-  assert.match(out.denied!, /not in SAHW_SCOPE/);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "policy");
+  assert.match(out.denied, /not in SAHW_SCOPE/);
   assert.equal(called, false, "fetch must not run when the Tether denies");
 });
 
@@ -69,20 +130,80 @@ test("shell_exec is denied for destructive commands without executing", async ()
   const r = await runner(okFetch);
   const out = await r.execute("shell_exec", { command: "rm -rf /" });
   assert.equal(out.ok, false);
-  assert.match(out.denied!, /destructive/);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "policy");
+  assert.match(out.denied, /destructive/);
 });
 
-test("an unknown tool is denied, not silently ignored", async () => {
+test("an unknown tool is denied by policy, not silently ignored via the no-executor fallback", async () => {
   const r = await runner(okFetch);
   const out = await r.execute("exfiltrate", {});
   assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  // Must be "policy" (gate()'s own default-deny for an unrecognized tool name), not
+  // "no_executor" (ToolRunner's fallback for a tool gate() ALLOWED but has no dispatch
+  // branch for). If gate()'s unknown-tool default-deny were ever deleted, execute()'s
+  // own "no executor" fallback would still produce ok:false with SOME message — so
+  // `assert.equal(out.ok, false)` alone cannot tell "the Tether denied it" apart from
+  // "the Tether waved it through and ToolRunner happened to have nothing to run".
+  // Pinning kind === "policy" is what actually proves the Tether's default-deny ran.
+  assert.equal(out.kind, "policy");
+});
+
+test("a tool the Tether allows but ToolRunner has no executor for reports kind: no_executor", async () => {
+  // Complements the unknown-tool test above: this exercises the OTHER branch that can
+  // also return ok:false — a tool name gate() recognizes and allows (shell_exec with a
+  // non-destructive command passes checkCommand()) but for which ToolRunner has no
+  // dispatch branch. Without this test, "no_executor" was a type-level literal with no
+  // test ever actually reaching it.
+  const r = await runner(okFetch);
+  const out = await r.execute("shell_exec", { command: "echo hello" });
+  assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "no_executor");
+  assert.match(out.denied, /no executor/);
 });
 
 test("identical responses collapse to one artifact", async () => {
   const r = await runner(okFetch);
   const a = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/a" });
   const b = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/a" });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  if (!a.ok || !b.ok) throw new Error("unreachable");
   assert.equal((a.result as any).artifact.sha256, (b.result as any).artifact.sha256);
+});
+
+test("exchanges differing only in a request header produce different artifact hashes", async () => {
+  // The dangerous direction of content-addressing to get wrong: two DISTINCT exchanges
+  // sharing one artifact would let a finding cite evidence that is not its own. The
+  // collapsing test above only proves identical requests collapse; it says nothing about
+  // whether a near-identical-but-different request would wrongly collapse too.
+  const r = await runner(okFetch);
+  const a = await r.execute("http_request", {
+    method: "GET", url: "http://10.0.0.1:3000/same-path", headers: { "x-tag": "one" },
+  });
+  const b = await r.execute("http_request", {
+    method: "GET", url: "http://10.0.0.1:3000/same-path", headers: { "x-tag": "two" },
+  });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  if (!a.ok || !b.ok) throw new Error("unreachable");
+  assert.notEqual((a.result as any).artifact.sha256, (b.result as any).artifact.sha256);
+});
+
+test("exchanges differing only in request body produce different artifact hashes", async () => {
+  const r = await runner(okFetch);
+  const a = await r.execute("http_request", {
+    method: "POST", url: "http://10.0.0.1:3000/same-path", body: "one",
+  });
+  const b = await r.execute("http_request", {
+    method: "POST", url: "http://10.0.0.1:3000/same-path", body: "two",
+  });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  if (!a.ok || !b.ok) throw new Error("unreachable");
+  assert.notEqual((a.result as any).artifact.sha256, (b.result as any).artifact.sha256);
 });
 
 // --- Strengthened / additional coverage beyond the brief's baseline ---
@@ -97,6 +218,8 @@ test("http_request never calls fetch for an out-of-scope request (network-touch 
     const r = await runner(spy);
     const out = await r.execute("http_request", { method: "GET", url });
     assert.equal(out.ok, false, `expected denial for ${url}`);
+    if (out.ok) throw new Error("unreachable");
+    assert.equal(out.kind, "policy", `expected a policy denial for ${url}`);
     assert.equal(called, false, `fetch must not run for ${url}`);
   }
 });
@@ -111,6 +234,8 @@ test("denied http_request writes no artifact to the store", async () => {
   const r = new ToolRunner({ engagement: E, store, fetchImpl: spy });
   const out = await r.execute("http_request", { method: "GET", url: "http://evil.test/" });
   assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "policy");
   assert.equal(called, false);
   // No artifact directory should have been created by this call.
   const { readdir } = await import("node:fs/promises");
@@ -129,7 +254,9 @@ test("shell_exec destructive commands are denied with a destructive reason acros
   for (const command of ["rm -rf /", "rm --recursive --force /", "dd if=/dev/zero of=/dev/sda"]) {
     const out = await r.execute("shell_exec", { command });
     assert.equal(out.ok, false, `expected denial for: ${command}`);
-    assert.match(out.denied!, /destructive/, `expected destructive reason for: ${command}`);
+    if (out.ok) throw new Error("unreachable");
+    assert.equal(out.kind, "policy", `expected a policy denial for: ${command}`);
+    assert.match(out.denied, /destructive/, `expected destructive reason for: ${command}`);
   }
 });
 
@@ -144,7 +271,9 @@ test("read_artifact denies a malformed sha256 via the upfront format check, not 
   // `out.denied` was truthy, but would fail this one.
   const out = await r.execute("read_artifact", { sha256: "not-a-hash" });
   assert.equal(out.ok, false);
-  assert.match(out.denied!, /invalid sha256/i);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "execution_error");
+  assert.match(out.denied, /invalid sha256/i);
 });
 
 test("read_artifact denies a well-formed but unknown sha256 via the store's not-found error", async () => {
@@ -152,11 +281,13 @@ test("read_artifact denies a well-formed but unknown sha256 via the store's not-
   const fakeButCanonical = "a".repeat(64);
   const out = await r.execute("read_artifact", { sha256: fakeButCanonical });
   assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "execution_error");
   // This is the ArtifactStore.get() -> readFile ENOENT path, caught by ToolRunner's
   // try/catch and reported as "tool execution error: ...ENOENT...". Distinguishing this
   // from the malformed-hash case (asserted above) proves the two failure paths are both
   // actually exercised, not just that one of them happens to satisfy a loose assertion.
-  assert.match(out.denied!, /ENOENT|no such file/i);
+  assert.match(out.denied, /ENOENT|no such file/i);
 });
 
 test("read_artifact round-trips content actually written by http_request", async () => {
@@ -164,9 +295,12 @@ test("read_artifact round-trips content actually written by http_request", async
   const store = new ArtifactStore(dir);
   const r = new ToolRunner({ engagement: E, store, fetchImpl: okFetch });
   const put = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/y" });
+  assert.equal(put.ok, true);
+  if (!put.ok) throw new Error("unreachable");
   const sha256 = (put.result as any).artifact.sha256 as string;
   const out = await r.execute("read_artifact", { sha256 });
   assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
   const content = (out.result as any).content as string;
   assert.match(content, /BODY-OK/);
 });

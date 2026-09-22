@@ -10,6 +10,21 @@ export interface HttpCapture {
   ms: number;
 }
 
+// A discriminated reason for a failed tool call, so a caller (the Task 9 agent loop) can
+// branch on WHY a call failed without parsing the human-readable message:
+//   "policy"          - the Tether denied it. Never retry; count it as a security event.
+//   "no_executor"      - gate() allowed the tool, but ToolRunner has no dispatch branch
+//                        for it. This will never succeed; it is a bug to surface, not a
+//                        transient condition to retry.
+//   "execution_error"  - the tool's own implementation threw while running (a network
+//                        failure, a malformed/missing artifact, etc). Retry may be
+//                        reasonable depending on the specific failure.
+export type ToolFailureKind = "policy" | "no_executor" | "execution_error";
+
+export type ToolResult<T = unknown> =
+  | { ok: true; result: T }
+  | { ok: false; kind: ToolFailureKind; denied: string };
+
 export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
@@ -63,21 +78,21 @@ export class ToolRunner {
     this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
-  async execute(tool: string, args: Record<string, unknown>) {
+  async execute(tool: string, args: Record<string, unknown>): Promise<ToolResult> {
     const decision = gate(this.engagement, tool, args);
-    if (!decision.allow) return { ok: false as const, denied: decision.reason };
+    if (!decision.allow) return { ok: false, kind: "policy", denied: decision.reason };
 
     try {
-      if (tool === "http_request") return { ok: true as const, result: await this.http(args) };
-      if (tool === "read_artifact") return { ok: true as const, result: await this.readArtifact(args) };
-      return { ok: false as const, denied: `no executor for tool: ${tool}` };
+      if (tool === "http_request") return { ok: true, result: await this.http(args) };
+      if (tool === "read_artifact") return { ok: true, result: await this.readArtifact(args) };
+      return { ok: false, kind: "no_executor", denied: `no executor for tool: ${tool}` };
     } catch (err) {
       // Belt-and-braces: even with the upfront hash validation below, ArtifactStore.get()
       // can still throw (e.g. a corrupt on-disk artifact whose content no longer matches
       // its filename hash). Convert ANY executor exception into a structured denial rather
       // than letting it propagate out of execute() and abort the agent loop.
       const message = err instanceof Error ? err.message : String(err);
-      return { ok: false as const, denied: `tool execution error: ${message}` };
+      return { ok: false, kind: "execution_error", denied: `tool execution error: ${message}` };
     }
   }
 
@@ -98,7 +113,19 @@ export class ToolRunner {
     const body = args.body === undefined ? null : String(args.body);
 
     const started = Date.now();
-    const res = await this.fetchImpl(url, { method, headers, body: body ?? undefined });
+    // redirect: "manual" is load-bearing for scope integrity. The Tether (gate()/
+    // inScope()) only sees the URL passed to THIS call — it never re-checks a URL the
+    // underlying transport decides to follow on its own. With the WHATWG default
+    // ("follow"), an in-scope target answering 3xx could cause this module to silently
+    // contact a host the engagement never approved, and the stored artifact would then
+    // record the ORIGINAL (in-scope) url while the bytes actually came from wherever the
+    // redirect landed — a scope violation AND an evidence-integrity defect, since the
+    // whole point of hashing the exchange is that the artifact is what was truly
+    // contacted. A 3xx is instead captured verbatim (status + Location header + body)
+    // like any other response; the model must issue a fresh http_request for the
+    // Location if it wants to follow, which sends that URL through gate() on its own
+    // merits.
+    const res = await this.fetchImpl(url, { method, headers, body: body ?? undefined, redirect: "manual" });
     const text = await res.text();
     const ms = Date.now() - started;
 
