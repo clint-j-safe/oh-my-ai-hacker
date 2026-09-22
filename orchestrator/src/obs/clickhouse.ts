@@ -2,7 +2,12 @@ import { createClient, type ClickHouseClient } from "@clickhouse/client";
 
 export interface FindingRow {
   engagement_id: string; finding_id: string; vuln_class: string; endpoint: string;
-  verdict: string; invariant_type: string; langfuse_trace_id: string; utc: string;
+  verdict: string; invariant_type: string;
+  // null, never a placeholder, when no real Langfuse trace was active — see
+  // src/obs/langfuse.ts and the Provenance Gate, which downgrades a finding to
+  // NEEDS_REVIEW rather than accept a fabricated id here.
+  langfuse_trace_id: string | null;
+  utc: string;
 }
 
 export class ClickHouseWriter {
@@ -22,7 +27,7 @@ export class ClickHouseWriter {
     await this.client.command({
       query: `CREATE TABLE IF NOT EXISTS sahw_findings (
         engagement_id String, finding_id String, vuln_class String, endpoint String,
-        verdict String, invariant_type String, langfuse_trace_id String, utc DateTime64(3)
+        verdict String, invariant_type String, langfuse_trace_id Nullable(String), utc DateTime64(3)
       ) ENGINE = MergeTree ORDER BY (engagement_id, utc)`,
     });
   }

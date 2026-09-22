@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { observeOpenAI } from "@langfuse/openai";
 import { runBeat } from "./beat.js";
 
 const env = process.env as Record<string, string | undefined>;
@@ -9,12 +10,17 @@ const baseURL = env.SAHW_PROFILE === "prod" ? env.SAGEMAKER_BASE_URL : env.OPENR
 // is a dev-only fallback until that gateway exists.
 const apiKey = env.SAHW_PROFILE === "prod" ? env.SAGEMAKER_API_KEY : env.SAHW_OPENROUTER_KEY;
 
-const client = new OpenAI({
+// observeOpenAI wraps the CLI edge only — runBeat/runAgent keep taking a plain
+// MinimalClient so the existing stubbed tests are untouched. It is safe to apply
+// unconditionally: with no LANGFUSE_PUBLIC_KEY/SECRET_KEY configured, the spans it
+// creates are no-ops (see src/obs/langfuse.ts) and every call still reaches OpenAI
+// exactly as before.
+const client = observeOpenAI(new OpenAI({
   baseURL,
   apiKey: apiKey ?? "unset",
   timeout: Number(env.SAHW_REQUEST_TIMEOUT_MS ?? 3_600_000),
   maxRetries: Number(env.SAHW_MAX_RETRIES ?? 0),
-});
+}));
 
 if (dryRun) {
   console.log(JSON.stringify({ dryRun: true, scope: env.SAHW_SCOPE, profile: env.SAHW_PROFILE ?? "test" }));

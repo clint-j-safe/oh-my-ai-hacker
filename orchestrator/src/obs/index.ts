@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { ClickHouseWriter, type FindingRow } from "./clickhouse.js";
 import { Neo4jWriter } from "./neo4j.js";
 import { LangfuseTracing } from "./langfuse.js";
@@ -32,7 +31,7 @@ export async function initObservability(
   const graph = Neo4jWriter.fromEnv(env);
   const tracing = LangfuseTracing.fromEnv(env);
 
-  if (tracing) tracing.start(randomUUID());
+  if (tracing) tracing.start();
   if (clickhouse) await safe("clickhouse.ensureSchema", () => clickhouse.ensureSchema());
 
   const obs: Observability = {

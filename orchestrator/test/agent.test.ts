@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { loadEngagement } from "../src/config.js";
 import { ArtifactStore } from "../src/artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS } from "../src/tools.js";
-import { runAgent } from "../src/agent.js";
+import { runAgent, toolSpanInput, toolSpanOutput } from "../src/agent.js";
 
 const E = loadEngagement({
   SAHW_SCOPE: "http://10.0.0.1:3000", SAHW_AUTH_REF: "ENG-1",
@@ -89,4 +89,72 @@ test("passes the tools array and parallel_tool_calls false on every request", as
   await runAgent(await OPTS(client));
   assert.equal(seen[0].parallel_tool_calls, false);
   assert.equal(seen[0].tools.length, TOOL_SCHEMAS.length);
+});
+
+test("a tool call's span output records the offload law: no full body, just body_bytes and artifact_sha256", () => {
+  const bigBody = "x".repeat(50_000);
+  const out = toolSpanOutput({
+    ok: true,
+    result: {
+      request: { method: "GET", url: "http://10.0.0.1:3000/", headers: {}, body: null },
+      response: { status: 200, headers: { "content-type": "text/plain" }, body: bigBody },
+      artifact: { sha256: "a".repeat(64) },
+      ms: 12,
+    },
+  });
+  assert.equal(out.body_bytes, bigBody.length);
+  assert.equal(out.artifact_sha256, "a".repeat(64));
+  assert.equal(out.ms, 12);
+  const serialized = JSON.stringify(out);
+  assert.ok(!serialized.includes(bigBody), "the full body string must never appear in span output");
+  assert.ok(!("body" in out), "no raw body field in span output");
+  assert.ok(!("body_preview" in out), "no body preview field either — telemetry gets none of the body");
+});
+
+test("a read_artifact tool call's span output caps content to content_bytes — no full content string either", () => {
+  const bigContent = "y".repeat(50_000);
+  const out = toolSpanOutput({ ok: true, result: { content: bigContent } });
+  assert.equal(out.content_bytes, bigContent.length);
+  assert.ok(!JSON.stringify(out).includes(bigContent), "the full artifact content must never appear in span output");
+  assert.ok(!("content" in out), "no raw content field in span output");
+});
+
+test("a denied tool call's span output carries its kind and denial reason", () => {
+  const out = toolSpanOutput({ ok: false, kind: "policy", denied: "out of scope: http://evil.test/" });
+  assert.equal(out.kind, "policy");
+  assert.equal(out.denied, "out of scope: http://evil.test/");
+});
+
+test("Authorization, Cookie and Set-Cookie header VALUES are redacted but the NAMES survive", () => {
+  const input = toolSpanInput({
+    method: "GET", url: "http://10.0.0.1:3000/",
+    headers: { Authorization: "Bearer super-secret-token", Cookie: "session=abc123", "X-Trace": "keep-me" },
+  });
+  const headers = (input as any).headers;
+  assert.equal(headers.Authorization, "<redacted>");
+  assert.equal(headers.Cookie, "<redacted>");
+  assert.equal(headers["X-Trace"], "keep-me");
+  assert.ok(Object.prototype.hasOwnProperty.call(headers, "Authorization"), "header NAME must survive redaction");
+  assert.ok(Object.prototype.hasOwnProperty.call(headers, "Cookie"), "header NAME must survive redaction");
+  assert.ok(!JSON.stringify(headers).includes("super-secret-token"), "the secret VALUE must never appear");
+  assert.ok(!JSON.stringify(headers).includes("abc123"), "the cookie VALUE must never appear");
+
+  const output = toolSpanOutput({
+    ok: true,
+    result: {
+      request: { method: "GET", url: "http://10.0.0.1:3000/", headers: {}, body: null },
+      response: {
+        status: 200,
+        headers: { "set-cookie": "session=abc123; HttpOnly", "content-type": "text/plain" },
+        body: "ok",
+      },
+      artifact: { sha256: "b".repeat(64) },
+      ms: 1,
+    },
+  });
+  const respHeaders = (output as any).headers;
+  assert.equal(respHeaders["set-cookie"], "<redacted>");
+  assert.equal(respHeaders["content-type"], "text/plain");
+  assert.ok(Object.prototype.hasOwnProperty.call(respHeaders, "set-cookie"), "header NAME must survive redaction");
+  assert.ok(!JSON.stringify(respHeaders).includes("abc123"), "the cookie VALUE must never appear");
 });
