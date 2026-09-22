@@ -1,0 +1,33 @@
+# SAHW engine — an OpenCode v2 server the control plane drives over the SDK.
+# Carries the project's opencode.json (plugins incl. the Langfuse observability
+# plugin), the .opencode agents, and the skill library.
+FROM node:20-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates bash git unzip jq openssl python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# opencode CLI (provides `opencode serve`, the v2 HTTP API)
+RUN curl -fsSL https://opencode.ai/install | bash
+ENV PATH="/root/.opencode/bin:${PATH}"
+
+WORKDIR /app
+COPY opencode.json ./
+COPY .opencode ./.opencode
+# opencode auto-loads LOCAL plugins from `.opencode/plugins/` (plural). This repo
+# uses the singular `plugin/`, so mirror it into the discovered location.
+RUN cp -r /app/.opencode/plugin /app/.opencode/plugins
+COPY skills ./skills
+
+# OpenCode resolves a project (and therefore opencode.json, .opencode/agents and
+# the skill library) from the git root. Without a repo here it falls back to the
+# "global" project and silently loads none of them.
+RUN git init -q \
+ && git config user.email "engine@sahw.local" \
+ && git config user.name "sahw-engine" \
+ && git add -A \
+ && git commit -qm "engine workspace" || true
+
+ENV NODE_ENV=production
+EXPOSE 4096
+CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]

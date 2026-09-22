@@ -1,10 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
-
   "experimental": {
     "openTelemetry": true
   },
-
   "provider": {
     "openrouter": {
       "npm": "@ai-sdk/openai-compatible",
@@ -17,30 +15,22 @@
         }
       },
       "models": {
-        "deepseek/deepseek-v4-pro": { "name": "REASONING_MODEL" },
-        "openai/gpt-4.1-mini": { "name": "FAST_MODEL" }
+        "deepseek/deepseek-v4-pro": {
+          "name": "REASONING_MODEL"
+        },
+        "openai/gpt-4.1-mini": {
+          "name": "FAST_MODEL"
+        }
       }
     }
   },
-
-  "mcp": {
-    "mcp-patt": { "type": "local", "command": ["node", "mcp/patt/server.js"] },
-    "mcp-oast": { "type": "local", "command": ["node", "mcp/oast/server.js"] }
-  },
-
-  "permission": {
-    "bash": "ask",
-    "webfetch": "ask",
-    "edit": "deny",
-    "write": "ask",
-    "mcp-patt_*": "allow",
-    "mcp-oast_*": "allow"
-  },
-
-  "plugins": [
-    ".opencode/plugin/tether.js",
-    ".opencode/plugin/ledger.js",
-    "opencode-skills",
+  "plugin": [
     "@langfuse/opencode-observability-plugin@latest"
-  ]
+  ],
+  "permission": {
+    "bash": "allow",
+    "webfetch": "allow",
+    "edit": "deny",
+    "write": "allow"
+  }
 }

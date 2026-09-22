@@ -34,32 +34,47 @@ describe("parseFindings", () => {
 describe("SdkRunner", () => {
   it("creates a session, prompts the agent, and maps cost/tokens", async () => {
     const calls: string[] = [];
+    const messages = [
+      { id: "m3", type: "idle", outcome: "succeeded" },
+      {
+        id: "m2",
+        type: "assistant",
+        cost: 0.042,
+        tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+        content: [
+          { type: "reasoning", text: "thinking" },
+          { type: "text", text: '{"finding_id":"SAHW-0009","invariant":{"statement":"s","type":"body_contains","expression":"m"},"evidence":{"exploit_response_excerpt":"m"}}' },
+        ],
+      },
+      { id: "m1", type: "user", text: "map it" },
+    ];
     const fakeClient = {
-      session: {
-        create: async () => {
-          calls.push("create");
-          return { data: { id: "sess-1" } };
-        },
-        prompt: async (args: { sessionID: string; agent?: string; parts?: Array<{ type: string; text: string }> }) => {
-          calls.push(`prompt:${args.sessionID}:${args.agent}`);
-          return {
-            data: {
-              info: { cost: 0.042, tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },
-              parts: [{ type: "text", text: '{"finding_id":"SAHW-0009","invariant":{"statement":"s","type":"body_contains","expression":"m"},"evidence":{"exploit_response_excerpt":"m"}}' }],
+      v2: {
+        session: {
+          create: async (args: { agent?: string; location?: { directory?: string } }) => {
+            calls.push(`create:${args.agent}:${args.location?.directory}`);
+            return { data: { data: { id: "sess-1" } } };
+          },
+          client: {
+            post: async (o: { url: string; body?: { text?: string; prompt?: { text?: string } } }) => {
+              calls.push(`prompt:${o.url}:${o.body?.prompt?.text ?? o.body?.text}`);
+              return { data: { data: { id: "msg_user" } } };
             },
-          };
+            get: async (o: { url: string }) => {
+              calls.push(`poll:${o.url}`);
+              return { data: { data: messages } };
+            },
+          },
         },
       },
     };
 
-    const runner = new SdkRunner({
-      client: fakeClient as never,
-      directory: "/work",
-      model: { providerID: "openrouter", modelID: "x" },
-    });
-
+    const runner = new SdkRunner({ client: fakeClient as never, directory: "/work", pollIntervalMs: 1 });
     const result = await runner.run("recon", "map it");
-    expect(calls).toEqual(["create", "prompt:sess-1:recon"]);
+
+    expect(calls[0]).toBe("create:recon:/work");
+    expect(calls[1]).toBe("prompt:/api/session/sess-1/prompt:map it");
+    expect(calls[2]).toBe("poll:/api/session/sess-1/message");
     expect(result.costUsd).toBe(0.042);
     expect(result.tokens.input).toBe(100);
     expect(result.findings).toHaveLength(1);
@@ -67,14 +82,50 @@ describe("SdkRunner", () => {
 
   it("reports stalled when the prompt returns an error", async () => {
     const fakeClient = {
-      session: {
-        create: async () => ({ data: { id: "sess-1" } }),
-        prompt: async () => ({ error: { message: "rate limited" }, data: undefined }),
+      v2: {
+        session: {
+          create: async () => ({ data: { data: { id: "sess-1" } } }),
+          client: {
+            post: async () => ({ error: { message: "rate limited" }, data: undefined }),
+            get: async () => ({ data: { data: [] } }),
+          },
+        },
       },
     };
-    const runner = new SdkRunner({ client: fakeClient as never, directory: "/work" });
+    const runner = new SdkRunner({ client: fakeClient as never, directory: "/work", pollIntervalMs: 1 });
     const result = await runner.run("recon", "x");
     expect(result.stalled).toBe(true);
     expect(result.findings).toHaveLength(0);
+  });
+
+  it("throws a clear error when the client has no v2 namespace (version mismatch)", async () => {
+    const runner = new SdkRunner({ client: { session: {} } as never, directory: "/work", pollIntervalMs: 1 });
+    await expect(runner.run("recon", "x")).rejects.toThrow(/v2 namespace/);
+  });
+
+  it("falls back to the bare {text} body when the server rejects {prompt}", async () => {
+    const bodies: string[] = [];
+    const fakeClient = {
+      v2: {
+        session: {
+          create: async () => ({ data: { data: { id: "sess-1" } } }),
+          client: {
+            post: async (o: { body?: Record<string, unknown> }) => {
+              bodies.push(JSON.stringify(o.body));
+              // first shape rejected the way opencode 2.0.x does
+              if (o.body && "prompt" in o.body) {
+                return { error: { _tag: "InvalidRequestError", message: 'Missing key\n  at ["text"]' }, data: undefined };
+              }
+              return { data: { data: { id: "msg_user" } } };
+            },
+            get: async () => ({ data: { data: [{ id: "i", type: "idle", outcome: "succeeded" }] } }),
+          },
+        },
+      },
+    };
+    const runner = new SdkRunner({ client: fakeClient as never, directory: "/work", pollIntervalMs: 1 });
+    await runner.run("recon", "map it");
+    expect(bodies[0]).toContain('"prompt"');
+    expect(bodies[1]).toBe('{"text":"map it"}');
   });
 });

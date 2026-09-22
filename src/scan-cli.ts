@@ -27,6 +27,7 @@ async function main(): Promise<void> {
   const runId = process.env.SAHW_RUN_ID || `${runStamp}-${Math.random().toString(36).slice(2, 6)}`;
   const sessionId = cfg.authorization.ref ? `${cfg.authorization.ref}/${runId}` : `run/${runId}`;
   console.log(`[sahw] run session: ${sessionId}`);
+  console.log(`[sahw] runner: ${cfg.opencode ? `opencode-sdk (${cfg.opencode.url})` : "direct-llm"}`);
 
   const res = await scan({
     apiKey: cfg.model.apiKey,
@@ -40,6 +41,7 @@ async function main(): Promise<void> {
     baseUrl: cfg.model.baseUrl,
     workspaceRoot: cfg.tether.workspaceRoot,
     judgeThreshold: cfg.axiom.judgeThreshold,
+    ...(cfg.opencode ? { opencode: cfg.opencode } : {}),
     sessionId,
   });
 
@@ -50,7 +52,8 @@ async function main(): Promise<void> {
     console.log(`- ${fid}: ${f.verdict.status} [${f.verdict.decided_by}] (conf ${f.verdict.confidence})`);
     console.log(`    ${f.verdict.reason.slice(0, 180)}`);
   }
-  console.log(`\n=== COST === $${res.cost.toFixed(6)} tokens=${JSON.stringify(res.tokens)}`);
+  const cacheHit = res.tokens.input ? Math.round((res.tokens.cached / res.tokens.input) * 100) : 0;
+  console.log(`\n=== COST === $${res.cost.toFixed(6)} tokens=${JSON.stringify(res.tokens)} cacheHit=${cacheHit}%`);
 }
 
 main().catch((e) => {

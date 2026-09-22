@@ -191,7 +191,19 @@ export class Axiom {
 
     // Autonomous judge path — re-evaluates prose/ambiguous evidence.
     if (this.judge) {
-      const j = await this.judge.judge(input);
+      let j: Awaited<ReturnType<Judge["judge"]>>;
+      try {
+        j = await this.judge.judge(input);
+      } catch (e) {
+        // A judge outage must not discard the finding (or the whole run).
+        return {
+          status: "NEEDS_REVIEW",
+          decided_by: "adjudicator_escalation",
+          invariant_violated: r.violated,
+          confidence: 0.5,
+          reason: `judge unavailable (${(e as Error).message.slice(0, 160)}); finding left for human review`,
+        };
+      }
       if (j.verdict === "CONFIRMED" && j.confidence >= this.judgeThreshold) {
         return {
           status: "CONFIRMED",

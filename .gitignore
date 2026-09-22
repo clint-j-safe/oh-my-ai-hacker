@@ -26,3 +26,6 @@ secrets/
 # OS / editor
 .DS_Store
 *.log
+
+# Raw scan output — contains live target credentials/PII; redact before sharing
+results/

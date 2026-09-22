@@ -14,6 +14,7 @@ export interface Config {
   tether: { workspaceRoot: string; authorizedTiers: ImpactTier[] };
   axiom: { confidence: number; judgeThreshold: number };
   langfuse?: { host: string; publicKey: string; secretKey: string };
+  opencode?: { url: string; password?: string; agent?: string; directory?: string; model?: { id: string; providerID: string } };
   neo4j?: { uri: string; user: string; password: string };
   ledgerFile: string;
   oob: { answerIp: string; dnsPort: number; httpPort: number; shellPort: number };
@@ -33,6 +34,18 @@ const TIERS: ImpactTier[] = ["read", "probe", "state_change", "shell", "destruct
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const authorizedTiers = csv(env.SAHW_AUTHORIZED_TIERS).filter((t) => TIERS.includes(t as ImpactTier)) as ImpactTier[];
+
+  const opencode = env.OPENCODE_URL
+    ? {
+        url: env.OPENCODE_URL,
+        ...(env.OPENCODE_PASSWORD ? { password: env.OPENCODE_PASSWORD } : {}),
+        ...(env.SAHW_ENGINE_AGENT ? { agent: env.SAHW_ENGINE_AGENT } : {}),
+        directory: env.SAHW_ENGINE_DIR || "/app",
+        ...(env.SAHW_ENGINE_MODEL && env.SAHW_ENGINE_PROVIDER
+          ? { model: { id: env.SAHW_ENGINE_MODEL, providerID: env.SAHW_ENGINE_PROVIDER } }
+          : {}),
+      }
+    : undefined;
 
   const langfuse =
     env.SAHW_LANGFUSE_HOST && env.SAHW_LANGFUSE_PUBLIC_KEY && env.SAHW_LANGFUSE_SECRET_KEY
@@ -74,6 +87,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       judgeThreshold: num(env.SAHW_AXIOM_JUDGE_THRESHOLD, 0.8),
     },
     langfuse,
+    opencode,
     neo4j:
       env.NEO4J_URI && env.NEO4J_USER && env.NEO4J_PASSWORD
         ? { uri: env.NEO4J_URI, user: env.NEO4J_USER, password: env.NEO4J_PASSWORD }

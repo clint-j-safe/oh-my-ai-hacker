@@ -1,0 +1,33 @@
+{
+  "source": "human-test/report-blackbox.md",
+  "target_app": "UnSAFE Bank",
+  "note": "Ground truth from the human black-box engagement. auth=true means an authenticated session is required to reach it.",
+  "findings": [
+    { "id": "F1",  "severity": "Critical", "auth": false, "title": "Unauthenticated arbitrary file read (path traversal)",
+      "endpoint": "/api/show", "any": ["traversal", "file read", "lfi", "arbitrary file", "path traversal", "etc/passwd"] },
+    { "id": "F2",  "severity": "Critical", "auth": false, "title": "Unauthenticated XXE with file disclosure",
+      "endpoint": "/api/contactus", "any": ["xxe", "xml external entity", "external entity"] },
+    { "id": "F3",  "severity": "Critical", "auth": false, "title": "Account takeover via OTP disclosure + unauthenticated password reset",
+      "endpoint": "/api/password/forgot", "any": ["otp", "account takeover", "password reset", "forgot"] },
+    { "id": "F9",  "severity": "Critical", "auth": false, "title": "Cross-user password reset (OTP reference not bound to user)",
+      "endpoint": "/api/password/reset", "any": ["cross-user", "not bound", "another user", "reference", "reset"] },
+    { "id": "F4",  "severity": "High", "auth": true,  "title": "Authenticated RCE via PHP object injection",
+      "endpoint": "/api/loan/apply", "any": ["object injection", "deserial", "rce", "remote code"] },
+    { "id": "F5",  "severity": "High", "auth": true,  "title": "IDOR: arbitrary customer KYC disclosure",
+      "endpoint": "/api/account/details", "any": ["idor", "bola", "object level", "access control", "kyc"] },
+    { "id": "F6",  "severity": "High", "auth": true,  "title": "Authenticated SQL injection (alias field)",
+      "endpoint": "/api/beneficiary/fetch", "any": ["sql injection", "sqli"] },
+    { "id": "F7",  "severity": "High", "auth": true,  "title": "Business logic: negative-amount transfer credits sender",
+      "endpoint": "/api/beneficiary/pay", "any": ["negative", "business logic", "amount"] },
+    { "id": "F8",  "severity": "Medium", "auth": true, "title": "Password change does not verify current password",
+      "endpoint": "/api/password/change", "any": ["current password", "password change", "without verifying"] },
+    { "id": "F11", "severity": "Medium", "auth": true, "title": "Weak recoverable JWT signing key and PII in token",
+      "endpoint": "/api/login", "any": ["jwt", "signing key", "token", "hs256", "pii"] },
+    { "id": "F12", "severity": "Medium", "auth": true, "title": "No attempt limit or lockout on OTP verification",
+      "endpoint": "/api/otp/verify", "any": ["rate limit", "lockout", "attempt limit", "brute"] },
+    { "id": "F13", "severity": "Medium", "auth": false, "title": "Security misconfiguration and information disclosure",
+      "endpoint": "", "any": ["information disclosure", "misconfiguration", "source map", "version", "x-powered-by", "stack trace", "debug", "enumeration"] },
+    { "id": "F14", "severity": "Medium", "auth": false, "title": "CORS wildcard origin with credentials allowed",
+      "endpoint": "", "any": ["cors", "access-control-allow-origin"] }
+  ]
+}
