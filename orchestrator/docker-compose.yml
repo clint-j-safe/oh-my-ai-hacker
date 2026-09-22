@@ -1,0 +1,10 @@
+services:
+  orchestrator:
+    build:
+      context: .
+    network_mode: host
+    env_file:
+      - ../.env
+    # The orchestrator points at the HOST's existing Langfuse / ClickHouse /
+    # Neo4j. Those services are deliberately NOT declared here — this compose
+    # file defines only the orchestrator, never the datastores.
