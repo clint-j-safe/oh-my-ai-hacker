@@ -29,7 +29,7 @@
       "required": ["statement", "type"],
       "properties": {
         "statement": { "type": "string", "description": "The business/security rule that must hold" },
-        "type": { "enum": ["body_contains", "status_in", "derived", "state_changed", "state_violated", "file_created_then_deleted"] },
+        "type": { "enum": ["body_contains", "status_in", "derived", "state_changed", "state_violated", "file_created_then_deleted", "response_asserted"] },
         "expression": { "type": "string" }
       }
     },
