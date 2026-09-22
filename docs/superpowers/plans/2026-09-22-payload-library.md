@@ -27,7 +27,7 @@
 ## File Structure
 
 ```
-payload-library/
+payload_library/
 ├── README.md                  # what it is, how to build the index, how to query
 ├── fetch.sh                   # clone PAT + SecLists at pinned SHAs into raw/
 ├── bin/
@@ -55,16 +55,16 @@ payload-library/
 
 Each `src/` module has one responsibility and is independently testable. `classify.py` is separated from `etl.py` deliberately: risk classification is the safety boundary, and it must be testable without any corpus present.
 
-Run all tests from the repo root: `python3 -m unittest discover -s payload-library/tests -t . -v`
+Run all tests from the repo root: `python3 -m unittest discover -s payload_library/tests -t . -v`
 
 ---
 
 ### Task 1: Config and caps
 
 **Files:**
-- Create: `payload-library/src/__init__.py` (empty)
-- Create: `payload-library/src/config.py`
-- Test: `payload-library/tests/test_config.py`
+- Create: `payload_library/src/__init__.py` (empty)
+- Create: `payload_library/src/config.py`
+- Test: `payload_library/tests/test_config.py`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -73,7 +73,7 @@ Run all tests from the repo root: `python3 -m unittest discover -s payload-libra
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# payload-library/tests/test_config.py
+# payload_library/tests/test_config.py
 import unittest
 from pathlib import Path
 from payload_library.src.config import load_config, RISK_CLASSES
@@ -287,6 +287,8 @@ from __future__ import annotations
 
 import re
 
+from .config import RISK_CLASSES
+
 _DESTRUCTIVE = re.compile(
     r"\b(drop\s+(table|database|schema)|truncate|delete\s+from|shutdown|"
     r"rm\s+-[rf]|mkfs|dd\s+if=|format\s+c:|xp_cmdshell|drop\s+user)\b|"
@@ -358,7 +360,7 @@ def categorize(source_path: str) -> str:
 
 
 def is_agent_selectable(risk: str) -> bool:
-    return risk in ("non_destructive_probe", "read_only_probe")
+    return risk in RISK_CLASSES
 ```
 
 - [ ] **Step 4: Run tests and confirm they pass**
@@ -748,7 +750,7 @@ The core safety surface: this is where a `risk_class` is enforced and where a fi
 - Test: `payload_library/tests/test_query.py`
 
 **Interfaces:**
-- Consumes: `Config`, `RISK_CLASSES` from `src.config`; `open_db` from `src.schema`; `is_agent_selectable` from `src.classify`.
+- Consumes: `Config`, `RISK_CLASSES` from `src.config`. Takes an open `conn` as an argument — it does not import `src.schema`.
 - Produces: `search(conn, *, category, risk_class, tech=None, cwe=None, max_payloads=50, sample=3) -> dict`; `create_set(conn, cfg, *, set_name, query_params) -> dict`. `search` returns `{"count", "category", "risk_class", "techs", "sample", "truncated"}`. `create_set` returns `{"set_id", "path", "line_count", "sha256"}`. Both raise `ValueError` on a rejected `risk_class`.
 
 - [ ] **Step 1: Write the failing test**
@@ -919,7 +921,7 @@ def create_set(conn, cfg: Config, *, set_name: str, query_params: dict) -> dict:
 - [ ] **Step 4: Run tests and confirm they pass**
 
 Run: `python3 -m unittest payload_library.tests.test_query -v`
-Expected: 13 tests PASS (5 inherited into `TestCreateSet` by subclassing, plus 4 new, plus 4 base)
+Expected: **14** tests PASS — 9 methods are defined, but `TestCreateSet(TestQuery)` re-runs TestQuery's 5, so 5 + (5 + 4) = 14. A count of 9 means the subclass did not inherit.
 
 - [ ] **Step 5: Commit**
 
@@ -1254,7 +1256,7 @@ git commit -m "feat(payload-library): OpenAI function-tool schemas and dispatche
 - Test: `payload_library/tests/test_cli.py`
 
 **Interfaces:**
-- Consumes: `TOOL_SCHEMAS`, `dispatch` from `src.tools`; `load_config` from `src.config`; `build_index` from `src.etl`.
+- Consumes: `dispatch` from `src.tools`; `load_config` from `src.config`; `open_db` from `src.schema`; `build_index` from `src.etl`.
 - Produces: two executables that print one JSON object to stdout and exit non-zero on error.
 
 - [ ] **Step 1: Write the failing test**
