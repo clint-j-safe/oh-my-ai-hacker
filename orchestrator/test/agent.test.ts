@@ -1,0 +1,92 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadEngagement } from "../src/config.js";
+import { ArtifactStore } from "../src/artifacts.js";
+import { ToolRunner, TOOL_SCHEMAS } from "../src/tools.js";
+import { runAgent } from "../src/agent.js";
+
+const E = loadEngagement({
+  SAHW_SCOPE: "http://10.0.0.1:3000", SAHW_AUTH_REF: "ENG-1",
+  SAHW_AUTH_START: "2026-09-20T00:00:00Z", SAHW_AUTH_END: "2026-09-25T00:00:00Z",
+  SAHW_PHASE_TIMEOUT_MS: "3000000",
+}, new Date("2026-09-22T12:00:00Z"));
+
+const okFetch = (async () => new Response("OK")) as unknown as typeof fetch;
+
+async function mkRunner() {
+  return new ToolRunner({
+    engagement: E, fetchImpl: okFetch,
+    store: new ArtifactStore(await mkdtemp(join(tmpdir(), "sahw-"))),
+  });
+}
+
+/** Stub client: returns scripted completions, records what it was sent. */
+function stub(script: any[]) {
+  const seen: any[] = [];
+  let i = 0;
+  return {
+    seen,
+    client: { chat: { completions: { create: async (p: any) => { seen.push(p); return script[i++] ?? script[script.length - 1]; } } } },
+  };
+}
+
+const say = (content: string) => ({ choices: [{ message: { role: "assistant", content } }], usage: { total_tokens: 10 } });
+const call = (name: string, args: object) => ({
+  choices: [{ message: { role: "assistant", content: null, tool_calls: [
+    { id: "c1", type: "function", function: { name, arguments: JSON.stringify(args) } }] } }],
+  usage: { total_tokens: 10 },
+});
+
+const OPTS = async (client: any, script?: any) => ({
+  client, model: "m", system: "sys", user: "go",
+  tools: TOOL_SCHEMAS, runner: await mkRunner(), maxTurns: 5, budgetTokens: 1000,
+});
+
+test("returns on a terminal assistant message", async () => {
+  const { client } = stub([say("done")]);
+  const r = await runAgent(await OPTS(client));
+  assert.equal(r.stopReason, "done");
+  assert.equal(r.turns, 1);
+});
+
+test("executes a tool call and feeds the result back", async () => {
+  const { client, seen } = stub([call("http_request", { method: "GET", url: "http://10.0.0.1:3000/" }), say("ok")]);
+  const r = await runAgent(await OPTS(client));
+  assert.equal(r.toolCalls.length, 1);
+  assert.equal(r.toolCalls[0].ok, true);
+  assert.equal(r.artifacts, 1);
+  const last = seen[seen.length - 1];
+  assert.ok(last.messages.some((m: any) => m.role === "tool"));
+});
+
+test("a denied tool call is fed back as a tool message, not thrown", async () => {
+  const { client } = stub([call("http_request", { method: "GET", url: "http://evil.test/" }), say("ok")]);
+  const r = await runAgent(await OPTS(client));
+  assert.equal(r.toolCalls[0].ok, false);
+  assert.equal(r.stopReason, "done");
+});
+
+test("stops at maxTurns", async () => {
+  const { client } = stub([call("http_request", { method: "GET", url: "http://10.0.0.1:3000/" })]);
+  const o = await OPTS(client);
+  const r = await runAgent({ ...o, maxTurns: 3 });
+  assert.equal(r.stopReason, "max_turns");
+  assert.equal(r.turns, 3);
+});
+
+test("stops when the token budget is exhausted", async () => {
+  const { client } = stub([call("http_request", { method: "GET", url: "http://10.0.0.1:3000/" })]);
+  const o = await OPTS(client);
+  const r = await runAgent({ ...o, budgetTokens: 15 });
+  assert.equal(r.stopReason, "budget");
+});
+
+test("passes the tools array and parallel_tool_calls false on every request", async () => {
+  const { client, seen } = stub([say("done")]);
+  await runAgent(await OPTS(client));
+  assert.equal(seen[0].parallel_tool_calls, false);
+  assert.equal(seen[0].tools.length, TOOL_SCHEMAS.length);
+});
