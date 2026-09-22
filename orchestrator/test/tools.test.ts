@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import type OpenAI from "openai";
 import { loadEngagement } from "../src/config.js";
 import { ArtifactStore } from "../src/artifacts.js";
@@ -85,12 +86,11 @@ test("a 3xx response is captured verbatim and NOT auto-followed", async () => {
   // - `callCount === 1` is shape-only here: `redirectFetch` is a hand-written mock that
   //   never follows anything regardless of what `options.redirect` says, so this
   //   assertion cannot fail no matter what ToolRunner passes. It does NOT demonstrate
-  //   "the redirect target was never contacted" — that property depends on undici's
-  //   real behaviour under `redirect: "manual"`, which cannot be exercised here without
-  //   a real network call (forbidden by this project's test constraints). That real
-  //   no-follow behaviour was verified empirically against a local 302 server by the
-  //   reviewer who requested this fix (see the fix-round report addendum), not by this
-  //   test suite.
+  //   "the redirect target was never contacted" — that property depends on undici's real
+  //   behaviour under `redirect: "manual"`, which this fake fetch cannot exercise.
+  //   See the test below, "real fetch: a 302 redirect target is never actually contacted
+  //   (loopback network test)", which verifies that real, behavioural property against
+  //   an actual HTTP server this suite starts and stops itself.
   let callCount = 0;
   let lastOptions: RequestInit | undefined;
   const redirectFetch = (async (_url: unknown, options?: RequestInit) => {
@@ -112,6 +112,83 @@ test("a 3xx response is captured verbatim and NOT auto-followed", async () => {
   assert.equal(cap.response.headers["location"], "http://evil.test/reached");
   assert.equal(callCount, 1, "the redirect target must not be auto-followed");
   assert.equal(lastOptions?.redirect, "manual", "ToolRunner must request manual redirect handling");
+});
+
+test("real fetch: a 302 redirect target is never actually contacted (loopback network test)", async () => {
+  // NOTE: unlike every other test in this file, this one deliberately does NOT pass a
+  // `fetchImpl` — ToolRunner falls back to the real global `fetch`. It talks to a real
+  // HTTP server, but one this test starts and stops itself on 127.0.0.1 with an
+  // ephemeral (port 0) listener: no external host, no dependency on anything already
+  // running, nothing left behind. Per an explicit coordinator clarification, this is NOT
+  // the kind of "touching the network" this project's tests are forbidden from doing —
+  // that rule targets external/live services, not a hermetic loopback fixture.
+  //
+  // This is here because the earlier fake-fetch version of the redirect test
+  // (`a 3xx response is captured verbatim and NOT auto-followed`, above) can only prove
+  // that ToolRunner PASSES `redirect: "manual"` to whatever fetch implementation it's
+  // given — a hand-written mock fetch never follows a redirect regardless of that
+  // option, so it cannot catch a real client that accepts the option and silently
+  // ignores it. This test converts that from a shape assertion into a behavioural one:
+  // the `/followed` route sets a flag if it is ever actually reached, and the assertion
+  // is that the flag stays false.
+  let followedReached = false;
+  let port = 0;
+
+  const server = createServer((req, res) => {
+    if (req.url === "/start") {
+      res.writeHead(302, { Location: `http://127.0.0.1:${port}/followed` });
+      res.end();
+      return;
+    }
+    if (req.url === "/followed") {
+      followedReached = true;
+      res.writeHead(200);
+      res.end("SHOULD-NEVER-BE-REACHED");
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected an AddressInfo from an ephemeral TCP listener");
+    }
+    port = address.port;
+
+    const loopbackEngagement = loadEngagement({
+      SAHW_SCOPE: `http://127.0.0.1:${port}`,
+      SAHW_AUTH_REF: "ENG-1",
+      SAHW_AUTH_START: "2026-09-20T00:00:00Z",
+      SAHW_AUTH_END: "2026-09-25T00:00:00Z",
+      SAHW_PHASE_TIMEOUT_MS: "3000000",
+    }, new Date("2026-09-22T12:00:00Z"));
+
+    const store = new ArtifactStore(await mkdtemp(join(tmpdir(), "sahw-")));
+    const r = new ToolRunner({ engagement: loopbackEngagement, store }); // no fetchImpl: real fetch
+
+    const out = await r.execute("http_request", {
+      method: "GET",
+      url: `http://127.0.0.1:${port}/start`,
+    });
+    assert.equal(out.ok, true);
+    if (!out.ok) throw new Error("unreachable");
+    const cap = out.result as any;
+    // Shape assertion — fails fastest and localises the cause if it regresses.
+    assert.equal(cap.response.status, 302);
+    assert.equal(cap.response.headers["location"], `http://127.0.0.1:${port}/followed`);
+    // Behavioural assertion — the property that actually matters. This is the one the
+    // fake-fetch version of this test cannot provide.
+    assert.equal(followedReached, false, "the redirect target must never actually be contacted");
+  } finally {
+    // Always close, even on assertion failure, so a failing run cannot leave a listener
+    // behind.
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
 });
 
 test("http_request is denied out of scope and never calls fetch", async () => {
@@ -272,7 +349,11 @@ test("read_artifact denies a malformed sha256 via the upfront format check, not 
   const out = await r.execute("read_artifact", { sha256: "not-a-hash" });
   assert.equal(out.ok, false);
   if (out.ok) throw new Error("unreachable");
-  assert.equal(out.kind, "execution_error");
+  // A malformed sha256 is decidable purely from the argument's shape, before any I/O —
+  // a permanent caller error that will fail identically on every retry with the same
+  // arguments. Distinct from the well-formed-but-unknown-hash case below, which is left
+  // under "execution_error" because it can only be decided by actually asking the store.
+  assert.equal(out.kind, "invalid_argument");
   assert.match(out.denied, /invalid sha256/i);
 });
 

@@ -11,19 +11,34 @@ export interface HttpCapture {
 }
 
 // A discriminated reason for a failed tool call, so a caller (the Task 9 agent loop) can
-// branch on WHY a call failed without parsing the human-readable message:
-//   "policy"          - the Tether denied it. Never retry; count it as a security event.
-//   "no_executor"      - gate() allowed the tool, but ToolRunner has no dispatch branch
-//                        for it. This will never succeed; it is a bug to surface, not a
-//                        transient condition to retry.
-//   "execution_error"  - the tool's own implementation threw while running (a network
-//                        failure, a malformed/missing artifact, etc). Retry may be
-//                        reasonable depending on the specific failure.
-export type ToolFailureKind = "policy" | "no_executor" | "execution_error";
+// branch on WHY a call failed without parsing the human-readable message. Retry guidance
+// for each kind (so Task 9's author does not have to infer it):
+//   "policy"            - the Tether denied it. NEVER retry; count it as a security event.
+//   "no_executor"        - gate() allowed the tool, but ToolRunner has no dispatch branch
+//                          for it. NEVER retry — this is a bug to surface (the call can
+//                          never succeed no matter how many times it's repeated), not a
+//                          transient condition.
+//   "invalid_argument"   - the caller/model supplied something structurally wrong (e.g. a
+//                          malformed sha256) that is decidable WITHOUT touching the
+//                          executor's I/O. NEVER retry the same arguments — they will
+//                          fail identically every time. A caller may retry with DIFFERENT,
+//                          corrected arguments, but that is a new call, not a retry.
+//   "execution_error"    - the executor's own logic threw while actually running (a
+//                          network failure, an artifact store I/O error, etc). Retry MAY
+//                          be reasonable depending on the specific failure — this is the
+//                          one kind where "try again" can plausibly help.
+export type ToolFailureKind = "policy" | "no_executor" | "invalid_argument" | "execution_error";
 
 export type ToolResult<T = unknown> =
   | { ok: true; result: T }
   | { ok: false; kind: ToolFailureKind; denied: string };
+
+// Thrown by an executor (e.g. readArtifact) for a caller-supplied argument that is
+// structurally invalid — decidable purely from the argument's shape, before any I/O is
+// attempted. execute()'s catch block maps this specifically to kind: "invalid_argument"
+// (never retryable with the same arguments), as opposed to any other thrown error, which
+// maps to kind: "execution_error" (an executor-level failure, possibly retryable).
+class InvalidToolArgumentError extends Error {}
 
 export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
   {
@@ -92,6 +107,9 @@ export class ToolRunner {
       // its filename hash). Convert ANY executor exception into a structured denial rather
       // than letting it propagate out of execute() and abort the agent loop.
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof InvalidToolArgumentError) {
+        return { ok: false, kind: "invalid_argument", denied: message };
+      }
       return { ok: false, kind: "execution_error", denied: `tool execution error: ${message}` };
     }
   }
@@ -99,7 +117,12 @@ export class ToolRunner {
   private async readArtifact(args: Record<string, unknown>): Promise<{ content: string }> {
     const sha256 = String(args.sha256 ?? "");
     if (!CANONICAL_SHA256.test(sha256)) {
-      throw new Error(
+      // Decidable purely from the string's shape, no I/O involved — kind: "invalid_argument".
+      // Distinct from a well-formed-but-unknown sha256 below, which requires actually
+      // asking the store and only fails once that I/O comes back not-found; that path is
+      // deliberately left under kind: "execution_error" (see the report's judgement-call
+      // note on this split).
+      throw new InvalidToolArgumentError(
         `invalid sha256: expected 64 lowercase hex characters, got ${JSON.stringify(args.sha256)}`);
     }
     const buf = await this.store.get(sha256);
