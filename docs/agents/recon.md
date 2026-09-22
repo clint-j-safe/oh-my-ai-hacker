@@ -4,7 +4,7 @@ description: >-
   HTTP service surface, and emits a structured attack-surface map. Black-box:
   works from the provided in-scope URLs only.
 mode: subagent
-model: "{{FAST_MODEL}}"     # e.g. openrouter/anthropic/claude-... — set in opencode.json
+model: "{{FAST_MODEL}}"     # logical name; resolved by the orchestrator to the SageMaker GLM endpoint
 temperature: 0.2
 permission:
   edit: deny
@@ -13,7 +13,7 @@ permission:
 tools:
   read: true
   write: false
-# skills mounted via opencode-skills plugin; allow-list the recon skills:
+# skills surfaced through the skill_run tool; allow-list the recon skills:
 #   tech-fingerprinting, intelligent-crawling
 ---
 

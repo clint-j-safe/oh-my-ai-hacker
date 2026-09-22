@@ -8,7 +8,7 @@
 >
 > Source of truth: `human-test/report-blackbox.md` (UnSAFE Bank black-box engagement,
 > 2026-09-20). The specific endpoints/values below are the *answer key* — they must NOT
-> leak into `docs/agents/*`, `opencode.json`, or the runtime scope object.
+> leak into `docs/agents/*`, the orchestrator config, or the runtime scope object.
 
 ## How scoring works
 For each ground-truth finding, the harness checks whether the run produced a **CONFIRMED**
