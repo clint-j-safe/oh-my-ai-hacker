@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
 
 // Registers a REAL (but export-free) OpenTelemetry tracer provider once, before any
 // test runs. OpenTelemetry's "first registered provider wins" rule means this
@@ -102,4 +102,176 @@ test("an out-of-window engagement refuses to run at all", async () => {
     env, client: scriptedClient(), fetchImpl: differentialFetch,
     now: new Date("2026-10-01T00:00:00Z"),
   }));
+});
+
+// ---- Multi-finding beats -------------------------------------------------------
+
+/** A response with no headers at all: any "!header:x" response_asserted clause holds. */
+const bareFetch = (async () => new Response("OK")) as unknown as typeof fetch;
+
+const say = (content: string) => ({ choices: [{ message: { role: "assistant", content } }], usage: { total_tokens: 10 } });
+const call = (name: string, args: object) => ({
+  choices: [{ message: { role: "assistant", content: null, tool_calls: [
+    { id: "c1", type: "function", function: { name, arguments: JSON.stringify(args) } }] } }],
+  usage: { total_tokens: 10 },
+});
+
+function claim(vuln_class: string, endpoint: string) {
+  return {
+    vuln_class, endpoint,
+    invariant: { statement: "no framing protection", type: "response_asserted", expression: "!header:x-frame-options" },
+  };
+}
+
+/** Records every params object the client was called with, so a test can inspect what the hunter was told. */
+function recordingScriptedClient(script: any[]) {
+  const seen: any[] = [];
+  let i = 0;
+  return {
+    seen,
+    chat: { completions: { create: async (params: any) => {
+      seen.push(params);
+      return script[Math.min(i++, script.length - 1)];
+    } } },
+  };
+}
+
+test("three different valid claims in one beat produce three findings", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify(claim("clickjacking", url("a")))),
+    call("http_request", { method: "GET", url: url("b") }),
+    say(JSON.stringify(claim("cors_misconfig", url("b")))),
+    call("http_request", { method: "GET", url: url("c") }),
+    say(JSON.stringify(claim("info_disclosure", url("c")))),
+    say("No further hypotheses. I am done."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 3);
+  assert.deepEqual(out.findings.map((f) => f.vuln_class), ["clickjacking", "cors_misconfig", "info_disclosure"]);
+  assert.equal(out.stalled, false);
+  assert.equal(out.exitCode, 0);
+});
+
+test("the same claim reported twice produces one finding and increments duplicates_suppressed", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.duplicates_suppressed, 1);
+  assert.equal(out.stalled, false);
+});
+
+test("a prose vuln_class is rejected, counted in rejected_claims, and the hunter is re-prompted with the allowed values", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("Missing framing protection (clickjacking)", url))),
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const client = recordingScriptedClient(script);
+  const out = await runBeat({ env: await ENV(), client, fetchImpl: bareFetch, now: NOW });
+
+  assert.equal(out.rejected_claims.length, 1);
+  assert.match(out.rejected_claims[0].reason, /not in the allowed vocabulary/);
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].vuln_class, "clickjacking");
+
+  // The re-prompt actually reached the model: some later request's messages contain
+  // the exact allowed-values list.
+  const allowedList = VULN_CLASSES.join(", ");
+  const sawFeedback = client.seen.some((params: any) =>
+    params.messages.some((m: any) => typeof m.content === "string" && m.content.includes(allowedList)));
+  assert.ok(sawFeedback, "hunter must be re-prompted with the exact allowed vuln_class values");
+});
+
+test("SAHW_MAX_FINDINGS caps the loop", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify(claim("clickjacking", url("a")))),
+    call("http_request", { method: "GET", url: url("b") }),
+    say(JSON.stringify(claim("cors_misconfig", url("b")))),
+    call("http_request", { method: "GET", url: url("c") }),
+    say(JSON.stringify(claim("info_disclosure", url("c")))),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_MAX_FINDINGS: "2" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 2);
+  assert.equal(out.stalled, false);
+  assert.equal(out.exitCode, 0);
+});
+
+test("a beat that banks one finding then fails to parse a later claim is NOT reported as stalled and exits 0", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    call("http_request", { method: "GET", url }),
+    say("I probed further but found nothing conclusive worth claiming."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.stalled, false);
+  assert.equal(out.exitCode, 0);
+});
+
+test("SAHW_MAX_TURNS_PER_FINDING cuts off a greedy attempt without ending the beat", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }), // attempt 1, turn 1 of 2 — no claim yet
+    call("http_request", { method: "GET", url }), // attempt 1, turn 2 of 2 — cap hit, still no claim
+    call("http_request", { method: "GET", url }), // attempt 2, turn 1 — bank the claim
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_MAX_TURNS_PER_FINDING: "2" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1, "the abandoned first attempt must not have killed the beat");
+  assert.equal(out.findings[0].vuln_class, "clickjacking");
+  assert.equal(out.stalled, false);
+  assert.equal(out.exitCode, 0);
+});
+
+test("a beat that never produces a parseable claim (zero findings) IS stalled and exits non-zero", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say("I probed but found nothing conclusive."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 0);
+  assert.equal(out.stalled, true);
+  assert.equal(out.exitCode, 3);
+});
+
+test("every VULN_CLASSES value is accepted by isVulnClass, and a prose value is rejected", () => {
+  for (const v of VULN_CLASSES) {
+    assert.equal(isVulnClass(v), true, `expected ${v} to be accepted`);
+  }
+  assert.equal(isVulnClass("Missing framing protection (clickjacking)"), false);
+  assert.equal(isVulnClass("Clickjacking"), false);
+  assert.equal(isVulnClass(""), false);
+  assert.equal(isVulnClass(undefined), false);
 });

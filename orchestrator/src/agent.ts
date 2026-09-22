@@ -126,8 +126,16 @@ export async function runAgent(opts: {
   maxTurns: number;
   budgetTokens: number;
   signal?: AbortSignal;
+  /**
+   * Continue an existing conversation (e.g. across multiple findings in one beat)
+   * instead of starting fresh from system/user. When provided, system/user are
+   * ignored — the caller is responsible for the conversation already containing a
+   * system message. The array is mutated in place AND returned as
+   * AgentResult.messages, so a caller can pass it straight back in for the next call.
+   */
+  messages?: any[];
 }): Promise<AgentResult> {
-  const messages: any[] = [
+  const messages: any[] = opts.messages ?? [
     { role: "system", content: opts.system },
     { role: "user", content: opts.user },
   ];
