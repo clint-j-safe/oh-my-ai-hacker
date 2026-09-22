@@ -158,3 +158,78 @@ test("Authorization, Cookie and Set-Cookie header VALUES are redacted but the NA
   assert.ok(Object.prototype.hasOwnProperty.call(respHeaders, "set-cookie"), "header NAME must survive redaction");
   assert.ok(!JSON.stringify(respHeaders).includes("abc123"), "the cookie VALUE must never appear");
 });
+
+// --- grep_artifact wiring ------------------------------------------------------------
+
+test("a grep_artifact tool call's span output records the pattern and match counts but never the matched lines", () => {
+  const out = toolSpanOutput(
+    {
+      ok: true,
+      result: {
+        matches: [{ line_number: 7, line: "authToken=super-secret-recovered-value", before: [], after: [] }],
+        total_matches: 5,
+        returned_matches: 1,
+        truncated: true,
+        total_lines: 900,
+      },
+    },
+    { sha256: "a".repeat(64), pattern: "authToken=\\S+", context: 0, max_matches: 1 },
+  );
+  assert.equal(out.pattern, "authToken=\\S+");
+  assert.equal(out.total_matches, 5);
+  assert.equal(out.returned_matches, 1);
+  assert.equal(out.truncated, true);
+  const serialized = JSON.stringify(out);
+  assert.ok(!serialized.includes("super-secret-recovered-value"), "a matched (possibly secret) line must never appear in span output");
+  assert.ok(!("matches" in out), "no raw matches array in span output");
+});
+
+test("a grep_artifact result reaches the model with its matches intact, unmolested by the generic body-preview truncation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const grepRunner = new ToolRunner({ engagement: E, store, fetchImpl: okFetch });
+  const artifact = await store.put("alpha\nneedle-hit\nomega");
+
+  const { client } = stub([
+    call("grep_artifact", { sha256: artifact.sha256, pattern: "needle" }),
+    say("ok"),
+  ]);
+  const o = await OPTS(client);
+  const r = await runAgent({ ...o, runner: grepRunner });
+
+  const toolMsg = r.messages.find((m: any) => m.role === "tool");
+  const content = JSON.parse(toolMsg.content);
+  assert.equal(content.total_matches, 1);
+  assert.equal(content.returned_matches, 1);
+  assert.equal(content.matches[0].line, "needle-hit");
+  assert.equal(content.matches[0].line_number, 2);
+});
+
+test("an oversized grep_artifact result (many matches with context) is trimmed by forModel's second bound, keeping accurate totals", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const grepRunner = new ToolRunner({ engagement: E, store, fetchImpl: okFetch });
+  // Near the tool's own GREP_LINE_MAX_CHARS cap (400), repeated many times with wide
+  // context — big enough that even after the tool's own bounds, forModel's coarser
+  // GREP_RESULT_MAX_CHARS backstop still has to trim it further.
+  const longLine = `needle ${"z".repeat(390)}`;
+  const lines = Array.from({ length: 200 }, () => longLine);
+  const artifact = await store.put(lines.join("\n"));
+
+  const { client } = stub([
+    call("grep_artifact", { sha256: artifact.sha256, pattern: "needle", max_matches: 100, context: 10 }),
+    say("ok"),
+  ]);
+  const o = await OPTS(client);
+  const r = await runAgent({ ...o, runner: grepRunner });
+
+  const toolMsg = r.messages.find((m: any) => m.role === "tool");
+  const content = JSON.parse(toolMsg.content);
+  assert.ok(content.matches.length < 100, "forModel must have dropped trailing matches to fit its bound");
+  assert.equal(content.truncated, true);
+  assert.ok(typeof content.note === "string" && content.note.length > 0, "must explain the extra truncation");
+  // The tool itself found a match on every one of the 200 lines, even though far
+  // fewer are actually handed to the model — the real total must survive forModel's
+  // second trim, not just the tool's own max_matches cap.
+  assert.equal(content.total_matches, 200);
+});

@@ -385,3 +385,138 @@ test("read_artifact round-trips content actually written by http_request", async
   const content = (out.result as any).content as string;
   assert.match(content, /BODY-OK/);
 });
+
+// --- grep_artifact -----------------------------------------------------------------
+
+/** Stores `content` as an artifact via a real ToolRunner/ArtifactStore pair and returns
+ * both, plus the artifact's sha256, so grep tests exercise the store's own hash
+ * validation rather than a hand-rolled fake sha256. */
+async function storeText(content: string): Promise<{ r: ToolRunner; sha256: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const r = new ToolRunner({ engagement: E, store, fetchImpl: okFetch });
+  const artifact = await store.put(content);
+  return { r, sha256: artifact.sha256 };
+}
+
+test("grep_artifact returns matching lines with correct line numbers", async () => {
+  const content = ["one", "two needle here", "three", "needle again", "five"].join("\n");
+  const { r, sha256 } = await storeText(content);
+  const out = await r.execute("grep_artifact", { sha256, pattern: "needle" });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const res = out.result as any;
+  assert.equal(res.total_matches, 2);
+  assert.equal(res.returned_matches, 2);
+  assert.equal(res.truncated, false);
+  assert.equal(res.total_lines, 5);
+  assert.deepEqual(res.matches.map((m: any) => m.line_number), [2, 4]);
+  assert.equal(res.matches[0].line, "two needle here");
+  assert.equal(res.matches[1].line, "needle again");
+});
+
+test("grep_artifact ignore_case defaults to true and can be turned off", async () => {
+  const content = "alpha\nNEEDLE\nomega";
+  const { r, sha256 } = await storeText(content);
+
+  const caseInsensitive = await r.execute("grep_artifact", { sha256, pattern: "needle" });
+  assert.equal(caseInsensitive.ok, true);
+  if (!caseInsensitive.ok) throw new Error("unreachable");
+  assert.equal((caseInsensitive.result as any).total_matches, 1);
+
+  const caseSensitive = await r.execute("grep_artifact", { sha256, pattern: "needle", ignore_case: false });
+  assert.equal(caseSensitive.ok, true);
+  if (!caseSensitive.ok) throw new Error("unreachable");
+  assert.equal((caseSensitive.result as any).total_matches, 0);
+});
+
+test("grep_artifact context returns the surrounding lines", async () => {
+  const content = ["a", "b", "c", "MATCH", "e", "f", "g"].join("\n");
+  const { r, sha256 } = await storeText(content);
+  const out = await r.execute("grep_artifact", { sha256, pattern: "MATCH", context: 2 });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const match = (out.result as any).matches[0];
+  assert.deepEqual(match.before, ["b", "c"]);
+  assert.deepEqual(match.after, ["e", "f"]);
+});
+
+test("grep_artifact max_matches truncates and still reports the real total", async () => {
+  const lines = Array.from({ length: 20 }, (_, i) => `needle-${i}`);
+  const { r, sha256 } = await storeText(lines.join("\n"));
+  const out = await r.execute("grep_artifact", { sha256, pattern: "needle", max_matches: 3 });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const res = out.result as any;
+  assert.equal(res.total_matches, 20, "the real total must survive truncation");
+  assert.equal(res.returned_matches, 3);
+  assert.equal(res.matches.length, 3);
+  assert.equal(res.truncated, true);
+});
+
+test("grep_artifact clamps an over-large max_matches to the ceiling rather than erroring", async () => {
+  const lines = Array.from({ length: 500 }, (_, i) => `needle-${i}`);
+  const { r, sha256 } = await storeText(lines.join("\n"));
+  const out = await r.execute("grep_artifact", { sha256, pattern: "needle", max_matches: 100000 });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const res = out.result as any;
+  assert.ok(res.returned_matches < 500, "must be clamped well below the true total");
+  assert.equal(res.returned_matches, res.matches.length);
+  assert.equal(res.truncated, true);
+});
+
+test("grep_artifact denies a malformed regex as invalid_argument, without throwing", async () => {
+  const { r, sha256 } = await storeText("hello world");
+  const out = await r.execute("grep_artifact", { sha256, pattern: "(unclosed" });
+  assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "invalid_argument");
+  assert.match(out.denied, /invalid regular expression/i);
+});
+
+test("grep_artifact denies a non-canonical sha256 as invalid_argument, delegating to the store's own validation", async () => {
+  const r = await runner(okFetch);
+  const out = await r.execute("grep_artifact", { sha256: "not-a-hash", pattern: "needle" });
+  assert.equal(out.ok, false);
+  if (out.ok) throw new Error("unreachable");
+  assert.equal(out.kind, "invalid_argument");
+  assert.match(out.denied, /invalid sha256/i);
+});
+
+test("grep_artifact clips a very long matched line and flags it", async () => {
+  const longLine = "x".repeat(2000) + "NEEDLE" + "y".repeat(2000);
+  const content = `short line\n${longLine}\nanother short line`;
+  const { r, sha256 } = await storeText(content);
+  const out = await r.execute("grep_artifact", { sha256, pattern: "NEEDLE" });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const match = (out.result as any).matches[0];
+  assert.equal(match.clipped, true);
+  assert.ok(match.line.length < longLine.length, "the returned line must be shorter than the original");
+  assert.ok(match.line.length <= 400, "clipped line must respect the line-length cap");
+});
+
+test("grep_artifact returns within its scan budget on a genuine catastrophic-backtracking pattern over a large artifact, rather than hanging", { timeout: 8000 }, async () => {
+  // Classic catastrophic-backtracking shape: (a+)+ against a long run of 'a's with no
+  // trailing terminator forces the engine through exponentially many ways to partition
+  // the run before it can fail — without a guard, this line alone would hang the
+  // process for a length far below the ~2000-char line used here.
+  const evilLine = "a".repeat(2000) + "!"; // no trailing 'b', so the match can never succeed
+  const filler = Array.from({ length: 5000 }, (_, i) => `line-${i} nothing interesting here`);
+  const content = [...filler, evilLine, ...filler].join("\n");
+  assert.ok(content.length > 100_000, "artifact must be large enough to matter");
+
+  const { r, sha256 } = await storeText(content);
+  const started = Date.now();
+  const out = await r.execute("grep_artifact", { sha256, pattern: "^(a+)+$" });
+  const elapsed = Date.now() - started;
+
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const res = out.result as any;
+  assert.equal(res.truncated, true, "the scan-budget guard must report truncated: true");
+  assert.match(res.note, /budget/i, "the note must explain why it stopped");
+  assert.ok(elapsed < 5000, `must return well within the scan budget, took ${elapsed}ms`);
+});
+

@@ -17,6 +17,18 @@ const PREVIEW_BYTES = Math.max(
   256, Number(process.env.SAHW_TOOL_PREVIEW_BYTES ?? 2000) || 2000);
 const ARTIFACT_PREVIEW_BYTES = Math.max(
   512, Number(process.env.SAHW_ARTIFACT_PREVIEW_BYTES ?? 8000) || 8000);
+// grep_artifact's own caps (GREP_LINE_MAX_CHARS / GREP_MAX_MATCHES_CEILING /
+// GREP_MAX_CONTEXT_LINES in tools.ts) already bound a single result, but their
+// product is still large enough (100 matches x 10 lines of context each side x 400
+// chars) to be worth a second, coarser backstop here — the Offload Law applies to
+// every tool result, grep_artifact included, not just http_request/read_artifact.
+const GREP_RESULT_MAX_CHARS = Math.max(
+  1000, Number(process.env.SAHW_GREP_RESULT_MAX_CHARS ?? 20000) || 20000);
+
+function isGrepResult(r: any): boolean {
+  return r && Array.isArray(r.matches) && typeof r.total_matches === "number"
+    && typeof r.returned_matches === "number";
+}
 
 function forModel(result: unknown): unknown {
   const r = result as any;
@@ -46,6 +58,32 @@ function forModel(result: unknown): unknown {
       content: r.content.slice(0, ARTIFACT_PREVIEW_BYTES),
       content_bytes: r.content.length,
       truncated: true,
+    };
+  }
+  // A grep_artifact result: ToolRunner already bounded this (line clipping, a match
+  // cap, a scan budget) — do NOT run it through a generic slice-the-JSON-string
+  // truncation like the branches above; chopping a structured array mid-match would
+  // just produce garbage, not a smaller useful result. It is also not EXEMPT from
+  // the Offload Law: a caller near its max_matches/context ceilings can still add up
+  // to a large payload, so drop trailing matches (never edit one that's kept) until
+  // the result fits, preserving the real total_matches/total_lines so the model still
+  // knows what it's missing and can narrow its pattern.
+  if (isGrepResult(r)) {
+    let matches = r.matches as unknown[];
+    let dropped = false;
+    while (matches.length > 0
+      && JSON.stringify({ ...r, matches }).length > GREP_RESULT_MAX_CHARS) {
+      matches = matches.slice(0, -1);
+      dropped = true;
+    }
+    if (!dropped) return r;
+    return {
+      ...r,
+      matches,
+      returned_matches: matches.length,
+      truncated: true,
+      note: `result exceeded ${GREP_RESULT_MAX_CHARS} chars for the model — kept ${matches.length} ` +
+        `of the ${r.matches.length} matches the tool returned; narrow the pattern or reduce max_matches/context`,
     };
   }
   return result;
@@ -83,8 +121,13 @@ export function toolSpanInput(args: Record<string, unknown>): Record<string, unk
  * reachable via the artifact store, and NEVER the response body itself. A denied
  * call is recorded as a denial, with its kind, so a Tether policy denial reads as
  * the security event it is, not a silent no-op.
+ *
+ * `args` is optional and only consulted for a grep_artifact result, to recover the
+ * search pattern for the span (the pattern is not itself part of the tool's return
+ * value) — every other branch ignores it, so existing single-argument call sites are
+ * unaffected.
  */
-export function toolSpanOutput(out: ToolResult): Record<string, unknown> {
+export function toolSpanOutput(out: ToolResult, args?: Record<string, unknown>): Record<string, unknown> {
   if (!out.ok) return { denied: out.denied, kind: out.kind };
   const r = out.result as any;
   if (r && r.response && r.artifact) {
@@ -95,6 +138,19 @@ export function toolSpanOutput(out: ToolResult): Record<string, unknown> {
       body_bytes: body.length,
       artifact_sha256: r.artifact.sha256,
       ms: r.ms,
+    };
+  }
+  // A grep_artifact result: record the pattern and match counts, but NEVER the
+  // matched lines themselves — they can contain recovered secrets (tokens, keys,
+  // PII) pulled straight out of a target's bundle, which is exactly the class of
+  // content this project's telemetry redaction already refuses to persist elsewhere
+  // (see redactHeaders() above).
+  if (isGrepResult(r)) {
+    return {
+      pattern: args?.pattern,
+      total_matches: r.total_matches,
+      returned_matches: r.returned_matches,
+      truncated: r.truncated,
     };
   }
   if (r && typeof r.content === "string") {
@@ -182,7 +238,7 @@ export async function runAgent(opts: {
         span.update({ input: toolSpanInput(args) });
         const result = await opts.runner.execute(name, args);
         span.update({
-          output: toolSpanOutput(result),
+          output: toolSpanOutput(result, args),
           ...(result.ok ? {} : { level: "WARNING" as const }),
         });
         return result;

@@ -92,6 +92,16 @@ test("gate denies an unknown tool rather than passing it through", () => {
   assert.equal(gate(E, "exfiltrate", {}).allow, false);
 });
 
+test("gate allows grep_artifact (it is in KNOWN_TOOLS) with no scope check, while an unknown tool is still denied", () => {
+  // grep_artifact touches no network, so it needs no scope check — but it must still
+  // pass through gate() like every other tool, landing on the default-allow branch
+  // rather than being special-cased around the Tether. Args are irrelevant to the
+  // decision; pass some to demonstrate they are not consulted.
+  assert.equal(gate(E, "grep_artifact", { sha256: "not-even-a-hash", pattern: "(unclosed" }).allow, true);
+  // The default-deny for anything NOT in KNOWN_TOOLS must still be intact alongside it.
+  assert.equal(gate(E, "exfiltrate", { sha256: "x", pattern: "x" }).allow, false);
+});
+
 // --- Fix round 2: two Critical, three Important, one Minor, all empirically verified. ---
 
 const E2 = loadEngagement({
