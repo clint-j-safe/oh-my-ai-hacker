@@ -5,16 +5,34 @@ export type Decision = { allow: true } | { allow: false; reason: string };
 const deny = (reason: string): Decision => ({ allow: false, reason });
 const ALLOW: Decision = { allow: true };
 
+// SECURITY MODEL: the destructive denylist below is DEFENCE IN DEPTH, not containment.
+// A regex denylist over shell strings is inherently incomplete. Real containment is the
+// ephemeral sandbox plus the scope allowlist — and note the allowlist is robust in a way
+// this denylist is not, because inScope() PARSES URLs with the URL constructor rather than
+// pattern-matching text. This check guards against a confused model proposing something
+// destructive; it is not a boundary against a determined adversary.
 const DESTRUCTIVE = [
-  /\brm\s+-[a-z]*[rf]/i, /\bdd\s+if=/i, /\bmkfs(\.\w+)?\b/i, /\bshutdown\b/i,
+  /\brm\s+-[a-z]*[rf]/i,
+  // Long-form rm flags (--recursive, --force, --no-preserve-root), possibly with other
+  // tokens/flags between "rm" and the dangerous long flag.
+  /\brm\s+(?:\S+\s+)*(?:--recursive|--force|--no-preserve-root)\b/i,
+  /\bdd\s+if=/i, /\bmkfs(\.\w+)?\b/i, /\bshutdown\b/i,
   /\breboot\b/i, /\bhalt\b/i, /\bmkswap\b/i, /\bfdisk\b/i, /:\s*\(\s*\)\s*\{.*\|\s*:\s*&/,
   /\bchmod\s+-R\s+777\s+\//, /\b(curl|wget)\b[^|]*\|\s*(ba)?sh\b/i,
   /\bnc\b.*\s-e\b/i, /\bcrontab\b/i, /\bsystemctl\s+(stop|disable)\b/i,
   /\b(useradd|adduser|passwd)\b/i, /\bauthorized_keys\b/i,
+  // eval hides indirection (e.g. `X=$(curl ...); eval "$X"`) from the curl|sh pattern above.
+  /\beval\b/i,
+  // IFS substitution (${IFS} / $IFS) is a classic whitespace-filter bypass; there is no
+  // legitimate use of it in a probe command, so its presence alone is the signal.
+  /\$\{?IFS\}?/i,
 ];
 
-// The payload library is reachable through tools, never by bulk read (spec 9.4).
-const BULK_LIBRARY_READ = /\b(cat|less|head|tail|grep|rg|find|xargs|tar|cp)\b[^\n]*\/opt\/payload-library\/(raw|normalized)\b/i;
+// The payload library is reachable through tools, never through a shell command — so any
+// shell command that so much as names the raw/normalized directories is wrong, regardless
+// of the verb around it (a "cd into it, then read with a relative path" trick defeats a
+// verb-adjacent-to-path check; naming the path at all does not) (spec 9.4).
+const BULK_LIBRARY_READ = /\/opt\/payload-library\/(raw|normalized)\b/i;
 
 function hostPort(u: URL): string {
   const port = u.port || (u.protocol === "https:" ? "443" : "80");
@@ -45,7 +63,7 @@ export function checkCommand(cmd: string): Decision {
     if (p.test(cmd)) return deny(`destructive pattern ${p} in: ${cmd}`);
   }
   if (BULK_LIBRARY_READ.test(cmd)) {
-    return deny("bulk read of the payload library; use the payload tools instead");
+    return deny("shell command references the payload library; use the payload tools instead");
   }
   return ALLOW;
 }
