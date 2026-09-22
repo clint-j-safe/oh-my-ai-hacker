@@ -169,7 +169,9 @@ export interface AgentResult {
   tokens: number;
   toolCalls: Array<{ tool: string; args: string; ok: boolean }>;
   artifacts: number;
-  stopReason: "done" | "max_turns" | "budget" | "aborted";
+  stopReason: "done" | "max_turns" | "budget" | "aborted" | "model_error";
+  /** Set only when stopReason is "model_error": why the model call failed. */
+  modelError?: string;
 }
 
 export async function runAgent(opts: {
@@ -208,7 +210,15 @@ export async function runAgent(opts: {
       return { messages, turns, tokens, toolCalls, artifacts, stopReason: "max_turns" };
     }
 
-    const completion = await opts.client.chat.completions.create(
+    // A model call can fail mid-flight for reasons that have nothing to do with the
+    // engagement — a dropped HTTP/2 stream, EHOSTUNREACH, a provider hiccup. One
+    // such failure previously propagated out of runBeat and killed the process,
+    // discarding four CONFIRMED findings that had already been proved. Treat it as
+    // the end of THIS attempt and hand back everything accumulated so far; the
+    // caller decides whether to keep hunting.
+    let completion: any;
+    try {
+      completion = await opts.client.chat.completions.create(
       {
         model: opts.model,
         messages,
@@ -216,7 +226,16 @@ export async function runAgent(opts: {
         parallel_tool_calls: false,
       },
       opts.signal ? { signal: opts.signal } : undefined,
-    );
+      );
+    } catch (err) {
+      const message = String((err as Error)?.message ?? err);
+      const cause = (err as { cause?: { code?: string } })?.cause?.code;
+      return {
+        messages, turns, tokens, toolCalls, artifacts,
+        stopReason: "model_error",
+        modelError: cause ? `${message} (${cause})` : message,
+      };
+    }
     turns += 1;
     tokens += completion.usage?.total_tokens ?? 0;
 

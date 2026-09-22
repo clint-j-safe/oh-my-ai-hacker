@@ -395,6 +395,15 @@ export async function runBeat(opts: {
               messages.push({ role: "user", content: feedbackForMaxTurnsPerFinding(maxTurnsPerFinding) });
               continue;
             }
+            if (run.stopReason === "model_error") {
+              // A transport/provider failure, NOT the hunter failing to produce a claim.
+              // Reporting this as "no parseable claim" would blame the model for a network
+              // fault and send a reader debugging the wrong layer. End the beat, keep every
+              // finding already banked, and name the real cause.
+              const why = `model call failed: ${run.modelError ?? "unknown"}`;
+              if (findings.length === 0) return bail(stallCfg.exitCode, true, why);
+              return bail(0, false, why);
+            }
             // The attempt actually finished (stopReason "done"/"budget"/"aborted") without
             // a parseable claim — either the hunter explicitly declared itself done, or it
             // just didn't produce one. Per the stall rule, this is a stall ONLY when NOTHING

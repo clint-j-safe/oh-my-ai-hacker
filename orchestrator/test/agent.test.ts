@@ -233,3 +233,31 @@ test("an oversized grep_artifact result (many matches with context) is trimmed b
   // second trim, not just the tool's own max_matches cap.
   assert.equal(content.total_matches, 200);
 });
+
+test("a failed model call ends the attempt as model_error instead of throwing", async () => {
+  // Reproduces the real failure: an in-flight OpenRouter HTTP/2 stream died with
+  // EHOSTUNREACH, the rejection escaped runBeat, and the process exited before
+  // printing — discarding four already-proved CONFIRMED findings.
+  const boom = Object.assign(new TypeError("terminated"), {
+    cause: { code: "EHOSTUNREACH" },
+  });
+  const client = { chat: { completions: { create: async () => { throw boom; } } } };
+  const r = await runAgent(await OPTS(client));
+  assert.equal(r.stopReason, "model_error");
+  assert.match(r.modelError ?? "", /terminated/);
+  assert.match(r.modelError ?? "", /EHOSTUNREACH/);   // the cause must survive, it is the diagnosis
+});
+
+test("a model failure on a LATER turn keeps the work already done", async () => {
+  let n = 0;
+  const client = { chat: { completions: { create: async () => {
+    n += 1;
+    if (n === 1) return call("http_request", { method: "GET", url: "http://10.0.0.1:3000/" });
+    throw Object.assign(new TypeError("terminated"), { cause: { code: "ECONNRESET" } });
+  } } } };
+  const r = await runAgent(await OPTS(client));
+  assert.equal(r.stopReason, "model_error");
+  assert.equal(r.toolCalls.length, 1, "the tool call from turn 1 must survive");
+  assert.equal(r.artifacts, 1, "its artifact must survive");
+  assert.match(r.modelError ?? "", /ECONNRESET/);
+});
