@@ -1,7 +1,12 @@
 import type OpenAI from "openai";
 import { Worker } from "node:worker_threads";
+import { spawn } from "node:child_process";
+import { stat, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import type { Engagement } from "./config.js";
-import { gate } from "./tether.js";
+import { gate, SKILL_EGRESS, type SkillEgress, type Decision } from "./tether.js";
 import { ArtifactStore, type Artifact } from "./artifacts.js";
 
 export interface HttpCapture {
@@ -9,6 +14,22 @@ export interface HttpCapture {
   response: { status: number; headers: Record<string, string>; body: string };
   artifact: Artifact;
   ms: number;
+}
+
+/**
+ * The full (unbounded) result of a successful skill_run call. `output` is the skill's
+ * complete, schema-validated JSON artifact — ToolRunner returns it in full so telemetry
+ * and forModel() (agent.ts) each apply their OWN bound; ToolRunner itself does not
+ * truncate. `kind: "skill_artifact"` is a discriminant forModel()/toolSpanOutput() use
+ * to recognize this shape among the other tool result shapes they already handle.
+ */
+export interface SkillRunOutcome {
+  kind: "skill_artifact";
+  skill_name: string;
+  exit_code: number;
+  ms: number;
+  artifact: Artifact;
+  output: unknown;
 }
 
 // A discriminated reason for a failed tool call, so a caller (the Task 9 agent loop) can
@@ -109,6 +130,66 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
     },
   },
 ];
+
+// --- skill_run: one dispatcher tool for every pre-built skill, not 37 separate ones --
+//
+// Chat Completions strict-mode function schema: `strict: true` requires
+// `additionalProperties: false` AND every declared property to appear in `required`
+// (no "optional" properties under strict mode — a property either exists or the model
+// must be told not to rely on it existing).
+//
+// `input_json` is a JSON-encoded STRING, not a nested object, and that is deliberate:
+// each of the 37 skills has a completely different input shape (severity-calibration
+// wants `{"verified_findings":[...]}`, osv-cve-correlation wants `{"components":[...]}`,
+// ...), and JSON Schema strict mode cannot express "the shape of this property depends
+// on the value of a sibling property" — there is no variable/polymorphic object type
+// under strict mode. Encoding the skill's input as a JSON string keeps the TOP-LEVEL
+// arguments (`skill_name`, `input_json`) strictly well-formed regardless of what's
+// inside the string, which is exactly what strict mode is for. ToolRunner parses and
+// validates `input_json` itself before ever touching the filesystem or a subprocess
+// (see skillRun() below). Do NOT "simplify" this back into a nested `input: object` —
+// that silently drops strict mode's guarantee for every call site that uses it.
+//
+// The `skill_name` enum is narrowed to the CALLING AGENT's allowlist, passed in
+// explicitly — never a module-level global — so the model literally cannot see, let
+// alone request, a skill it has no authorization to run. gate() in tether.ts enforces
+// the same allowlist independently and deterministically at call time; this enum is a
+// prompting nicety (fewer wasted turns proposing a skill that will just be denied), not
+// the security boundary.
+export function buildSkillRunTool(allowlist: readonly string[]): OpenAI.Chat.ChatCompletionTool {
+  return {
+    type: "function",
+    function: {
+      name: "skill_run",
+      description:
+        "Run one pre-built skill (a scripts/run.py that takes JSON on stdin and emits " +
+        "one strict JSON artifact on stdout) against evidence already collected. Only " +
+        "skills this agent is authorized to run appear in skill_name's enum. Returns a " +
+        "bounded summary of the artifact plus its sha256 — call read_artifact/" +
+        "grep_artifact against the sha256 for the full result.",
+      strict: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          skill_name: {
+            type: "string",
+            description: "Which skill to run. Must be one of the enum values.",
+            enum: [...allowlist],
+          },
+          input_json: {
+            type: "string",
+            description:
+              "The skill's input object, JSON-encoded as a string (e.g. " +
+              '\'{"verified_findings":[...]}\'). A string, not an object, so this ' +
+              "schema stays strict-mode valid across skills with different input shapes.",
+          },
+        },
+        required: ["skill_name", "input_json"],
+      },
+    },
+  };
+}
 
 // Mirrors ArtifactStore's own canonical-hash check (src/artifacts.ts). ArtifactStore.get()
 // now throws on a non-canonical sha256 argument (fail-closed on corrupt/junk input) rather
@@ -277,25 +358,246 @@ async function grepArtifactContent(
   };
 }
 
+// --- skill_run: skills root resolution ------------------------------------------------
+//
+// Configurable via env SAHW_SKILLS_ROOT; default is the repo's top-level skills/. This
+// module can run either directly from src/ (tsx, as the test suite does) or from a
+// compiled dist/src/ (the built artifact), so the default probes both possible
+// relative locations and picks whichever actually exists on disk, rather than assuming
+// one fixed depth.
+function defaultSkillsRoot(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(here, "..", "..", "skills"),        // .../orchestrator/src/tools.ts -> repo/skills
+    join(here, "..", "..", "..", "skills"),  // .../orchestrator/dist/src/tools.js -> repo/skills
+  ];
+  return candidates.find((c) => existsSync(c)) ?? candidates[0];
+}
+
+const SKILLS_ROOT = process.env.SAHW_SKILLS_ROOT?.trim() || defaultSkillsRoot();
+const SKILL_TIMEOUT_MS = Math.max(
+  1000, Number(process.env.SAHW_SKILL_TIMEOUT_MS ?? 120_000) || 120_000);
+
+// A skill_name must be a single, plain directory-name segment: no path separators, no
+// parent-directory reference. This is checked BEFORE gate()/policy is even consulted —
+// it is not a scope judgement, it is a structural precondition on the argument's shape
+// (identical in spirit to the sha256/regex shape checks above for read_artifact/
+// grep_artifact), decidable with zero I/O and independent of what the registry knows.
+function validateSkillNameShape(name: unknown): { ok: true; name: string } | { ok: false; reason: string } {
+  if (typeof name !== "string" || name.length === 0) {
+    return { ok: false, reason: `skill_name must be a non-empty string, got ${JSON.stringify(name)}` };
+  }
+  if (name.includes("/") || name.includes("\\")) {
+    return {
+      ok: false,
+      reason: `skill_name must be a plain directory name — no path separators: ${JSON.stringify(name)}`,
+    };
+  }
+  if (name.includes("..")) {
+    return {
+      ok: false,
+      reason: `skill_name must not reference a parent directory: ${JSON.stringify(name)}`,
+    };
+  }
+  return { ok: true, name };
+}
+
+// --- skill_run: a minimal JSON Schema validator, on purpose not a full one -----------
+//
+// WHAT THIS DOES check, at the top level of the document AND one level into any
+// property schema has its own `properties`/`type`/`enum`/`required`:
+//   - `required`: every named key is present on the object being checked.
+//   - `type`: matches "object" | "array" | "string" | "number" | "integer" | "boolean" |
+//     "null" (an unrecognized type keyword is treated as unconstrained, not a failure).
+//   - `enum`: the value is one of the listed literals.
+//
+// WHAT THIS DOES NOT check (by design — writing a real JSON Schema engine is out of
+// scope, and a skill artifact schema in this repo never needs more than the above):
+//   array `items` shapes (only the array's OWN type, one level deep, is checked — the
+//   elements inside it are not walked), `additionalProperties`, `pattern`/`format`,
+//   numeric bounds (`minimum`/`maximum`), `oneOf`/`anyOf`/`allOf`/`not`, and anything
+//   nested more than one property deep. A schema that relies on any of those will not
+//   be fully enforced — see references/artifact.schema.json in each skill for what a
+//   fuller validator would need to check.
+function schemaTypeMatches(value: unknown, type: string): boolean {
+  switch (type) {
+    case "object": return typeof value === "object" && value !== null && !Array.isArray(value);
+    case "array": return Array.isArray(value);
+    case "string": return typeof value === "string";
+    case "number": return typeof value === "number";
+    case "integer": return typeof value === "number" && Number.isInteger(value);
+    case "boolean": return typeof value === "boolean";
+    case "null": return value === null;
+    default: return true; // unrecognized type keyword: not our job to enforce it
+  }
+}
+
+function validateNode(value: unknown, schema: any, path: string, errors: string[], depth: number): void {
+  if (!schema || typeof schema !== "object") return;
+  if (typeof schema.type === "string" && !schemaTypeMatches(value, schema.type)) {
+    const actual = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    errors.push(`${path}: expected type "${schema.type}", got ${actual}`);
+    return; // a wrongly-typed node's own required/enum/properties are meaningless to check further
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((e: unknown) => Object.is(e, value) || e === value)) {
+    errors.push(`${path}: value ${JSON.stringify(value)} is not one of the schema's enum values`);
+  }
+  if (Array.isArray(schema.required) && value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of schema.required) {
+      if (!(key in (value as Record<string, unknown>))) {
+        errors.push(`${path}: missing required property "${key}"`);
+      }
+    }
+  }
+  // One level deep only: descend into declared `properties` exactly once.
+  if (depth === 0 && schema.properties && value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [key, subSchema] of Object.entries<any>(schema.properties)) {
+      if (key in (value as Record<string, unknown>)) {
+        validateNode((value as Record<string, unknown>)[key], subSchema, `${path}.${key}`, errors, depth + 1);
+      }
+    }
+  }
+}
+
+export function validateAgainstSchema(
+  data: unknown, schema: unknown,
+): { ok: true } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  validateNode(data, schema, "$", errors, 0);
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+
+// --- skill_run: subprocess execution --------------------------------------------------
+
+interface SkillProcessOutcome {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+}
+
+/** Bounds an error message that may embed raw script stderr — never dump an unbounded
+ * amount of target-derived or script-derived text into a thrown Error's message. */
+function boundedForError(s: string, max = 2000): string {
+  return s.length > max ? `${s.slice(0, max)}… (${s.length} bytes total)` : s;
+}
+
+function runSkillProcess(
+  spawnImpl: typeof spawn,
+  runPyPath: string, cwd: string, stdinPayload: string, timeoutMs: number,
+): Promise<SkillProcessOutcome> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timedOut = false;
+    const child = spawnImpl("python3", [runPyPath], { cwd, stdio: ["pipe", "pipe", "pipe"] });
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => stdoutChunks.push(c));
+    child.stderr.on("data", (c: Buffer) => stderrChunks.push(c));
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+
+    child.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        exitCode: code,
+        timedOut,
+      });
+    });
+
+    child.stdin.write(stdinPayload);
+    child.stdin.end();
+  });
+}
+
 export class ToolRunner {
   private readonly engagement: Engagement;
   private readonly store: ArtifactStore;
   private readonly fetchImpl: typeof fetch;
+  private readonly skillAllowlist: readonly string[];
+  private readonly skillEgress: Readonly<Record<string, SkillEgress>>;
+  private readonly skillsRoot: string;
+  private readonly skillTimeoutMs: number;
+  private readonly spawnImpl: typeof spawn;
 
-  constructor(opts: { engagement: Engagement; store: ArtifactStore; fetchImpl?: typeof fetch }) {
+  constructor(opts: {
+    engagement: Engagement;
+    store: ArtifactStore;
+    fetchImpl?: typeof fetch;
+    /** The calling agent's skill_run allowlist. Defaults to none (fail closed) — a
+     * caller that wants skill_run to do anything must say so explicitly, mirroring the
+     * "capability is the tools array" rule: no skill is ambiently available. */
+    skillAllowlist?: readonly string[];
+    /** Overrides the built-in skill -> egress classification registry. Tests use this
+     * to register a fixture skill's classification without touching the production
+     * registry in tether.ts; production code omits it and gets SKILL_EGRESS. */
+    skillEgress?: Readonly<Record<string, SkillEgress>>;
+    /** Overrides SAHW_SKILLS_ROOT / the default repo skills/ dir — used by tests to
+     * point at a temporary fixture skill directory. */
+    skillsRoot?: string;
+    /** Overrides SAHW_SKILL_TIMEOUT_MS / the 120s default. */
+    skillTimeoutMs?: number;
+    /** Overrides node:child_process's real `spawn` — tests use this to spy on/replace
+     * process creation (e.g. to prove a denied call never spawns anything), mirroring
+     * how `fetchImpl` above lets tests intercept http_request without a real network
+     * call. Production code omits it and gets the real `spawn`. */
+    spawnImpl?: typeof spawn;
+  }) {
     this.engagement = opts.engagement;
     this.store = opts.store;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.skillAllowlist = opts.skillAllowlist ?? [];
+    this.skillEgress = opts.skillEgress ?? SKILL_EGRESS;
+    this.skillsRoot = opts.skillsRoot ?? SKILLS_ROOT;
+    this.skillTimeoutMs = opts.skillTimeoutMs ?? SKILL_TIMEOUT_MS;
+    this.spawnImpl = opts.spawnImpl ?? spawn;
+  }
+
+  /** Computes the Tether's decision for a call WITHOUT executing it. Exists so
+   * agent.ts can record the decision as its own `tether` audit span (Part 1) — a
+   * sibling of the `tool:<name>` span, not nested inside it — independent of whether
+   * the call goes on to succeed. execute() below calls gate() itself too (defense in
+   * depth: execute() must never trust that some caller already checked); both calls
+   * are deterministic and pure, so there is no risk of the audit record and the real
+   * enforcement decision diverging. */
+  checkGate(tool: string, args: Record<string, unknown>): Decision {
+    return gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress);
   }
 
   async execute(tool: string, args: Record<string, unknown>): Promise<ToolResult> {
-    const decision = gate(this.engagement, tool, args);
+    if (tool === "skill_run") {
+      // Structural shape check happens BEFORE gate()/policy: a path-separator or ".."
+      // skill_name is a caller-argument defect decidable with zero I/O, not a policy
+      // judgement — see validateSkillNameShape() above. Denying it here also guarantees
+      // no process is ever spawned for a malformed name, regardless of what the
+      // registry/allowlist would otherwise have said about it.
+      const shape = validateSkillNameShape(args.skill_name);
+      if (!shape.ok) return { ok: false, kind: "invalid_argument", denied: shape.reason };
+    }
+
+    const decision = gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress);
     if (!decision.allow) return { ok: false, kind: "policy", denied: decision.reason };
 
     try {
       if (tool === "http_request") return { ok: true, result: await this.http(args) };
       if (tool === "read_artifact") return { ok: true, result: await this.readArtifact(args) };
       if (tool === "grep_artifact") return { ok: true, result: await this.grepArtifact(args) };
+      if (tool === "skill_run") return { ok: true, result: await this.skillRun(args) };
       return { ok: false, kind: "no_executor", denied: `no executor for tool: ${tool}` };
     } catch (err) {
       // Belt-and-braces: even with the upfront hash validation below, ArtifactStore.get()
@@ -394,5 +696,104 @@ export class ToolRunner {
     };
     const artifact = await this.store.put(JSON.stringify(capture, null, 2));
     return { ...capture, artifact, ms };
+  }
+
+  private async skillRun(args: Record<string, unknown>): Promise<SkillRunOutcome> {
+    // Shape already validated by execute() before gate() ran; re-derive the narrowed
+    // string rather than trust a stale outer variable.
+    const skillName = String(args.skill_name ?? "");
+
+    const inputJson = args.input_json;
+    if (typeof inputJson !== "string" || inputJson.trim() === "") {
+      throw new InvalidToolArgumentError(
+        `input_json must be a non-empty JSON-encoded string, got ${JSON.stringify(inputJson)}`);
+    }
+    try {
+      JSON.parse(inputJson);
+    } catch (err) {
+      // Decidable purely from the string's own content, no I/O — invalid_argument, same
+      // convention as the sha256/regex checks elsewhere in this file.
+      throw new InvalidToolArgumentError(
+        `input_json is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const skillDir = join(this.skillsRoot, skillName);
+    const runPyPath = join(skillDir, "scripts", "run.py");
+    const schemaPath = join(skillDir, "references", "artifact.schema.json");
+
+    // A skill gate() already recognized as KNOWN (it's in the egress registry and the
+    // caller's allowlist) can still be missing on disk — a skillsRoot misconfiguration,
+    // or a registry entry with no matching fixture in a test. That is decidable without
+    // ever spawning a process, so it is invalid_argument, not execution_error: retrying
+    // the identical call cannot succeed until the caller's configuration changes.
+    try {
+      const st = await stat(skillDir);
+      if (!st.isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new InvalidToolArgumentError(`unknown skill (no directory under skills root): ${skillName}`);
+    }
+    try {
+      await stat(runPyPath);
+    } catch {
+      throw new InvalidToolArgumentError(`skill is missing scripts/run.py: ${skillName}`);
+    }
+
+    let schema: unknown;
+    try {
+      schema = JSON.parse(await readFile(schemaPath, "utf8"));
+    } catch (err) {
+      // The skill's OWN schema file being unreadable/corrupt is an infra defect of the
+      // skill/registry, not something the caller's arguments could have avoided —
+      // execution_error (a plain Error; not InvalidToolArgumentError).
+      throw new Error(
+        `skill is missing a readable references/artifact.schema.json: ${skillName}: ` +
+        `${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const started = Date.now();
+    const proc = await runSkillProcess(this.spawnImpl, runPyPath, skillDir, inputJson, this.skillTimeoutMs);
+    const ms = Date.now() - started;
+
+    if (proc.timedOut) {
+      throw new Error(
+        `skill_run timed out after ${this.skillTimeoutMs}ms and was killed: ${skillName} ` +
+        `(stderr: ${boundedForError(proc.stderr)})`);
+    }
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `skill exited ${proc.exitCode}: ${skillName} (stderr: ${boundedForError(proc.stderr)})`);
+    }
+    // Narrowed to exactly 0 by the check above (a null exitCode only occurs when the
+    // process was killed by a signal, which the timedOut branch already handled).
+    const exitCode: number = proc.exitCode ?? 0;
+
+    let parsedOutput: unknown;
+    try {
+      parsedOutput = JSON.parse(proc.stdout);
+    } catch (err) {
+      // Fail closed but keep the evidence: the raw (malformed) stdout is hashed into
+      // the artifact store for forensics BEFORE the failure is thrown, but the message
+      // carries only the parse error and the artifact's sha256 — never the raw text.
+      const forensic = await this.store.put(proc.stdout);
+      throw new Error(
+        `skill produced malformed JSON on stdout: ${skillName}: ` +
+        `${err instanceof Error ? err.message : String(err)} ` +
+        `(raw output preserved as artifact ${forensic.sha256} for forensics)`);
+    }
+
+    const validation = validateAgainstSchema(parsedOutput, schema);
+    if (!validation.ok) {
+      // Same fail-closed-but-keep-the-evidence posture as the malformed-JSON branch
+      // above: store the raw stdout, surface ONLY the validation error — never the
+      // unvalidated content itself, which is exactly what schema validation exists to
+      // not vouch for.
+      const forensic = await this.store.put(proc.stdout);
+      throw new Error(
+        `skill output failed artifact schema validation: ${skillName}: ${validation.errors.join("; ")} ` +
+        `(raw output preserved as artifact ${forensic.sha256} for forensics)`);
+    }
+
+    const artifact = await this.store.put(proc.stdout);
+    return { kind: "skill_artifact", skill_name: skillName, exit_code: exitCode, ms, artifact, output: parsedOutput };
   }
 }

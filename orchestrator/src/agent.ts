@@ -1,6 +1,7 @@
 import type OpenAI from "openai";
 import { startActiveObservation } from "@langfuse/tracing";
 import type { ToolRunner, ToolResult } from "./tools.js";
+import { auditTarget } from "./tether.js";
 
 /**
  * THE OFFLOAD LAW. Tool results must never be fed back to the model in full.
@@ -24,10 +25,20 @@ const ARTIFACT_PREVIEW_BYTES = Math.max(
 // every tool result, grep_artifact included, not just http_request/read_artifact.
 const GREP_RESULT_MAX_CHARS = Math.max(
   1000, Number(process.env.SAHW_GREP_RESULT_MAX_CHARS ?? 20000) || 20000);
+// skill_run artifacts can be arbitrarily large (severity-calibration over hundreds of
+// findings, a full crawl map, ...) for the exact reason http_request bodies can: the
+// model gets a bounded preview of the validated artifact plus its sha256, and calls
+// read_artifact/grep_artifact against that hash when it genuinely needs more.
+const SKILL_SUMMARY_MAX_CHARS = Math.max(
+  512, Number(process.env.SAHW_SKILL_SUMMARY_MAX_CHARS ?? 4000) || 4000);
 
 function isGrepResult(r: any): boolean {
   return r && Array.isArray(r.matches) && typeof r.total_matches === "number"
     && typeof r.returned_matches === "number";
+}
+
+function isSkillArtifactResult(r: any): boolean {
+  return r && r.kind === "skill_artifact" && r.artifact && typeof r.skill_name === "string";
 }
 
 function forModel(result: unknown): unknown {
@@ -86,6 +97,28 @@ function forModel(result: unknown): unknown {
         `of the ${r.matches.length} matches the tool returned; narrow the pattern or reduce max_matches/context`,
     };
   }
+  // A skill_run success: ToolRunner already schema-validated and hashed the FULL
+  // artifact into the store (r.output is the complete parsed JSON). The Offload Law
+  // applies here exactly as it does to http_request: the model gets a bounded preview
+  // of the artifact plus its sha256, never the whole thing, and calls
+  // read_artifact/grep_artifact against artifact_sha256 when it needs more.
+  if (isSkillArtifactResult(r)) {
+    const full = JSON.stringify(r.output);
+    const truncated = full.length > SKILL_SUMMARY_MAX_CHARS;
+    return {
+      skill_name: r.skill_name,
+      exit_code: r.exit_code,
+      ms: r.ms,
+      artifact_sha256: r.artifact.sha256,
+      summary: truncated ? full.slice(0, SKILL_SUMMARY_MAX_CHARS) : full,
+      summary_bytes: full.length,
+      truncated,
+      ...(truncated
+        ? { note: `artifact truncated to ${SKILL_SUMMARY_MAX_CHARS} of ${full.length} chars for the ` +
+            "model — call read_artifact with artifact_sha256 for the full validated artifact" }
+        : {}),
+    };
+  }
   return result;
 }
 
@@ -109,6 +142,18 @@ function redactHeaders(headers: Record<string, string> | undefined | null): Reco
  */
 export function toolSpanInput(args: Record<string, unknown>): Record<string, unknown> {
   if (!args) return {};
+  // skill_run's input_json can be arbitrarily large (and, like any tool argument, is
+  // caller/model-supplied) — bound it the same way response bodies are bounded, rather
+  // than writing it into telemetry verbatim.
+  if (typeof args.input_json === "string") {
+    const truncated = args.input_json.length > PREVIEW_BYTES;
+    return {
+      ...args,
+      input_json: truncated ? args.input_json.slice(0, PREVIEW_BYTES) : args.input_json,
+      input_json_bytes: args.input_json.length,
+      ...(truncated ? { input_json_truncated: true } : {}),
+    };
+  }
   if (typeof args.headers !== "object" || args.headers === null) return { ...args };
   return { ...args, headers: redactHeaders(args.headers as Record<string, string>) };
 }
@@ -155,6 +200,19 @@ export function toolSpanOutput(out: ToolResult, args?: Record<string, unknown>):
   }
   if (r && typeof r.content === "string") {
     return { content_bytes: r.content.length };
+  }
+  // A skill_run success: skill_name, exit code, duration, the artifact hash and that
+  // validation passed — NEVER the artifact body, and never a secret value (a skill
+  // that discovers a credential is itself responsible for hashing/encrypting it before
+  // it ever reaches an artifact; this span records only bookkeeping about the run).
+  if (isSkillArtifactResult(r)) {
+    return {
+      skill_name: r.skill_name,
+      exit_code: r.exit_code,
+      ms: r.ms,
+      artifact_sha256: r.artifact.sha256,
+      validation: "ok",
+    };
   }
   return {};
 }
@@ -271,6 +329,34 @@ export async function runAgent(opts: {
       const raw = c.function.arguments ?? "{}";
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(raw); } catch { /* malformed args reach the tool as {} */ }
+
+      // THE TETHER AUDIT SPAN. gate() runs on every tool call inside
+      // ToolRunner.execute(), but until now that decision left no record of its own: a
+      // DENIAL surfaced only as kind:"policy" buried inside the tool result (see
+      // toolSpanOutput below), and an ALLOW left NO record at all — the single most
+      // security-critical decision in the system ("may this action leave the box") was
+      // the one thing with no audit trail. This computes the SAME decision the
+      // executor is about to enforce (ToolRunner.checkGate() delegates to the identical
+      // gate() call tools.ts.execute() makes internally) and records it as its own
+      // `tether` span — a SIBLING of the `tool:<name>` span below, not nested inside
+      // it, so the authorization decision is auditable on its own regardless of
+      // whether the call goes on to succeed. Emitted for ALLOW as well as DENY: an
+      // allow-only-on-deny audit log is useless for answering "was this authorization
+      // decision even made" on the other 66 calls in a 67-call trace.
+      await startActiveObservation("tether", async (span) => {
+        const decision = opts.runner.checkGate(name, args);
+        span.update({
+          input: { tool: name, target: auditTarget(name, args) },
+          output: decision.allow
+            ? { decision: "allow" as const }
+            // The reason is the security record here — shell_exec commands and
+            // http_request URLs are NEVER redacted (per toolSpanInput's own body/URL
+            // handling elsewhere, only response BODIES and secret header VALUES are
+            // redacted, never the requested action itself).
+            : { decision: "deny" as const, reason: decision.reason },
+          ...(decision.allow ? {} : { level: "WARNING" as const }),
+        });
+      });
 
       const out = await startActiveObservation(`tool:${name}`, async (span) => {
         span.update({ input: toolSpanInput(args) });

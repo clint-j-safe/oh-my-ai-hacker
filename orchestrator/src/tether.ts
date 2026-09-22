@@ -182,10 +182,124 @@ export function checkCommand(cmd: string): Decision {
 
 const KNOWN_TOOLS = new Set([
   "http_request", "read_artifact", "grep_artifact", "glob_artifact",
-  "write_file", "shell_exec",
+  "write_file", "shell_exec", "skill_run",
 ]);
 
-export function gate(e: Engagement, tool: string, args: Record<string, unknown>): Decision {
+// --- skill_run egress classification -------------------------------------------------
+//
+// A skill runs `python3 scripts/run.py` as a plain OS process. http_request and
+// shell_exec are gated because THIS module inspects the URL/command being asked for —
+// but a skill's *script* can make its own outbound connections that this module never
+// sees at all. Wiring a network-capable skill in as skill_run would therefore be an
+// un-gated egress channel straight through the project's central security claim
+// ("capability is the tools array; the Tether gates every action").
+//
+// So every skill is classified by what its OWN scripts/run.py actually does when
+// invoked directly (not by what a *generated* exploit script it writes would later do,
+// and not by trusting a skill's own SKILL.md prose uncritically — several SKILL.md
+// files say "sends no traffic" about the ENGAGEMENT TARGET while the script still talks
+// to an external reference service, e.g. osv-cve-correlation -> api.osv.dev):
+//
+//   "none"     - run.py performs pure computation over evidence already collected.
+//                No import of a network-capable module (httpx, urllib.request, socket,
+//                requests, ...), no subprocess call to a network tool (sqlmap, ghauri,
+//                nuclei, interactsh-client, curl, playwright, ...), and no execution of
+//                previously-generated, network-capable code.
+//   "target"   - run.py itself contacts the engagement target directly (or executes/
+//                subprocesses something that does, e.g. re-running a PoC script, or
+//                shelling out to sqlmap/ghauri against the target URL), or delegates to
+//                sub-agents that do (declared "indirect" in its own SKILL.md).
+//   "external" - run.py itself contacts a reference service OTHER than the engagement
+//                target (e.g. api.osv.dev). Still an egress channel the Tether cannot
+//                see or gate; treated exactly like "target" for permission purposes.
+//
+// A skill with no entry here is UNKNOWN and is denied by gate() below, same as any of
+// "target"/"external" — being unclassified is not a lesser risk than being classified
+// network-touching.
+//
+// TODO(phase 2 - declared egress): replace the blanket "target"/"external" denial with
+// a per-skill, per-host allowlist: a skill declares the exact hosts it needs in its
+// SKILL.md metadata (e.g. `metadata.egress-hosts: ["api.osv.dev"]`), and the Tether
+// permits ONLY those named hosts for that named skill — not a blanket grant to touch
+// "the target" or "the network" at large. Until that per-host mechanism exists, no
+// skill whose classification is anything other than "none" may run, regardless of how
+// narrow its actual traffic really is.
+export type SkillEgress = "none" | "target" | "external";
+
+// Evidence for every entry below was gathered by reading each skill's SKILL.md
+// (description + metadata block) AND scripts/run.py (imports, subprocess/exec calls),
+// not by pattern-matching the skill's name. See the skill-run-report.md for the
+// per-skill evidence trail this table was built from.
+export const SKILL_EGRESS: Readonly<Record<string, SkillEgress>> = Object.freeze({
+  // -- none: pure computation over already-collected evidence, verified network-free --
+  "adversarial-self-review": "none",
+  "blast-radius-estimation": "none",
+  "chain-construction": "none",
+  "cognitive-pruning": "none",
+  "credential-secret-custody": "none",
+  "exploit-request-generator": "none",   // writes a spec (text); no execution, no network call in run.py
+  "exploit-safety-auditor": "none",      // static pattern scanner over script text; no execution
+  "exploit-script-developer": "none",    // GENERATES a script that itself imports httpx, but run.py
+                                          // never executes it -- see report for the exact line checked
+  "exploit-sandbox-programming": "none", // GENERATES a script + expected-hash; run.py never runs it
+  "payload-mutator": "none",
+  "scope-discipline": "none",            // urllib.parse only, for parsing -- never urllib.request
+  "severity-calibration": "none",
+  "skill-planner": "none",
+  "skill-variant-generator": "none",
+  "stall-ambiguity-resolution": "none",
+  "technique-combinator": "none",
+  "token-session-forensics": "none",
+
+  // -- target: run.py itself (or a subprocess it drives) contacts the engagement target --
+  "account-role-acquisition": "target",
+  "api-graphql-specifics": "target",
+  "auth-bypass-battery": "target",
+  "business-logic-state": "target",
+  "delegation-collaboration": "target",       // SKILL.md declares target-interaction: "indirect"
+  "deserialization-rce": "target",
+  "file-upload-path-traversal": "target",     // also polls an external OOB collaborator
+  "idor-bola-access-control": "target",
+  "injection-battery-xxe-ssti-nosql": "target", // also polls an external OOB collaborator
+  "intelligent-crawling": "target",
+  "js-spa-reverse": "target",
+  "oob-blind-vuln-correlation": "target",     // also polls an external OOB collaborator
+  "poc-hardening-self-verification": "target", // subprocess.run()s a PoC script against the target
+  "privilege-matrix-mapping": "target",
+  "sqli-database-injection": "target",        // subprocess execs sqlmap/ghauri against the target
+  "ssrf-internal-pivot": "target",            // also polls an external OOB collaborator
+  "tech-fingerprinting": "target",
+  "waf-evasion-mastery": "target",
+  "xss-dom-sinks": "target",
+
+  // -- external: run.py itself contacts a reference service OTHER than the target --
+  "osv-cve-correlation": "external",          // hard-pinned to api.osv.dev via urllib.request
+});
+
+// What a `tether` audit span records as its input.target: the thing whose
+// authorization is being decided. http_request -> the URL; shell_exec -> the raw
+// command string (never redacted here -- this IS the security record, and it never
+// carries a response body, only the requested action); skill_run -> the skill name.
+export function auditTarget(tool: string, args: Record<string, unknown>): string {
+  if (tool === "http_request") return String(args.url ?? "");
+  if (tool === "shell_exec") return String(args.command ?? "");
+  if (tool === "skill_run") return String(args.skill_name ?? "");
+  return "";
+}
+
+export function gate(
+  e: Engagement,
+  tool: string,
+  args: Record<string, unknown>,
+  // The calling agent's skill_run allowlist. Explicit parameter, not a global — see
+  // the same rule applied to the skill_run tool-schema builder in tools.ts. Defaults to
+  // "nothing" (fail closed): a caller that doesn't pass one gets every skill denied.
+  skillAllowlist: readonly string[] = [],
+  // The skill -> egress classification table. Defaults to the built-in registry above;
+  // overridable so tests can register a fixture skill's classification without
+  // mutating the production registry.
+  skillEgress: Readonly<Record<string, SkillEgress>> = SKILL_EGRESS,
+): Decision {
   if (!KNOWN_TOOLS.has(tool)) return deny(`unknown tool: ${tool}`);
   if (tool === "http_request") {
     return inScope(e, String(args.url ?? ""));
@@ -197,6 +311,27 @@ export function gate(e: Engagement, tool: string, args: Record<string, unknown>)
     for (const u of urlsInCmd) {
       const d = inScope(e, u);
       if (!d.allow) return d;
+    }
+    return ALLOW;
+  }
+  if (tool === "skill_run") {
+    const skillName = String(args.skill_name ?? "");
+    const egress = skillEgress[skillName];
+    if (egress === undefined) {
+      return deny(`unknown skill: ${JSON.stringify(skillName)}`);
+    }
+    if (!skillAllowlist.includes(skillName)) {
+      return deny(
+        `skill not on the caller's allowlist: ${JSON.stringify(skillName)} ` +
+        `(allowed: ${skillAllowlist.length ? skillAllowlist.join(", ") : "none"})`);
+    }
+    if (egress !== "none") {
+      return deny(
+        `skill egress not yet gated: ${JSON.stringify(skillName)} is classified "${egress}" — ` +
+        "network-touching skills are denied until the declared-egress mechanism lands " +
+        "(a skill declares its required hosts in SKILL.md; the Tether permits only those " +
+        "named hosts for that named skill — see the TODO above SKILL_EGRESS); phase 1 " +
+        "permits only \"none\" (pure computation over already-collected evidence)");
     }
     return ALLOW;
   }

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import { loadEngagement } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
-import { ToolRunner, TOOL_SCHEMAS, type HttpCapture } from "./tools.js";
+import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture } from "./tools.js";
 import { runAgent, type MinimalClient } from "./agent.js";
 import { evaluate, type Invariant } from "./axiom.js";
 import { gateProvenance } from "./provenance.js";
@@ -22,6 +22,20 @@ import { buildHunterBrief } from "./brief.js";
 // src/brief.ts can use it without a beat.ts <-> brief.ts import cycle.
 export { VULN_CLASSES, isVulnClass };
 export type { VulnClass };
+
+// The hunter's skill_run allowlist. Phase 1 permits only skills confirmed genuinely
+// network-free (egress "none" in tether.ts's SKILL_EGRESS registry) AND actually needed
+// right now — not every network-free skill that exists. The measured bottleneck isn't
+// discovery, it's that a proved finding gets mislabeled/misscored, so the two skills
+// wired in both attack that directly: adversarial-self-review challenges a claim before
+// it is emitted, severity-calibration scores it from demonstrated evidence rather than
+// theoretical maximum. This is a narrower cut of the design doc's `adjudicator` agent's
+// skill list (§7.1), which also includes poc-hardening-self-verification — left out
+// here because it subprocess-executes a PoC against the live target (egress "target"),
+// which stays denied until the declared-egress mechanism (see the TODO in tether.ts)
+// exists. Widening this list is a one-line change PROVIDED the new skill's own egress
+// classification is "none" — gate() enforces that independently either way.
+export const HUNTER_SKILL_ALLOWLIST = ["adversarial-self-review", "severity-calibration"] as const;
 
 export interface RejectedClaim {
   raw: unknown;
@@ -222,7 +236,11 @@ export async function runBeat(opts: {
 
   const workspace = opts.env.SAHW_WORKSPACE ?? ".";
   const store = new ArtifactStore(join(workspace, "artifacts"));
-  const runner = new ToolRunner({ engagement, store, fetchImpl: opts.fetchImpl });
+  const runner = new ToolRunner({
+    engagement, store, fetchImpl: opts.fetchImpl,
+    skillAllowlist: HUNTER_SKILL_ALLOWLIST,
+  });
+  const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(HUNTER_SKILL_ALLOWLIST)];
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), engagement.phaseTimeoutMs);
@@ -413,7 +431,7 @@ export async function runBeat(opts: {
             model: opts.env.SAHW_MODEL ?? "model",
             system: hunterBrief,
             user: `In-scope: ${scopeUrls.join(", ")}`,
-            tools: TOOL_SCHEMAS,
+            tools: hunterTools,
             runner,
             maxTurns: perCallMaxTurns,
             budgetTokens: remainingTokens,
