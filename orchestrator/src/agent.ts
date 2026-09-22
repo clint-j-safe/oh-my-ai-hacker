@@ -172,6 +172,24 @@ export interface AgentResult {
   stopReason: "done" | "max_turns" | "budget" | "aborted" | "model_error";
   /** Set only when stopReason is "model_error": why the model call failed. */
   modelError?: string;
+  /**
+   * Metadata-only record of every successful http_request this call made: method,
+   * url, status, content-type — NEVER the body. This does not weaken the Offload
+   * Law above; it is bookkeeping over fields toolSpanOutput already extracts for
+   * telemetry, not a path for full response bodies back to the caller. Exists so a
+   * caller (beat.ts) can feed what the hunter actually discovered into the Spine's
+   * attack_surface, not just the endpoints involved in a claim.
+   */
+  httpCalls: Array<{ method: string; url: string; status: number; contentType: string | null }>;
+}
+
+function headerValue(headers: Record<string, string> | undefined | null, name: string): string | null {
+  if (!headers) return null;
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return null;
 }
 
 export async function runAgent(opts: {
@@ -198,16 +216,17 @@ export async function runAgent(opts: {
     { role: "user", content: opts.user },
   ];
   const toolCalls: AgentResult["toolCalls"] = [];
+  const httpCalls: AgentResult["httpCalls"] = [];
   let turns = 0;
   let tokens = 0;
   let artifacts = 0;
 
   while (true) {
     if (opts.signal?.aborted) {
-      return { messages, turns, tokens, toolCalls, artifacts, stopReason: "aborted" };
+      return { messages, turns, tokens, toolCalls, artifacts, httpCalls, stopReason: "aborted" };
     }
     if (turns >= opts.maxTurns) {
-      return { messages, turns, tokens, toolCalls, artifacts, stopReason: "max_turns" };
+      return { messages, turns, tokens, toolCalls, artifacts, httpCalls, stopReason: "max_turns" };
     }
 
     // A model call can fail mid-flight for reasons that have nothing to do with the
@@ -231,7 +250,7 @@ export async function runAgent(opts: {
       const message = String((err as Error)?.message ?? err);
       const cause = (err as { cause?: { code?: string } })?.cause?.code;
       return {
-        messages, turns, tokens, toolCalls, artifacts,
+        messages, turns, tokens, toolCalls, artifacts, httpCalls,
         stopReason: "model_error",
         modelError: cause ? `${message} (${cause})` : message,
       };
@@ -244,7 +263,7 @@ export async function runAgent(opts: {
 
     const calls = message?.tool_calls ?? [];
     if (calls.length === 0) {
-      return { messages, turns, tokens, toolCalls, artifacts, stopReason: "done" };
+      return { messages, turns, tokens, toolCalls, artifacts, httpCalls, stopReason: "done" };
     }
 
     for (const c of calls) {
@@ -264,6 +283,17 @@ export async function runAgent(opts: {
       });
       toolCalls.push({ tool: name, args: raw, ok: out.ok });
       if (out.ok && (out.result as any)?.artifact) artifacts += 1;
+      if (out.ok && name === "http_request") {
+        const r = out.result as any;
+        if (r?.request && r?.response) {
+          httpCalls.push({
+            method: r.request.method,
+            url: r.request.url,
+            status: r.response.status,
+            contentType: headerValue(r.response.headers, "content-type"),
+          });
+        }
+      }
 
       messages.push({
         role: "tool",
@@ -274,7 +304,7 @@ export async function runAgent(opts: {
     }
 
     if (tokens >= opts.budgetTokens) {
-      return { messages, turns, tokens, toolCalls, artifacts, stopReason: "budget" };
+      return { messages, turns, tokens, toolCalls, artifacts, httpCalls, stopReason: "budget" };
     }
   }
 }

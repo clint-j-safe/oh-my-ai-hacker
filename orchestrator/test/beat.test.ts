@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
@@ -264,6 +264,64 @@ test("a beat that never produces a parseable claim (zero findings) IS stalled an
   assert.equal(out.findings.length, 0);
   assert.equal(out.stalled, true);
   assert.equal(out.exitCode, 3);
+});
+
+// ---- the Spine -------------------------------------------------------------------
+
+test("the spine is written even when the beat stalls, and records the stalled beat", async () => {
+  const env = await ENV();
+  const silent = { chat: { completions: { create: async () => ({ choices: [{ message: { role: "assistant", content: "I will think about it." } }], usage: { total_tokens: 5 } }) } } };
+  const out = await runBeat({ env, client: silent, fetchImpl: differentialFetch, now: NOW });
+  assert.equal(out.stalled, true);
+
+  const raw = await readFile(join(env.SAHW_WORKSPACE!, "spine", "progress.json"), "utf8");
+  const spine = JSON.parse(raw);
+  assert.equal(spine.beats.length, 1);
+  assert.equal(spine.beats[0].stalled, true);
+  assert.equal(spine.beats[0].findings_banked, 0);
+  assert.ok(spine.beats[0].reason, "a stalled beat must record why");
+});
+
+test("a fresh workspace produces spine_fresh: true on the result, with a null reason", async () => {
+  const out = await runBeat({ env: await ENV(), client: scriptedClient(), fetchImpl: differentialFetch, now: NOW });
+  assert.equal(out.spine_fresh, true);
+  assert.equal(out.spine_fresh_reason, null);
+});
+
+test("the generated hunter brief (not a static string) reaches the model as the system message", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const client = recordingScriptedClient(script);
+  await runBeat({ env: await ENV(), client, fetchImpl: bareFetch, now: NOW });
+  const firstCallMessages = client.seen[0].messages;
+  const system = firstCallMessages.find((m: any) => m.role === "system");
+  assert.match(system.content, /<safe_ai_hacker_hunter>/);
+  assert.match(system.content, /<attack_surface>/);
+  assert.match(system.content, /<already_proved>/);
+  assert.match(system.content, /map the attack surface/i);
+});
+
+test("a second beat against the SAME engagement/scope inherits the first beat's proved findings into <already_proved>", async () => {
+  const env = await ENV();
+  const url = "http://10.0.0.1:3000/a";
+  const script1 = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const first = await runBeat({ env, client: recordingScriptedClient(script1), fetchImpl: bareFetch, now: NOW });
+  assert.equal(first.findings.length, 1);
+
+  const script2 = [say("Nothing to report.")];
+  const client2 = recordingScriptedClient(script2);
+  await runBeat({ env, client: client2, fetchImpl: bareFetch, now: NOW });
+  const system = client2.seen[0].messages.find((m: any) => m.role === "system");
+  assert.match(system.content, /vuln_class="clickjacking"/);
+  assert.match(system.content, new RegExp(`endpoint="${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
 });
 
 test("every VULN_CLASSES value is accepted by isVulnClass, and a prose value is rejected", () => {

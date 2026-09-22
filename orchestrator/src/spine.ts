@@ -1,0 +1,377 @@
+import { mkdir, readFile, writeFile, rm, rename } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+
+/**
+ * THE SPINE — persistent state carried between beats.
+ *
+ * "No spine, no loop. Without it, the loop just repeats its first step forever."
+ * (docs/superpowers/specs/2026-09-22-safe-ai-hacker-design.md §4/§5). Before this
+ * module existed, every beat rebuilt the hunter's system prompt from a single static
+ * string, so a fresh beat had no memory of endpoints already mapped, findings already
+ * proved, or hypotheses already dead-ended — two consecutive real runs both
+ * rediscovered the same two trivial header findings from zero.
+ *
+ * Lives under <workspace>/spine/, NEVER in the repo. Two files:
+ *   progress.json  machine state — read at beat start (loadSpine), written at beat
+ *                  end (saveSpine), one JSON round trip, never partially written
+ *                  (temp-file-then-rename, mirroring ArtifactStore.put in artifacts.ts).
+ *   rules.md       durable, human-editable lessons. The loop reads it (loadRules) but
+ *                  never writes it — it is out of scope for this module to mutate.
+ */
+
+export const SPINE_SCHEMA_VERSION = 1;
+
+/** Thrown when progress.json declares a schema_version newer than this orchestrator
+ * understands. Refused, not misread: an older reader silently misinterpreting a
+ * newer shape is worse than refusing to start. Distinct from a corrupt/unparseable
+ * file, which is safe to discard and start fresh from (see loadSpine). */
+export class SpineVersionError extends Error {}
+
+export interface SpineEndpoint {
+  url: string;
+  method: string;
+  status: number | null;
+  content_type: string | null;
+  semantic_role?: string;
+  notes?: string;
+}
+
+/**
+ * Free-form but structured client-intel recovered from the target's own served
+ * assets. Never a secret's plaintext value — see sanitizeIntelValue below, which
+ * updateSpine runs over every string written here. A caller that has a real secret
+ * must already hand it in as a description (e.g. "bearer-less JWT in Authorization"),
+ * never the material itself; the sanitizer is a backstop, not the only guard.
+ */
+export interface RecoveredIntel {
+  api_base?: string;
+  request_envelope?: string;
+  auth_header_style?: string;
+  source_maps_seen?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ProvedEntry {
+  vuln_class: string;
+  endpoint: string;
+  invariant_type: string;
+  /** The gated verdict (may be NEEDS_REVIEW even though the invariant itself passed
+   * — see beat.ts, which routes into `proved` on axiom.status === "CONFIRMED", not
+   * on the provenance-gated status). Kept for audit; presence in `proved` is itself
+   * the "don't re-derive this" signal, independent of this field's value. */
+  verdict: string;
+  finding_id: string;
+}
+
+export interface AttemptedEntry {
+  vuln_class: string;
+  endpoint: string;
+  invariant_type: string;
+  outcome: string;
+  why: string;
+}
+
+export interface SpineBeatRecord {
+  beat_id: string;
+  started_utc: string;
+  ended_utc: string;
+  findings_banked: number;
+  stalled: boolean;
+  reason: string | null;
+  codename: string;
+}
+
+export interface SpineCounters {
+  total_beats: number;
+  total_findings: number;
+  total_proved: number;
+  total_attempted: number;
+}
+
+export interface SpineEngagementRef {
+  auth_ref: string;
+  scope_origins: string[];
+}
+
+export interface Spine {
+  schema_version: number;
+  engagement: SpineEngagementRef;
+  beats: SpineBeatRecord[];
+  attack_surface: SpineEndpoint[];
+  recovered_intel: RecoveredIntel;
+  proved: ProvedEntry[];
+  attempted: AttemptedEntry[];
+  counters: SpineCounters;
+  /** Durable record of why THIS spine started fresh instead of continuing a prior
+   * one — e.g. an engagement/scope mismatch, or a corrupt prior file. null for a
+   * spine that continued normally. This is what makes "start fresh, and say so"
+   * survive past a single beat's stderr: it is written into progress.json itself,
+   * not just logged and discarded. */
+  fresh_reason: string | null;
+}
+
+export interface LoadSpineResult {
+  spine: Spine;
+  /** true if this beat is starting from a brand-new spine (no prior file, a prior
+   * file that failed to parse, or one for a different engagement/scope). */
+  fresh: boolean;
+  freshReason: string | null;
+}
+
+function freshSpine(authRef: string, scopeOrigins: string[], freshReason: string | null): Spine {
+  return {
+    schema_version: SPINE_SCHEMA_VERSION,
+    engagement: { auth_ref: authRef, scope_origins: [...scopeOrigins].sort() },
+    beats: [],
+    attack_surface: [],
+    recovered_intel: {},
+    proved: [],
+    attempted: [],
+    counters: { total_beats: 0, total_findings: 0, total_proved: 0, total_attempted: 0 },
+    fresh_reason: freshReason,
+  };
+}
+
+function spineDir(workspace: string): string {
+  return join(workspace, "spine");
+}
+function progressPath(workspace: string): string {
+  return join(spineDir(workspace), "progress.json");
+}
+export function rulesPath(workspace: string): string {
+  return join(spineDir(workspace), "rules.md");
+}
+
+/** rules.md is human-editable and read-only to the loop — no writer is exposed here. */
+export async function loadRules(workspace: string): Promise<string | null> {
+  try {
+    return await readFile(rulesPath(workspace), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function asStringArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+function asObject<T>(v: unknown, fallback: T): T {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as T) : fallback;
+}
+function asArray<T>(v: unknown): T[] {
+  return Array.isArray(v) ? (v as T[]) : [];
+}
+
+/**
+ * Normalizes a parsed-but-untrusted progress.json into a well-shaped Spine. A file
+ * can pass JSON.parse and carry a matching schema_version while still having a
+ * shape a naive `parsed as Spine` cast would let through malformed — e.g.
+ * `"beats": "nope"` — and blow up a later beat (updateSpine's `[...spine.beats, x]`)
+ * well after loadSpine returned normally. Every array/object field is defaulted
+ * here so a structurally damaged file degrades gracefully instead of crashing a
+ * beat that has not even started hunting yet.
+ */
+function normalize(parsed: any, authRef: string, scopeOrigins: string[]): Spine {
+  const engagement = asObject<Partial<SpineEngagementRef>>(parsed.engagement, {});
+  return {
+    schema_version: SPINE_SCHEMA_VERSION,
+    engagement: {
+      auth_ref: typeof engagement.auth_ref === "string" ? engagement.auth_ref : authRef,
+      scope_origins: asStringArray(engagement.scope_origins),
+    },
+    beats: asArray<SpineBeatRecord>(parsed.beats),
+    attack_surface: asArray<SpineEndpoint>(parsed.attack_surface),
+    recovered_intel: asObject<RecoveredIntel>(parsed.recovered_intel, {}),
+    proved: asArray<ProvedEntry>(parsed.proved),
+    attempted: asArray<AttemptedEntry>(parsed.attempted),
+    counters: asObject<SpineCounters>(parsed.counters, {
+      total_beats: 0, total_findings: 0, total_proved: 0, total_attempted: 0,
+    }),
+    fresh_reason: typeof parsed.fresh_reason === "string" ? parsed.fresh_reason : null,
+  };
+}
+
+/**
+ * Reads <workspace>/spine/progress.json and returns state ready for this beat.
+ *
+ * - No file at all: a brand-new spine (`fresh: true`).
+ * - Unparseable JSON, or JSON missing a usable schema_version: logged, and a fresh
+ *   spine is returned — a corrupt file must never kill the run.
+ * - A schema_version NEWER than this build understands: REFUSED — throws
+ *   SpineVersionError rather than guessing at an unknown shape. Distinct from
+ *   corruption on purpose: corrupt data is safe to discard, but a newer schema may
+ *   encode a shape this reader would silently misinterpret.
+ * - A schema_version this build understands, but for a DIFFERENT engagement
+ *   (`auth_ref`) or a DIFFERENT scope (`scope_origins`, as a set): NOT merged. A
+ *   fresh spine is returned and the mismatch is recorded (`freshReason`, and inside
+ *   the returned spine's `fresh_reason`) — silently inheriting another engagement's
+ *   state would be a scope violation in effect.
+ */
+export async function loadSpine(opts: {
+  workspace: string;
+  authRef: string;
+  scopeOrigins: string[];
+}): Promise<LoadSpineResult> {
+  const path = progressPath(opts.workspace);
+  const scopeOrigins = [...opts.scopeOrigins].sort();
+
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return { spine: freshSpine(opts.authRef, scopeOrigins, null), fresh: true, freshReason: null };
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const reason = `corrupt progress.json: ${(err as Error).message}`;
+    console.error(`[spine] ${reason} — starting fresh`);
+    return { spine: freshSpine(opts.authRef, scopeOrigins, reason), fresh: true, freshReason: reason };
+  }
+
+  if (typeof parsed?.schema_version !== "number") {
+    const reason = "corrupt progress.json: missing or non-numeric schema_version";
+    console.error(`[spine] ${reason} — starting fresh`);
+    return { spine: freshSpine(opts.authRef, scopeOrigins, reason), fresh: true, freshReason: reason };
+  }
+
+  if (parsed.schema_version > SPINE_SCHEMA_VERSION) {
+    throw new SpineVersionError(
+      `progress.json schema_version ${parsed.schema_version} is newer than this ` +
+      `orchestrator supports (${SPINE_SCHEMA_VERSION}) — refusing to misread it`);
+  }
+
+  const priorAuthRef: unknown = parsed?.engagement?.auth_ref;
+  const priorScope = asStringArray(parsed?.engagement?.scope_origins).sort();
+  const sameScope = JSON.stringify(priorScope) === JSON.stringify(scopeOrigins);
+  if (priorAuthRef !== opts.authRef || !sameScope) {
+    const reason =
+      `spine was for engagement ${JSON.stringify(priorAuthRef)} / scope ${JSON.stringify(priorScope)}, ` +
+      `this run is ${JSON.stringify(opts.authRef)} / scope ${JSON.stringify(scopeOrigins)} — ` +
+      `starting fresh rather than silently merging across engagements/scopes`;
+    console.error(`[spine] ${reason}`);
+    return { spine: freshSpine(opts.authRef, scopeOrigins, reason), fresh: true, freshReason: reason };
+  }
+
+  return { spine: normalize(parsed, opts.authRef, scopeOrigins), fresh: false, freshReason: null };
+}
+
+export async function saveSpine(workspace: string, spine: Spine): Promise<void> {
+  const path = progressPath(workspace);
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `.tmp-${randomBytes(4).toString("hex")}`);
+  const body = JSON.stringify(spine, null, 2);
+  try {
+    await writeFile(tmp, body, "utf8");
+    await rename(tmp, path);
+  } catch (err) {
+    try { await rm(tmp); } catch { /* best effort cleanup */ }
+    throw err;
+  }
+}
+
+// ---- secret redaction (recovered_intel only — see updateSpine) -----------------
+
+// A JWT: three dot-separated base64url segments, each long enough that this
+// wouldn't fire on an incidental "a.b.c". Matched and redacted wherever it occurs
+// in a string, not just as a full match, so a descriptive sentence that quotes a
+// token inline is still caught.
+const JWT_RE = /[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+// A long, unbroken run of base64/hex-alphabet characters: bearer tokens, API keys,
+// long hex secrets. 24 chars is deliberately conservative — long enough to avoid
+// eating ordinary words, short enough to catch real key material.
+const LONG_TOKEN_RE = /\b[A-Za-z0-9+/_-]{24,}={0,2}\b/g;
+
+function sanitizeIntelString(v: string): string {
+  let out = v.replace(JWT_RE, "<redacted-secret>");
+  out = out.replace(LONG_TOKEN_RE, (m) => (m.startsWith("<redacted") ? m : "<redacted-secret>"));
+  return out;
+}
+
+/**
+ * Deep-sanitizes recovered_intel values only. NEVER apply this to attack_surface —
+ * a URL path segment can easily be 24+ opaque characters (an id, a slug) and is not
+ * a secret; scrubbing it there would gut the very surface list the spine exists to
+ * carry.
+ */
+function sanitizeIntel(v: unknown): unknown {
+  if (typeof v === "string") return sanitizeIntelString(v);
+  if (Array.isArray(v)) return v.map(sanitizeIntel);
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) out[k] = sanitizeIntel(val);
+    return out;
+  }
+  return v;
+}
+
+function mergeIntel(prev: RecoveredIntel, next: RecoveredIntel): RecoveredIntel {
+  const merged: RecoveredIntel = { ...prev };
+  for (const [k, v] of Object.entries(next)) {
+    merged[k] = sanitizeIntel(v);
+  }
+  return merged;
+}
+
+function mergeEndpoints(prev: SpineEndpoint[], next: SpineEndpoint[]): SpineEndpoint[] {
+  const byKey = new Map<string, SpineEndpoint>();
+  for (const e of prev) byKey.set(`${e.method} ${e.url}`, e);
+  for (const e of next) {
+    const key = `${e.method} ${e.url}`;
+    const existing = byKey.get(key);
+    // Later observations win on scalar fields; a newly-empty optional field does
+    // not erase a previously-recorded one.
+    byKey.set(key, existing ? { ...existing, ...e, notes: e.notes ?? existing.notes, semantic_role: e.semantic_role ?? existing.semantic_role } : e);
+  }
+  return [...byKey.values()];
+}
+
+function dedupeByPair<T extends { vuln_class: string; endpoint: string }>(items: T[]): T[] {
+  const byKey = new Map<string, T>();
+  for (const it of items) byKey.set(`${it.vuln_class}::${it.endpoint}`, it);
+  return [...byKey.values()];
+}
+
+function dedupeAttempted(items: AttemptedEntry[]): AttemptedEntry[] {
+  const byKey = new Map<string, AttemptedEntry>();
+  for (const it of items) byKey.set(`${it.vuln_class}::${it.endpoint}::${it.invariant_type}`, it);
+  return [...byKey.values()];
+}
+
+export interface SpineBeatUpdate {
+  beat: SpineBeatRecord;
+  discoveredEndpoints?: SpineEndpoint[];
+  recoveredIntel?: RecoveredIntel;
+  proved?: ProvedEntry[];
+  attempted?: AttemptedEntry[];
+}
+
+/**
+ * Pure merge: current spine + what this beat learned -> the next spine. Never
+ * mutates its input. Called once per beat, right before saveSpine, for every stop
+ * condition the beat can end on — including a stall or a failure (see beat.ts's
+ * `bail`) — so a beat that learned "this endpoint answers uniformly to every
+ * probe" is a beat whose lesson survives even though it banked nothing.
+ */
+export function updateSpine(spine: Spine, update: SpineBeatUpdate): Spine {
+  const beats = [...spine.beats, update.beat];
+  const proved = dedupeByPair([...spine.proved, ...(update.proved ?? [])]);
+  const attempted = dedupeAttempted([...spine.attempted, ...(update.attempted ?? [])]);
+  return {
+    ...spine,
+    beats,
+    attack_surface: mergeEndpoints(spine.attack_surface, update.discoveredEndpoints ?? []),
+    recovered_intel: mergeIntel(spine.recovered_intel, update.recoveredIntel ?? {}),
+    proved,
+    attempted,
+    counters: {
+      total_beats: beats.length,
+      total_findings: spine.counters.total_findings + update.beat.findings_banked,
+      total_proved: proved.length,
+      total_attempted: attempted.length,
+    },
+  };
+}

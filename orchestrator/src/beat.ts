@@ -9,101 +9,19 @@ import { evaluate, type Invariant } from "./axiom.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
+import { VULN_CLASSES, isVulnClass, type VulnClass } from "./vuln-classes.js";
+import {
+  loadSpine, saveSpine, updateSpine,
+  type SpineEndpoint, type ProvedEntry, type AttemptedEntry, type RecoveredIntel,
+  type SpineBeatRecord,
+} from "./spine.js";
+import { buildHunterBrief } from "./brief.js";
 
-/**
- * The exact snake_case vocabulary the benchmark harness scores `vuln_class` against.
- * Single source of truth: the hunter's system prompt is built from it, claim parsing
- * validates against it, and a test asserts every member is accepted. Free prose (e.g.
- * "Missing framing protection (clickjacking)") is a vocabulary violation, not a vuln —
- * the harness matches on this exact string, so a correct finding with the wrong
- * spelling scores as `missed`.
- *
- * This is a VOCABULARY, not target knowledge: it names classes of vulnerability in
- * the abstract, never an endpoint, a payload, or anything specific to the engagement
- * target. The black-box rule (no target hostname/path/payload in src/) still holds.
- */
-export const VULN_CLASSES = [
-  "auth_bypass", "business_logic", "clickjacking", "cors_misconfig", "crypto_disclosure",
-  "deserialization_rce", "disposable_email_accepted", "forced_browsing", "idor",
-  "improper_session_invalidation", "info_disclosure", "insecure_transport", "jwt_weak_key",
-  "path_traversal", "rate_limit_absence", "sqli", "ssrf", "user_enumeration",
-  "weak_password_policy", "xss_reflected", "xss_stored", "xxe",
-] as const;
-
-export type VulnClass = (typeof VULN_CLASSES)[number];
-
-export function isVulnClass(v: unknown): v is VulnClass {
-  return typeof v === "string" && (VULN_CLASSES as readonly string[]).includes(v);
-}
-
-const HUNTER_SYSTEM = [
-  "You are the SAFE AI Hacker methodical hunter. You probe ONE hypothesis at a time",
-  "against the in-scope target and read the FULL response before concluding.",
-  "This beat hunts for MANY findings, one at a time: after each claim is verified you",
-  "will be told the verdict and asked to continue hunting for the NEXT, DIFFERENT",
-  "finding. Bank each cheap win and move on rather than perfecting any single",
-  "hypothesis.",
-  "",
-  "Use the http_request tool to probe. When a response body is large or truncated,",
-  "use grep_artifact with a targeted pattern to SEARCH the stored artifact instead of",
-  "read_artifact to retrieve it — read_artifact only gives you a small bounded",
-  "preview, so pulling a large body back through it takes many calls and still never",
-  "gets you the whole thing. grep_artifact returns just the matching lines in one call.",
-  "",
-  "When you can state a concrete violated invariant, end your turn with a JSON",
-  "object of this shape:",
-  '{"vuln_class","endpoint","control_url","invariant":{"statement","type","expression"}}',
-  "",
-  "vuln_class MUST be exactly one of these snake_case strings — no prose, no",
-  "parentheses, no extra words, no capitalisation, nothing outside this list:",
-  VULN_CLASSES.join(", "),
-  "",
-  "invariant.type must be one of:",
-  '  "body_contains"     - expression is a marker string. REQUIRES control_url.',
-  "                        Matched against the whole exchange: status line, response",
-  "                        headers, then body. CONFIRMED only if the marker is present",
-  "                        for the exploit and ABSENT for the control.",
-  '  "status_in"         - expression is a comma-separated status list. REQUIRES control_url.',
-  '  "response_asserted" - a self-contained claim about the server\'s OWN configuration.',
-  "                        NO control_url needed; omit it or set it to null.",
-  "                        expression clauses, semicolon-separated, ALL must hold:",
-  '                          header:name            header is present',
-  '                          !header:name           header is absent',
-  '                          header:name=substring  header present and value contains substring',
-  '                        e.g. missing framing protection: "!header:x-frame-options;!header:content-security-policy"',
-  '                        e.g. permissive CORS: "header:access-control-allow-origin=*;header:access-control-allow-credentials=true"',
-  "",
-  "Use response_asserted ONLY for the server's own configuration (header present/absent/value).",
-  "",
-  "SUGGESTED ORDER — cheapest checks first, as STRATEGY, not as answers. You must",
-  "still find the real endpoints and evidence yourself; nothing below names one:",
-  "  1. response_asserted claims from response headers alone, no control needed:",
-  "     missing framing protection, permissive CORS where a wildcard allow-origin",
-  "     coexists with allow-credentials, or a version/technology banner disclosed",
-  "     in a header.",
-  "  2. status_in claims with a control: an undocumented debug route, a shipped",
-  "     source map, or a directory index returning 200 where a bogus sibling path",
-  "     returns 404.",
-  "  3. body_contains claims with a control: a file-serving parameter returning",
-  "     file contents where a bogus filename does not; an error page leaking an",
-  "     absolute path or a stack trace; or distinct responses for a registered vs",
-  "     unregistered identifier.",
-  "Your very first probe returns response headers — inspect them immediately and",
-  "emit a cheap response_asserted claim right away if one holds. Do not spend turns",
-  "exploring before you have banked a provable finding.",
-  "",
-  "For anything caused by YOUR input, use a differential type and give a control_url",
-  "that SHOULD NOT exhibit the issue.",
-  "",
-  "You have a limited turn budget for EACH finding attempt: emit a claim well before",
-  "you run out. A claim you emitted beats a better one you never stated. After a",
-  "claim is verified you will be told the verdict — do NOT re-report the same",
-  "vuln_class/endpoint pair; move on to a different one. If you are told a",
-  "vuln_class was rejected, re-emit using one of the exact allowed values above.",
-  "",
-  "When you have exhausted profitable avenues and have no further hypothesis to",
-  "try, say so in plain text (no JSON) and stop.",
-].join("\n");
+// Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
+// import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
+// src/brief.ts can use it without a beat.ts <-> brief.ts import cycle.
+export { VULN_CLASSES, isVulnClass };
+export type { VulnClass };
 
 export interface RejectedClaim {
   raw: unknown;
@@ -117,6 +35,13 @@ type BeatResult = {
   reason: string | null;
   duplicates_suppressed: number;
   rejected_claims: RejectedClaim[];
+  /** true if this beat started from a brand-new Spine (no prior file, a corrupt
+   * one, or one for a different engagement/scope) rather than continuing a prior
+   * one. See src/spine.ts loadSpine. */
+  spine_fresh: boolean;
+  /** Why spine_fresh is true — e.g. an engagement/scope mismatch or a corrupt
+   * progress.json — or null when the spine continued normally. */
+  spine_fresh_reason: string | null;
 };
 
 type Env = Record<string, string | undefined>;
@@ -214,6 +139,70 @@ export function buildRunSession(opts: {
   };
 }
 
+// ---- Spine-facing helpers --------------------------------------------------------
+
+/** A captured exchange (an exploit or control probe), reduced to what the Spine's
+ * attack_surface records — status and content-type, never the body. */
+function toSpineEndpoint(capture: HttpCapture): SpineEndpoint {
+  return {
+    url: capture.request.url,
+    method: capture.request.method,
+    status: capture.response.status,
+    content_type: headerValueCI(capture.response.headers, "content-type"),
+  };
+}
+
+function headerValueCI(headers: Record<string, string> | undefined | null, name: string): string | null {
+  if (!headers) return null;
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return null;
+}
+
+/**
+ * A model claim may attach an optional "intel" object of durable recon facts (see
+ * <output_contract> in src/brief.ts) — deterministic code decides whether to keep
+ * it: only string/boolean VALUES are accepted, nothing nested, so a malformed or
+ * hostile shape simply drops rather than corrupting the spine. Secret-looking
+ * values are still stripped later, in spine.ts's updateSpine — this is not the only
+ * guard.
+ */
+function extractIntel(claim: unknown): RecoveredIntel | null {
+  const raw = (claim as { intel?: unknown } | null)?.intel;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: RecoveredIntel = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string" || typeof v === "boolean") out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * A cheap, generic fallback signal for recovered_intel, derived purely from
+ * endpoints actually observed this run — never a literal. A model-reported
+ * "intel" object (see extractIntel) is more specific and always wins on conflict;
+ * this only fills gaps a claim never mentioned.
+ */
+function inferRecoveredIntel(scopeOrigins: string[], endpoints: SpineEndpoint[]): RecoveredIntel {
+  const intel: RecoveredIntel = {};
+  const foreignOrigins = new Set<string>();
+  let sourceMapsSeen = false;
+  for (const ep of endpoints) {
+    try {
+      const origin = new URL(ep.url).origin;
+      if (!scopeOrigins.includes(origin)) foreignOrigins.add(origin);
+    } catch {
+      // Unparseable URL — nothing to infer from it.
+    }
+    if (/\.map(\?|$)/.test(ep.url)) sourceMapsSeen = true;
+  }
+  if (foreignOrigins.size > 0) intel.api_base = [...foreignOrigins].sort().join(", ");
+  if (sourceMapsSeen) intel.source_maps_seen = true;
+  return intel;
+}
+
 export async function runBeat(opts: {
   env: Record<string, string | undefined>;
   client: MinimalClient;
@@ -231,15 +220,38 @@ export async function runBeat(opts: {
   const obs = await initObservability(opts.env);
   const sandboxId = randomUUID();
 
-  const store = new ArtifactStore(join(opts.env.SAHW_WORKSPACE ?? ".", "artifacts"));
+  const workspace = opts.env.SAHW_WORKSPACE ?? ".";
+  const store = new ArtifactStore(join(workspace, "artifacts"));
   const runner = new ToolRunner({ engagement, store, fetchImpl: opts.fetchImpl });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), engagement.phaseTimeoutMs);
   const scopeUrls = engagement.scope.map((u) => u.toString());
+  const scopeOrigins = engagement.scope.map((u) => u.origin);
 
   const maxFindings = Math.max(1, numEnv(opts.env, "SAHW_MAX_FINDINGS", 12));
   const maxTurnsPerFinding = Math.max(1, numEnv(opts.env, "SAHW_MAX_TURNS_PER_FINDING", 8));
+
+  // THE SPINE. Read first, written last, every beat — see src/spine.ts. A missing,
+  // corrupt, or engagement/scope-mismatched spine degrades to a fresh one (logged
+  // and recorded, never thrown); a schema_version newer than this build understands
+  // is refused outright and legitimately throws here, before any span opens — the
+  // same posture as loadEngagement above.
+  const spineLoad = await loadSpine({ workspace, authRef: engagement.authRef, scopeOrigins });
+
+  // GENERATED FROM STATE, AS XML. Built once, from the spine as loaded — the
+  // conversation's system message is only set on the FIRST runAgent call of the
+  // beat (see agent.ts: system/user are ignored once `messages` is supplied), so
+  // regenerating it mid-beat would never reach the model anyway. What THIS beat
+  // itself discovers is folded into the spine at the end, for the NEXT beat.
+  const hunterBrief = buildHunterBrief({
+    attackSurface: spineLoad.spine.attack_surface,
+    recoveredIntel: spineLoad.spine.recovered_intel,
+    proved: spineLoad.spine.proved,
+    attempted: spineLoad.spine.attempted,
+    turnsRemaining: engagement.maxTurns,
+    findingsRemaining: maxFindings,
+  });
 
   try {
     // One Langfuse trace per beat; one SESSION per run, so runs are comparable.
@@ -264,6 +276,7 @@ export async function runBeat(opts: {
           engagement: engagement.authRef,
           run_codename: session.codename,
           run_started_utc: session.startedUtc,
+          spine_fresh: String(spineLoad.fresh),
         },
       }, async () => {
         const result = await hunt();
@@ -299,30 +312,87 @@ export async function runBeat(opts: {
         let duplicatesSuppressed = 0;
         const rejectedClaims: RejectedClaim[] = [];
 
+        // What THIS beat learns, folded into the spine at every exit — including a
+        // stall or a failure. This is the whole point: a beat that learned "this
+        // endpoint answers uniformly to every probe" is a beat whose lesson must
+        // survive.
+        const discoveredEndpoints: SpineEndpoint[] = [];
+        const provedEntries: ProvedEntry[] = [];
+        const attemptedEntries: AttemptedEntry[] = [];
+        let recoveredIntelFromClaims: RecoveredIntel = {};
+        const beatStartedUtc = new Date().toISOString();
+
         let messages: any[] | undefined = undefined;  // undefined until the first runAgent call
         let totalTurns = 0;
         let totalTokens = 0;
 
-        const bail = (exitCode: number, stalled: boolean, reason: string | null): BeatResult => ({
-          exitCode, findings, stalled, reason,
-          duplicates_suppressed: duplicatesSuppressed,
-          rejected_claims: rejectedClaims,
-        });
+        /** Builds this beat's contribution to the spine and saves it. Never throws —
+         * a save failure is logged and swallowed, exactly like a corrupt read: the
+         * beat's own result must not be lost because the workspace disk hiccuped. */
+        async function persistSpine(stalled: boolean, reason: string | null): Promise<void> {
+          const beatRecord: SpineBeatRecord = {
+            beat_id: sandboxId,
+            started_utc: beatStartedUtc,
+            ended_utc: new Date().toISOString(),
+            findings_banked: findings.length,
+            stalled,
+            reason,
+            codename: session.codename,
+          };
+          const inferred = inferRecoveredIntel(
+            scopeOrigins, [...spineLoad.spine.attack_surface, ...discoveredEndpoints]);
+          const nextSpine = updateSpine(spineLoad.spine, {
+            beat: beatRecord,
+            discoveredEndpoints,
+            recoveredIntel: { ...inferred, ...recoveredIntelFromClaims },
+            proved: provedEntries,
+            attempted: attemptedEntries,
+          });
+          try {
+            await saveSpine(workspace, nextSpine);
+          } catch (err) {
+            console.error(`[spine] failed to save progress.json (continuing): ${(err as Error).message}`);
+          }
+        }
 
+        const bail = async (exitCode: number, stalled: boolean, reason: string | null): Promise<BeatResult> => {
+          await persistSpine(stalled, reason);
+          return {
+            exitCode, findings, stalled, reason,
+            duplicates_suppressed: duplicatesSuppressed,
+            rejected_claims: rejectedClaims,
+            spine_fresh: spineLoad.fresh,
+            spine_fresh_reason: spineLoad.freshReason,
+          };
+        };
+
+        try {
+          return await loop();
+        } catch (err) {
+          // An unexpected throw (not one of the documented stop conditions below,
+          // which all go through `bail`) must still leave a trace in the spine —
+          // "write the spine even when the beat stalls or FAILS". Save, then
+          // rethrow: this does not swallow the failure, it just makes sure the
+          // failure itself is not silently lossy.
+          await persistSpine(true, `beat failed: ${(err as Error)?.message ?? String(err)}`);
+          throw err;
+        }
+
+        async function loop(): Promise<BeatResult> {
         while (true) {
           if (findings.length >= maxFindings) {
-            return bail(0, false, `max findings cap (${maxFindings}) reached`);
+            return await bail(0, false, `max findings cap (${maxFindings}) reached`);
           }
           if (controller.signal.aborted) {
-            return bail(0, false, findings.length ? null : "aborted before any finding was banked");
+            return await bail(0, false, findings.length ? null : "aborted before any finding was banked");
           }
           const remainingTurns = engagement.maxTurns - totalTurns;
           if (remainingTurns <= 0) {
-            return bail(0, false, findings.length ? null : "turn budget exhausted before any finding was banked");
+            return await bail(0, false, findings.length ? null : "turn budget exhausted before any finding was banked");
           }
           const remainingTokens = engagement.budgetTokens - totalTokens;
           if (remainingTokens <= 0) {
-            return bail(0, false, findings.length ? null : "token budget exhausted before any finding was banked");
+            return await bail(0, false, findings.length ? null : "token budget exhausted before any finding was banked");
           }
 
           // Everything in `messages` before this call is prior conversation, not new
@@ -333,7 +403,7 @@ export async function runBeat(opts: {
           const run = await runAgent({
             client: opts.client,
             model: opts.env.SAHW_MODEL ?? "model",
-            system: HUNTER_SYSTEM,
+            system: hunterBrief,
             user: `In-scope: ${scopeUrls.join(", ")}`,
             tools: TOOL_SCHEMAS,
             runner,
@@ -346,6 +416,15 @@ export async function runBeat(opts: {
           totalTurns += run.turns;
           totalTokens += run.tokens;
           messages = run.messages;
+
+          // Every endpoint the hunter actually touched this attempt, metadata-only
+          // (status + content-type, never a body) — feeds the Spine's attack_surface
+          // so a LATER beat inherits the map instead of re-deriving it.
+          for (const hc of run.httpCalls) {
+            discoveredEndpoints.push({
+              url: hc.url, method: hc.method, status: hc.status, content_type: hc.contentType,
+            });
+          }
 
           const succeededToolCalls = run.toolCalls.filter((c) => c.ok).length;
           const repeatCounts = new Map<string, number>();
@@ -374,9 +453,9 @@ export async function runBeat(opts: {
             // because a later attempt did no work — that's the hunter running dry,
             // which ends the loop gracefully, not a failure of the whole beat.
             if (findings.length === 0) {
-              return bail(stallCfg.exitCode, true, stall.reason);
+              return await bail(stallCfg.exitCode, true, stall.reason);
             }
-            return bail(0, false, stall.reason);
+            return await bail(0, false, stall.reason);
           }
 
           // Only the messages produced DURING this attempt can contain its claim —
@@ -401,8 +480,8 @@ export async function runBeat(opts: {
               // fault and send a reader debugging the wrong layer. End the beat, keep every
               // finding already banked, and name the real cause.
               const why = `model call failed: ${run.modelError ?? "unknown"}`;
-              if (findings.length === 0) return bail(stallCfg.exitCode, true, why);
-              return bail(0, false, why);
+              if (findings.length === 0) return await bail(stallCfg.exitCode, true, why);
+              return await bail(0, false, why);
             }
             // The attempt actually finished (stopReason "done"/"budget"/"aborted") without
             // a parseable claim — either the hunter explicitly declared itself done, or it
@@ -410,10 +489,16 @@ export async function runBeat(opts: {
             // has been banked yet; once ≥1 finding is banked, the hunter running dry ends the
             // loop gracefully rather than failing the whole beat.
             if (findings.length === 0) {
-              return bail(stallCfg.exitCode, true, "hunter produced no parseable claim");
+              return await bail(stallCfg.exitCode, true, "hunter produced no parseable claim");
             }
-            return bail(0, false, null);
+            return await bail(0, false, null);
           }
+
+          // A claim may carry durable recon facts under "intel" independent of its own
+          // vuln_class/verdict — captured here, before the vuln_class/dedupe checks
+          // below, so it survives even a rejected or duplicate claim.
+          const claimIntel = extractIntel(claim);
+          if (claimIntel) recoveredIntelFromClaims = { ...recoveredIntelFromClaims, ...claimIntel };
 
           if (!isVulnClass(claim.vuln_class)) {
             rejectedClaims.push({
@@ -436,6 +521,8 @@ export async function runBeat(opts: {
           const control = claim.invariant.type === "response_asserted"
             ? null                                   // self-contained: no control exists
             : await capture(runner, claim.control_url);
+          if (exploit) discoveredEndpoints.push(toSpineEndpoint(exploit));
+          if (control) discoveredEndpoints.push(toSpineEndpoint(control));
 
           const axiom = await startActiveObservation("axiom-eval", async (axSpan) => {
             axSpan.update({
@@ -494,6 +581,25 @@ export async function runBeat(opts: {
             utc: new Date().toISOString(),
           };
 
+          // Route into the spine on the RAW axiom verdict, not the provenance-gated
+          // one: a hypothesis whose invariant genuinely passed (axiom.status ===
+          // "CONFIRMED") belongs in `proved` even if gateProvenance downgraded the
+          // reported verdict to NEEDS_REVIEW for missing tracing — that downgrade is
+          // an infra/provenance concern, not evidence the hunter should re-derive
+          // this pair next beat. Anything the invariant itself did not pass
+          // (FALSE_POSITIVE / NEEDS_REVIEW / BLOCKED from axiom) is a real dead end.
+          if (axiom.status === "CONFIRMED") {
+            provedEntries.push({
+              vuln_class: claim.vuln_class, endpoint: claim.endpoint,
+              invariant_type: claim.invariant.type, verdict: gated.status, finding_id: row.finding_id,
+            });
+          } else {
+            attemptedEntries.push({
+              vuln_class: claim.vuln_class, endpoint: claim.endpoint,
+              invariant_type: claim.invariant.type, outcome: axiom.status, why: axiom.reason,
+            });
+          }
+
           // Bank it as soon as it's confirmed, not at the end of the beat — a run
           // that dies mid-way must still have what it already proved.
           findings.push(row);
@@ -506,6 +612,7 @@ export async function runBeat(opts: {
             role: "user",
             content: feedbackForVerdict(row.vuln_class, row.endpoint, row.verdict, axiom.reason),
           });
+        }
         }
       }
     });

@@ -1,0 +1,6 @@
+# Runtime state written under SAHW_WORKSPACE, which defaults to this directory
+# when unset. Neither belongs in the repo:
+#   spine/      the Spine's progress.json / rules.md — per-engagement, per-workspace
+#   artifacts/  the content-addressed artifact store
+spine/
+artifacts/
