@@ -92,6 +92,8 @@ test("applies documented defaults", () => {
   assert.equal(e.maxTurns, 40);
   assert.equal(e.budgetTurns, 200);
   assert.equal(e.requestTimeoutMs, 3_600_000);
+  assert.equal(e.phaseTimeoutMs, 3_000_000);
+  assert.ok(e.phaseTimeoutMs < e.requestTimeoutMs, "defaults must satisfy the validator");
   assert.equal(e.maxRetries, 0);
   assert.equal(e.profile, "test");
 });
@@ -227,7 +229,8 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
   }
 
   const requestTimeoutMs = num(env, "SAHW_REQUEST_TIMEOUT_MS", 3_600_000);
-  const phaseTimeoutMs = num(env, "SAHW_PHASE_TIMEOUT_MS", 5_400_000);
+  // Default MUST stay below the request-timeout default, or loadEngagement rejects its own defaults.
+  const phaseTimeoutMs = num(env, "SAHW_PHASE_TIMEOUT_MS", 3_000_000);
   if (phaseTimeoutMs >= requestTimeoutMs) {
     throw new ConfigError(
       "SAHW_PHASE_TIMEOUT_MS must be < SAHW_REQUEST_TIMEOUT_MS so the orchestrator " +
@@ -1265,7 +1268,7 @@ git commit -m "feat(orchestrator): stall detection measured in executed work"
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks (types only).
-- Produces: `interface FindingRow { engagement_id: string; finding_id: string; vuln_class: string; endpoint: string; verdict: string; invariant_type: string; langfuse_trace_id: string; utc: string }`; `interface Observability { traceId(): string | null; recordFinding(r: FindingRow): Promise<void>; mergeEndpoint(url: string, method: string): Promise<void>; mergeFinding(r: FindingRow): Promise<void>; shutdown(): Promise<void> }`; `initObservability(env): Promise<Observability>`. **Each writer no-ops when its env is unset.**
+- Produces: `interface FindingRow { engagement_id: string; finding_id: string; vuln_class: string; endpoint: string; verdict: string; invariant_type: string; langfuse_trace_id: string; utc: string }`; `interface Observability { clickhouse: ClickHouseWriter | null; graph: Neo4jWriter | null; traceId(): string | null; recordFinding(r: FindingRow): Promise<void>; mergeEndpoint(url: string, method: string): Promise<void>; mergeFinding(r: FindingRow): Promise<void>; shutdown(): Promise<void> }`; `initObservability(env): Promise<Observability>`. **Each writer no-ops when its env is unset.**
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1320,7 +1323,7 @@ test("Neo4j writer MERGEs so repeated beats do not duplicate", async () => {
 
 test("one store failing does not take down the others", async () => {
   const obs = await initObservability({});
-  (obs as any).clickhouse = { recordFinding: async () => { throw new Error("CH down"); } };
+  obs.clickhouse = { recordFinding: async () => { throw new Error("CH down"); } } as any;
   await obs.recordFinding(ROW);  // must swallow and continue
 });
 ```
@@ -1453,9 +1456,14 @@ import { ClickHouseWriter, type FindingRow } from "./clickhouse.js";
 import { Neo4jWriter } from "./neo4j.js";
 import { LangfuseTracing } from "./langfuse.js";
 
+export type { ClickHouseWriter, Neo4jWriter };
+
 export type { FindingRow };
 
 export interface Observability {
+  /** Exposed so a caller (and a test) can substitute a writer without casting. */
+  clickhouse: ClickHouseWriter | null;
+  graph: Neo4jWriter | null;
   traceId(): string | null;
   recordFinding(r: FindingRow): Promise<void>;
   mergeEndpoint(url: string, method: string): Promise<void>;
@@ -1481,16 +1489,17 @@ export async function initObservability(
   if (clickhouse) await safe("clickhouse.ensureSchema", () => clickhouse.ensureSchema());
 
   const obs: Observability = {
+    clickhouse,
+    graph,
     traceId: () => tracing?.traceId() ?? null,
     recordFinding: async (r) => {
-      const ch = (obs as any).clickhouse ?? clickhouse;
-      if (ch) await safe("clickhouse.recordFinding", () => ch.recordFinding(r));
+      if (obs.clickhouse) await safe("clickhouse.recordFinding", () => obs.clickhouse!.recordFinding(r));
     },
     mergeEndpoint: async (url, method) => {
-      if (graph) await safe("neo4j.mergeEndpoint", () => graph.mergeEndpoint(url, method));
+      if (obs.graph) await safe("neo4j.mergeEndpoint", () => obs.graph!.mergeEndpoint(url, method));
     },
     mergeFinding: async (r) => {
-      if (graph) await safe("neo4j.mergeFinding", () => graph.mergeFinding(r));
+      if (obs.graph) await safe("neo4j.mergeFinding", () => obs.graph!.mergeFinding(r));
     },
     shutdown: async () => {
       await safe("langfuse.shutdown", () => tracing?.shutdown() ?? Promise.resolve());
