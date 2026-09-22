@@ -49,7 +49,19 @@ export class ArtifactStore {
   }
 
   async get(sha256: string): Promise<Buffer> {
-    return readFile(this.pathFor(sha256));
+    const buf = await readFile(this.pathFor(sha256));
+    // Verify that the bytes read match the requested hash.
+    // The store's contract is that the name IS the hash of the contents.
+    // This check converts "silently trusted forever" into "fails closed immediately"
+    // for any pre-existing corrupt artifacts.
+    const actualHash = createHash("sha256").update(buf).digest("hex");
+    if (actualHash !== sha256) {
+      throw new Error(
+        `Hash mismatch for ${sha256}: file contains ${actualHash}. ` +
+        `Store may be corrupt.`
+      );
+    }
+    return buf;
   }
 
   async has(sha256: string): Promise<boolean> {
