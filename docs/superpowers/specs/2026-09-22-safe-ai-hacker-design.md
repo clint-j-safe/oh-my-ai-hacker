@@ -101,11 +101,13 @@ MODEL LAYER   (one client, two profiles — selected by env, never by code)
 EXECUTION PLANE  (ephemeral Docker per agent/iteration, disposable volumes) — Small Loops
   Agent instructions   docs/agents/*.md   (core.md prepended to each)
   Skills-as-tools      ./skills — 36 skills, one generic dispatcher tool
-  MCP (version-pinned) mcp-patt (payload corpus) · mcp-oast (out-of-band callbacks)
+  Payload Library      /opt/payload-library  mounted READ-ONLY; SQLite+FTS5 index (§9)
+  MCP (version-pinned) mcp-patt (semantic corpus retrieval) · mcp-oast (out-of-band)
 
 STATE & OBSERVABILITY
   Neo4j       attack graph: surface · secrets · findings · chains · coverage
   Langfuse    one trace per beat; spans per agent turn and per tool call
+  ClickHouse  payload_usage_events + findings telemetry (high-volume aggregation)
 ```
 
 - **AI Hacker Tether** = the scope/safety gate — decides whether an action may run.
@@ -157,6 +159,8 @@ would break the black-box rule in §3.
 | Verdicts | escalation confidence, judge threshold, adjudicator count and quorum | `SAHW_AXIOM_*`, `SAHW_ADJUDICATOR_*` |
 | State | workspace, engagement graph, **separate** coverage graph | `SAHW_WORKSPACE`, `NEO4J_*` |
 | Observability | Langfuse host and keys | `SAHW_LANGFUSE_*`, `LANGFUSE_*` |
+| Payload library | mount path, pinned source SHAs, wordlist tier caps, set TTL | `SAHW_PAYLOAD_*` |
+| Analytics | ClickHouse DSN for `payload_usage_events` and findings telemetry | `CLICKHOUSE_*` |
 | Out-of-band | OAST listener address and ports | `OOB_*` |
 
 Two of these are correctness-critical rather than preference: `SAHW_SCOPE` **is** the Tether's
@@ -325,7 +329,11 @@ omits `shell_exec` has no shell, and no prompt can conjure one.
 | `shell_exec` | Run a command in the isolated sandbox; destructive-AST checked | **exploit-constructor only** |
 | `skill_run` | Dispatch one of the 36 skills, resolved against the caller's `skills` allowlist | all but core, threat-model |
 | `graph_query` | Named, parameterised, **read-only** Cypher against the engagement graph | threat-model, stateful-prober, chain-reasoner |
-| `patt_search` | MCP `mcp-patt` — payload corpus retrieval | novelty-synthesizer |
+| `payload_search` | Query the payload index by category/tech/CWE/risk. Returns **metadata and a set id — never raw payloads** | novelty-synthesizer, exploit-constructor |
+| `payload_set_create` | Materialise a query to a `.txt` on disk; returns the absolute path for `ffuf`/`sqlmap`/custom scripts | novelty-synthesizer, exploit-constructor |
+| `wordlist_search` | Find wordlist metadata (path, line count, size), tier-capped | recon, exploit-constructor |
+| `wordlist_preview` | First *n* lines of a wordlist, so the model can sanity-check without loading it | recon, exploit-constructor |
+| `patt_search` | MCP `mcp-patt` — semantic corpus retrieval, for "what technique might apply here" | novelty-synthesizer |
 | `oast_register` / `oast_poll` | MCP `mcp-oast` — out-of-band callback registration and polling | **exploit-constructor only** |
 
 ### 7.1 Agent registry
@@ -339,14 +347,14 @@ framework config: `model`, `temperature`, `tools` (the literal `tools` array), `
 | Agent | Source prompt | Tools (`tools` array) | Skills allowed | Emits | Touches target |
 |---|---|---|---|---|---|
 | `core` | `SAFE_AI_HACKER_CORE_SYSTEM_PROMPT` | — | — | shared preamble | — |
-| `recon` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `glob_artifact`, `skill_run` | `tech-fingerprinting`, `intelligent-crawling`, `scope-discipline` | recon-map JSON | yes (HTTP, Tether-gated) |
+| `recon` | Core Phase 1 | `http_request`, `wordlist_search`, `wordlist_preview`, `read_artifact`, `grep_artifact`, `glob_artifact`, `skill_run` | `tech-fingerprinting`, `intelligent-crawling`, `scope-discipline` | recon-map JSON | yes (HTTP, Tether-gated) |
 | `client-intel` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `glob_artifact`, `write_file`, `skill_run` | `js-spa-reverse`, `credential-secret-custody` | client-intel JSON | yes (HTTP) |
 | `state-mapper` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `skill_run` | `account-role-acquisition`, `privilege-matrix-mapping`, `token-session-forensics` | state-machine JSON | yes (HTTP) |
 | `threat-model` | `THREAT_MODEL_PROMPT` | `read_artifact`, `grep_artifact`, `glob_artifact`, `graph_query` | — | per-endpoint strategies | **no** |
-| `novelty-synthesizer` | `NOVELTY_SYNTHESIZER_PROMPT` | `read_artifact`, `grep_artifact`, `patt_search`, `skill_run` | `payload-mutator`, `waf-evasion-mastery`, `technique-combinator` | payload + proposed invariant | **no** |
+| `novelty-synthesizer` | `NOVELTY_SYNTHESIZER_PROMPT` | `read_artifact`, `grep_artifact`, `patt_search`, `payload_search`, `payload_set_create`, `skill_run` | `payload-mutator`, `waf-evasion-mastery`, `technique-combinator` | payload + proposed invariant | **no** |
 | `stateful-prober` | `STATEFUL_LOGIC_PROBER_PROMPT` | `read_artifact`, `grep_artifact`, `graph_query`, `skill_run` | `business-logic-state`, `auth-bypass-battery`, `idor-bola-access-control` | step sequence + invariant | **no** |
 | `chain-reasoner` | `CHAIN_REASONER_PROMPT` | `read_artifact`, `graph_query`, `skill_run` | `chain-construction`, `blast-radius-estimation` | chain artifact | **no** |
-| `exploit-constructor` | Core Phase 3 | `shell_exec`, `http_request`, `read_artifact`, `write_file`, `oast_register`, `oast_poll`, `skill_run` | the offensive batteries (`sqli-*`, `xss-*`, `ssrf-*`, `deserialization-rce`, `injection-battery-*`, `file-upload-path-traversal`, `exploit-*`) | PoC + evidence + finding | **yes** |
+| `exploit-constructor` | Core Phase 3 | `shell_exec`, `http_request`, `read_artifact`, `write_file`, `payload_search`, `payload_set_create`, `wordlist_search`, `wordlist_preview`, `oast_register`, `oast_poll`, `skill_run` | the offensive batteries (`sqli-*`, `xss-*`, `ssrf-*`, `deserialization-rce`, `injection-battery-*`, `file-upload-path-traversal`, `exploit-*`) | PoC + evidence + finding | **yes** |
 | `adjudicator` | Core / Axiom | `read_artifact`, `grep_artifact`, `glob_artifact`, `skill_run` | `adversarial-self-review`, `severity-calibration`, `poc-hardening-self-verification` | verdict | **no** |
 
 **Invocation rule:** agents do not spawn each other. The orchestrator dispatches. The finder
@@ -467,7 +475,90 @@ into the threat-model hypothesis queue — that is the graph closing the loop.
 
 ---
 
-## 9. Langfuse — observability and the trace spine
+## 9. The Payload Library
+
+**Core principle: payloads and wordlists never enter prompt context.** They are a versioned,
+read-only library indexed by SQLite, exposed through structured tool calls, and consumed
+*by path* by the tools that actually fire them. The model sees metadata and a set id; the
+shell sees a file.
+
+This is a token-economics decision as much as a safety one. SecLists alone is hundreds of
+megabytes. Any design that lets a model read corpora into context is one `cat` away from
+burning a beat's entire budget on payload text that deterministic code could have selected.
+
+### 9.1 Layout — mounted read-only into every sandbox
+
+```
+/opt/payload-library/
+├── raw/              # cloned repos, PINNED COMMITS, never modified
+├── normalized/       # ETL output: JSONL manifests, one record per payload
+├── db/               # payload-library.sqlite3 (FTS5 over payload text + metadata)
+├── sets/generated/   # materialised .txt sets — ephemeral, per engagement
+└── bin/              # payload-query, wordlist-info
+```
+
+Sources are pinned by commit SHA, not by branch: **PayloadsAllTheThings**
+(`swisskyrepo/PayloadsAllTheThings`) and **SecLists** (`danielmiessler/SecLists`). A payload
+corpus that changes under you invalidates every replay that referenced it — and replay is how
+the Axiom confirms findings (§6, Layer 3). Pinning is therefore a correctness requirement, not
+hygiene.
+
+### 9.2 The four tools
+
+Registered in the request's `tools` array like any other function (§7.0). Signatures:
+
+| Tool | Input | Returns |
+|---|---|---|
+| `payload_search` | `category`, `tech?`, `cwe?`, `risk_class`, `max_payloads` | count, categories, sample **metadata**, `payload_set_id` |
+| `payload_set_create` | `set_name`, `query_params` | absolute path, line count, `sha256`, `set_id` |
+| `wordlist_search` | `category`, `max_lines?` | path, line count, byte size, tier |
+| `wordlist_preview` | `path`, `n` (capped) | first *n* lines |
+
+`risk_class` is a **required** enum on payload queries — `non_destructive_probe` or
+`read_only_probe`. A query that omits it is rejected by schema, not by prompt instruction.
+
+### 9.3 Workflow
+
+1. Orchestrator injects target context from the graph (e.g. fingerprinted DBMS, WAF present).
+2. Agent calls `payload_set_create` → receives `/opt/payload-library/sets/generated/<name>.txt`.
+3. Agent writes a script referencing **that path** — never the payload contents.
+4. `shell_exec` runs it; stdout is captured, hashed, and stored. The set's `sha256` is recorded
+   alongside, so the Adjudicator can see exactly which corpus produced the evidence.
+
+### 9.4 Governance
+
+- **Risk gating is the Tether's job, not the prompt's.** The dispatch wrapper (§5.2) rejects any
+  `payload_set_create` whose `risk_class` is destructive or high-risk state-changing, and any
+  `shell_exec` referencing such a set, unless a human has approved it. Same gate, same code path
+  as scope enforcement.
+- **Immutability.** `raw/` and `db/` are mounted read-only; the mount is the enforcement, not a
+  convention. Generated sets are ephemeral and discarded with the engagement.
+- **Anti-pattern, enforced.** Any `shell_exec` that reads `raw/` or `normalized/` wholesale
+  (`cat`, `grep -r`, `find | xargs`) is **denied by the Tether**. The tools are the only way in.
+  This is the rule that makes the token-economics argument hold — without it the library is
+  merely a suggestion.
+
+### 9.5 Boundaries — what this does *not* touch
+
+- **The 36 skills are unchanged.** They keep their bundled `assets/` corpora and their existing
+  override knobs (e.g. `intelligent-crawling`'s `CRAWL_WORDLIST`). The library serves **agents
+  directly**; it is not wired into `skill_run`. The trade-off is explicit: skills stay portable
+  and runnable standalone, and do not gain the full corpora.
+- **`mcp-patt` stays.** The two answer different questions: `patt_search` is semantic retrieval
+  ("what technique might apply to this primitive?"), the library is indexed selection ("give me
+  40 read-only Postgres probes as a file"). Overlap is accepted deliberately.
+
+### 9.6 Observability
+
+Every `payload_set_create` is traced to Langfuse with its inputs, `set_id` and `sha256`, so a
+finding links back to the exact corpus slice. Usage is aggregated in **ClickHouse**
+(`payload_usage_events`) to answer the question that actually steers the roadmap: *which payload
+categories yield the highest confirmed-finding rate per dollar spent.* That is a
+high-cardinality aggregation over many runs, which is what ClickHouse is for.
+
+---
+
+## 10. Langfuse — observability and the trace spine
 
 `NodeSDK` + `LangfuseSpanProcessor` + `observeOpenAI` (see the appendix) capture every model
 and tool call without threading a logger through the orchestrator. `sdk.shutdown()` is
@@ -485,7 +576,7 @@ makes a finding auditable end to end — and what the Provenance Gate checks.
 
 ---
 
-## 10. The Provenance Gate
+## 11. The Provenance Gate
 
 Non-negotiable. A verdict may be `CONFIRMED` **only** if all of the following are present and
 internally consistent:
@@ -503,7 +594,7 @@ defines a believable one. It exists to prevent one failure mode — **placeholde
 model-generated text mistaken for real tool output.** A finding whose evidence cannot be
 traced to a hashed artifact produced by a recorded command did not happen.
 
-### 10.1 The learning loop
+### 11.1 The learning loop
 
 A `FALSE_POSITIVE` verdict is an asset. Its underlying pattern is extracted into a
 **per-engagement, version-controlled suppression library**, injected on subsequent runs as a
@@ -513,7 +604,7 @@ imagined evidence.
 
 ---
 
-## 11. Security, isolation, reliability
+## 12. Security, isolation, reliability
 
 The harness is pointed at hostile input by definition, and the SDK defaults are wrong for this
 workload. Both are handled by explicit settings, not by convention.
@@ -533,7 +624,7 @@ workload. Both are handled by explicit settings, not by convention.
 
 ---
 
-## 12. Benchmark harness
+## 13. Benchmark harness
 
 Runs **after** the engagement, outside every agent context. It reads the pipeline's
 `CONFIRMED` findings and chains, joins them to `docs/bench/human-test-benchmark.md`, writes
@@ -552,7 +643,7 @@ is counted as a false positive.
 
 ---
 
-## 13. Roadmap
+## 14. Roadmap
 
 Phases are gated on benchmark milestones, not on calendar time.
 
@@ -565,7 +656,7 @@ Phases are gated on benchmark milestones, not on calendar time.
 
 ---
 
-## 14. Appendix — client and a capability-bounded call
+## 15. Appendix — client and a capability-bounded call
 
 ```ts
 import OpenAI from "openai";

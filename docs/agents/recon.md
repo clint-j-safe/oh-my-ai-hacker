@@ -11,6 +11,8 @@ temperature: 0.2
 # capability is declarative: a function not listed here cannot be called.
 tools: 
   - http_request
+  - wordlist_search
+  - wordlist_preview
   - read_artifact
   - grep_artifact
   - glob_artifact

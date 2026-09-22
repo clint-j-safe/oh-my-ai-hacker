@@ -14,6 +14,8 @@ tools:
   - read_artifact
   - grep_artifact
   - patt_search
+  - payload_search
+  - payload_set_create
   - skill_run
 skills: 
   - payload-mutator
