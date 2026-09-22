@@ -27,6 +27,42 @@ if (dryRun) {
   process.exit(0);
 }
 
-const out = await runBeat({ env, client });
-console.log(JSON.stringify(out, null, 2));
-process.exit(out.exitCode);
+// A transient network fault must not destroy a beat's results.
+//
+// Beat 5 crashed with an unhandled `TypeError: terminated` (cause: EHOSTUNREACH)
+// from an in-flight fetch while the target was blipping. The process died before
+// printing anything, so four CONFIRMED findings survived only because each is
+// written to the stores as it is confirmed rather than batched at the end.
+// A transport hiccup is an operational event, not a reason to lose evidence.
+let lateFault: unknown = null;
+process.on("unhandledRejection", (reason) => { lateFault = reason; });
+process.on("uncaughtException",  (err)    => { lateFault = err; });
+
+let out: Awaited<ReturnType<typeof runBeat>> | null = null;
+let failure: unknown = null;
+try {
+  out = await runBeat({ env, client });
+} catch (err) {
+  failure = err;
+}
+
+if (out) {
+  // Report the beat honestly, including a fault that arrived after it finished.
+  const payload = lateFault
+    ? { ...out, late_fault: String((lateFault as Error)?.message ?? lateFault) }
+    : out;
+  console.log(JSON.stringify(payload, null, 2));
+  process.exit(out.exitCode);
+}
+
+// runBeat itself threw: emit a valid result describing the failure rather than a
+// bare stack trace, so a caller can still parse the outcome.
+console.log(JSON.stringify({
+  exitCode: 1,
+  findings: [],
+  stalled: false,
+  reason: `beat aborted: ${String((failure as Error)?.message ?? failure)}`,
+  fatal: true,
+}, null, 2));
+console.error(failure);
+process.exit(1);

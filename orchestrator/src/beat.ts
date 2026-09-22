@@ -159,6 +159,61 @@ function feedbackForInvalidVulnClass(got: unknown): string {
   ].join(" ");
 }
 
+/**
+ * A run needs its own session, not the engagement's.
+ *
+ * sessionId was engagement.authRef, so every beat ever executed against a target
+ * collapsed into ONE Langfuse session and runs could not be compared. A session
+ * should be "this run", which may contain several beats.
+ *
+ * Shape: sahw-<host>-<YYYYMMDD-HHMMSSZ>-<codename>
+ *   e.g. sahw-10.0.0.1-20260922-080715Z-quiet-ledger
+ *
+ * The codename is deterministic from the run id, so the same run always yields the
+ * same memorable label — greppable in logs, and easy to say out loud when two runs
+ * are being compared. The engagement is preserved as a tag and in metadata, so
+ * filtering by engagement still works.
+ */
+const CODENAME_LEFT = [
+  "quiet", "amber", "hollow", "narrow", "brittle", "candid", "crimson", "still",
+  "patient", "sudden", "civil", "blunt", "clear", "gilded", "sparse", "wary",
+] as const;
+const CODENAME_RIGHT = [
+  "ledger", "vault", "teller", "transit", "mandate", "escrow", "cipher", "tally",
+  "custody", "clearing", "docket", "remit", "bourse", "warrant", "assay", "drawer",
+] as const;
+
+function codenameFor(runId: string): string {
+  // FNV-1a: tiny, stable, and dependency-free. Only needs to be well-spread, not secure.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < runId.length; i++) {
+    h ^= runId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  const left = CODENAME_LEFT[h % CODENAME_LEFT.length];
+  const right = CODENAME_RIGHT[(h >>> 8) % CODENAME_RIGHT.length];
+  return `${left}-${right}`;
+}
+
+export function buildRunSession(opts: {
+  scope: URL[]; runId: string; now: Date; override?: string;
+}): { sessionId: string; runId: string; codename: string; startedUtc: string } {
+  const t = opts.now.toISOString();                       // 2026-09-22T08:07:15.123Z
+  const stamp = `${t.slice(0, 10).replace(/-/g, "")}-${t.slice(11, 19).replace(/:/g, "")}Z`;
+  const host = opts.scope[0]?.hostname ?? "unknown-target";
+  const codename = codenameFor(opts.runId);
+  // A 4-char tail from the run id keeps sessions unique even when two runs start
+  // in the same second and their codenames collide (the wordlists give 256 pairs,
+  // so collisions are ordinary birthday behaviour and purely cosmetic).
+  const tail = opts.runId.replace(/[^a-z0-9]/gi, "").slice(0, 4).toLowerCase() || "0000";
+  return {
+    sessionId: opts.override?.trim() || `sahw-${host}-${stamp}-${codename}-${tail}`,
+    runId: opts.runId,
+    codename,
+    startedUtc: t,
+  };
+}
+
 export async function runBeat(opts: {
   env: Record<string, string | undefined>;
   client: MinimalClient;
@@ -187,15 +242,29 @@ export async function runBeat(opts: {
   const maxTurnsPerFinding = Math.max(1, numEnv(opts.env, "SAHW_MAX_TURNS_PER_FINDING", 8));
 
   try {
-    // One Langfuse trace per beat. Beats for the SAME engagement share sessionId
-    // (the authRef), so repeated beats group into one Langfuse session.
+    // One Langfuse trace per beat; one SESSION per run, so runs are comparable.
+    // The engagement stays discoverable via the tag and metadata below.
+    const session = buildRunSession({
+      scope: engagement.scope,
+      // SAHW_RUN_ID groups several beats of one run into a single session.
+      // Unset, each beat is its own run — which is the case for a single CLI call.
+      runId: opts.env.SAHW_RUN_ID?.trim() || sandboxId,
+      now: opts.now ?? new Date(),
+      override: opts.env.SAHW_SESSION_ID,
+    });
     return await startActiveObservation("beat", async (span) => {
       return await propagateAttributes({
-        traceName: "sahw-beat",
-        sessionId: engagement.authRef,
+        traceName: `sahw-beat · ${session.codename}`,
+        sessionId: session.sessionId,
         userId: opts.env.LANGFUSE_USER_ID ?? "sahw",
-        tags: [engagement.profile, "m0"],
-        metadata: { scope: scopeUrls.join(","), sandboxId },
+        tags: [engagement.profile, "m0", `engagement:${engagement.authRef}`],
+        metadata: {
+          scope: scopeUrls.join(","),
+          sandboxId,
+          engagement: engagement.authRef,
+          run_codename: session.codename,
+          run_started_utc: session.startedUtc,
+        },
       }, async () => {
         const result = await hunt();
         // setTraceIO is deprecated in @langfuse/tracing v5 but remains the only
