@@ -21,16 +21,22 @@ const RM_LONG_FLAGS = [
   ...longOptionAbbreviations("no-preserve-root", 6),
 ].join("|");
 
-// SECURITY MODEL: the destructive denylist below is DEFENCE IN DEPTH, not containment.
-// A regex denylist over shell strings is inherently incomplete. Real containment is the
-// ephemeral sandbox plus the scope allowlist. Within that allowlist, host:port comparison
-// is robust because both sides are parsed and normalised by the URL constructor (see
-// hostPort() below) — but path-based out-of-scope entries are NOT inherently robust the
-// same way: the URL constructor does not decode percent-escapes in .pathname, so inScope()
-// has to explicitly percent-decode the request path (at multiple levels, to catch double
-// encoding) and match it against out-of-scope paths on segment boundaries before it can be
-// trusted. This check guards against a confused model proposing something destructive; it
-// is not a boundary against a determined adversary.
+// SECURITY MODEL:
+// - inScope() is STRICT. Scope is authorization, not a heuristic — out-of-scope means
+//   unauthorized, full stop. Host:port comparison is robust because both sides are parsed
+//   and normalised by the URL constructor (see hostPort() below); path-based out-of-scope
+//   entries needed the explicit percent-decode (multiple levels, to catch double encoding)
+//   and segment-boundary matching below, because the URL constructor does not decode
+//   percent-escapes in .pathname on its own.
+// - checkCommand() below is a MODERATE GUARDRAIL, not containment. A regex denylist over
+//   shell strings is inherently incomplete, and this project has deliberately stopped
+//   trying to make it exhaustive: an autonomous system that chases every evasion technique
+//   on a text denylist becomes brittle, not safer. This check exists to stop a confused
+//   model from proposing something obviously destructive — it is not a boundary against a
+//   determined adversary. Real containment is the ephemeral sandbox (no route to internal
+//   networks, no orchestrator credentials) plus the scope allowlist above; genuinely
+//   ambiguous commands are meant to escalate to a judge model per the architecture, rather
+//   than be caught here.
 const DESTRUCTIVE = [
   /\brm\s+-[a-z]*[rf]/i,
   // Long-form / abbreviated-long-form rm flags (--recursive.../--force.../
@@ -59,9 +65,14 @@ const BULK_LIBRARY_READ = /\/opt\/payload-library\/(raw|normalized)(?=\/|\s|$)/i
 // Strips URL substrings before destructive-pattern matching. URLs are scope-checked
 // separately — inScope() is called on every URL gate() finds in the command — so leaving
 // them in here would let attacker-controlled query-string content masquerade as a
-// destructive keyword (e.g. `?cmd=eval`) and falsely deny an ordinary probe.
+// destructive keyword (e.g. `?cmd=eval`) and falsely deny an ordinary probe. The match
+// terminates at shell metacharacters (whitespace, ; | & quotes/backticks parens <> {}),
+// not just whitespace, so a command CHAINED onto a URL with no space (e.g.
+// `curl http://h/;rm -rf /`) is not swallowed into the stripped-away text along with the
+// URL — removing text before a denylist runs can hide the very thing the denylist looks
+// for.
 function stripUrls(cmd: string): string {
-  return cmd.replace(/https?:\/\/\S+/gi, " ");
+  return cmd.replace(/https?:\/\/[^\s;|&'"`()<>{}]+/gi, " ");
 }
 
 // A second matching pass that collapses bash constructs which defeat a `\s+`-as-

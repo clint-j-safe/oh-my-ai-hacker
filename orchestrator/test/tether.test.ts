@@ -169,3 +169,27 @@ test("regression: legitimate percent-encoding in an in-scope path is not wrongly
 test("regression: an ordinary in-scope URL is still allowed after the decode/segment-boundary changes", () => {
   assert.equal(inScope(E, "http://10.0.0.1:3000/anything?x=1").allow, true);
 });
+
+// --- Fix round 3 (final hardening round on checkCommand): a false ALLOW caused by the
+// round-2 URL-stripping fix. stripUrls() was greedy to the next WHITESPACE, so a command
+// chained onto a URL with no space in between (;, &&, etc.) got swallowed along with the
+// URL text and never reached the destructive patterns at all. ---
+
+test("denies a semicolon-chained IFS rm -rf glued to a URL with no space", () => {
+  assert.equal(checkCommand("curl http://10.0.0.1:3000/;rm${IFS}-rf${IFS}/").allow, false);
+});
+
+test("denies a semicolon-chained brace-expansion rm -rf glued to a URL with no space", () => {
+  assert.equal(checkCommand("curl http://10.0.0.1:3000/;{rm,-rf,/}").allow, false);
+});
+
+test("denies an &&-chained IFS rm -rf glued to a URL with no space", () => {
+  assert.equal(checkCommand("curl http://10.0.0.1:3000/&&rm${IFS}-rf${IFS}/").allow, false);
+});
+
+test("denies a semicolon-chained IFS dd glued to a URL with no space", () => {
+  assert.equal(
+    checkCommand("wget http://10.0.0.1:3000/x;dd${IFS}if=/dev/zero${IFS}of=/dev/sda").allow,
+    false,
+  );
+});
