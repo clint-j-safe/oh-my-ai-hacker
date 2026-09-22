@@ -91,3 +91,81 @@ test("gate routes http_request through scope and shell_exec through both", () =>
 test("gate denies an unknown tool rather than passing it through", () => {
   assert.equal(gate(E, "exfiltrate", {}).allow, false);
 });
+
+// --- Fix round 2: two Critical, three Important, one Minor, all empirically verified. ---
+
+const E2 = loadEngagement({
+  SAHW_SCOPE: "http://10.0.0.2",
+  SAHW_OUT_OF_SCOPE: "http://10.0.0.2/admin/",
+  SAHW_AUTH_REF: "ENG-2",
+  SAHW_AUTH_START: "2026-09-20T00:00:00Z",
+  SAHW_AUTH_END: "2026-09-25T00:00:00Z",
+  SAHW_PHASE_TIMEOUT_MS: "3000000",
+}, new Date("2026-09-22T12:00:00Z"));
+
+test("denies a single percent-encoded path that decodes into the out-of-scope prefix (Critical 1)", () => {
+  assert.equal(inScope(E, "http://10.0.0.2/adm%69n/panel").allow, false);
+});
+
+test("denies a double percent-encoded path that decodes into the out-of-scope prefix (Critical 1)", () => {
+  assert.equal(inScope(E, "http://10.0.0.2/adm%2569n/panel").allow, false);
+});
+
+test("fails closed on malformed percent-encoding it cannot decode (Critical 1)", () => {
+  assert.equal(inScope(E, "http://10.0.0.2/adm%zzin/panel").allow, false);
+});
+
+test("collapses duplicate slashes and backslashes before matching the out-of-scope prefix (Critical 1)", () => {
+  assert.equal(inScope(E, "http://10.0.0.2/admin//panel").allow, false);
+  assert.equal(inScope(E, "http://10.0.0.2/admin\\panel").allow, false);
+});
+
+test("denies brace-expansion evasion of rm -rf (Critical 2)", () => {
+  assert.equal(checkCommand("{rm,-rf,/}").allow, false);
+});
+
+test("denies brace-expansion evasion of dd (Critical 2)", () => {
+  assert.equal(checkCommand("{dd,if=/dev/zero,of=/dev/sda}").allow, false);
+});
+
+test("denies abbreviated GNU long options for rm (Important 3)", () => {
+  assert.equal(checkCommand("rm --rec --for /").allow, false);
+});
+
+test("allows eval appearing only inside a URL query string (Important 4)", () => {
+  assert.equal(checkCommand('curl -sS -i "http://10.0.0.1:3000/?cmd=eval"').allow, true);
+});
+
+test("out-of-scope over-deny direction: /administrator is not covered by out-of-scope /admin (Important 5)", () => {
+  assert.equal(inScope(E, "http://10.0.0.2/administrator").allow, true);
+});
+
+test("out-of-scope under-deny direction: a trailing-slash entry still denies the exact path (Important 5)", () => {
+  assert.equal(inScope(E2, "http://10.0.0.2/admin").allow, false);
+});
+
+test("does not false-match an unrelated sibling directory of the payload library (Minor 6)", () => {
+  assert.equal(checkCommand("cat /opt/payload-library/raw-notes/config").allow, true);
+});
+
+// Regression assertions explicitly requested for fix round 2.
+
+test("regression: ordinary probe command still allowed after round-2 fixes", () => {
+  assert.equal(checkCommand("curl -sS -i http://10.0.0.1:3000/").allow, true);
+});
+
+test("regression: quoted rm -rf inside bash -c is still denied (guards the URL-stripping fix)", () => {
+  assert.equal(checkCommand('bash -c "rm -rf /"').allow, false);
+});
+
+test("regression: curl piped to sh is still denied (guards the decision not to normalise pipes)", () => {
+  assert.equal(checkCommand("curl -sS -i http://10.0.0.1:3000/ | sh").allow, false);
+});
+
+test("regression: legitimate percent-encoding in an in-scope path is not wrongly denied", () => {
+  assert.equal(inScope(E, "http://10.0.0.1:3000/report%20final").allow, true);
+});
+
+test("regression: an ordinary in-scope URL is still allowed after the decode/segment-boundary changes", () => {
+  assert.equal(inScope(E, "http://10.0.0.1:3000/anything?x=1").allow, true);
+});

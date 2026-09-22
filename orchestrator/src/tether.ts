@@ -5,17 +5,37 @@ export type Decision = { allow: true } | { allow: false; reason: string };
 const deny = (reason: string): Decision => ({ allow: false, reason });
 const ALLOW: Decision = { allow: true };
 
+// Builds "re|rec|recu|...|recursive" style alternatives: every prefix of `full` from
+// `minLen` characters up to the whole word. GNU getopt_long accepts any unambiguous
+// abbreviation of a long option (e.g. `--rec` for `--recursive`), so a check for the
+// literal option name alone is not enough.
+function longOptionAbbreviations(full: string, minLen: number): string[] {
+  const out: string[] = [];
+  for (let len = minLen; len <= full.length; len++) out.push(full.slice(0, len));
+  return out;
+}
+
+const RM_LONG_FLAGS = [
+  ...longOptionAbbreviations("recursive", 2),
+  ...longOptionAbbreviations("force", 2),
+  ...longOptionAbbreviations("no-preserve-root", 6),
+].join("|");
+
 // SECURITY MODEL: the destructive denylist below is DEFENCE IN DEPTH, not containment.
 // A regex denylist over shell strings is inherently incomplete. Real containment is the
-// ephemeral sandbox plus the scope allowlist — and note the allowlist is robust in a way
-// this denylist is not, because inScope() PARSES URLs with the URL constructor rather than
-// pattern-matching text. This check guards against a confused model proposing something
-// destructive; it is not a boundary against a determined adversary.
+// ephemeral sandbox plus the scope allowlist. Within that allowlist, host:port comparison
+// is robust because both sides are parsed and normalised by the URL constructor (see
+// hostPort() below) — but path-based out-of-scope entries are NOT inherently robust the
+// same way: the URL constructor does not decode percent-escapes in .pathname, so inScope()
+// has to explicitly percent-decode the request path (at multiple levels, to catch double
+// encoding) and match it against out-of-scope paths on segment boundaries before it can be
+// trusted. This check guards against a confused model proposing something destructive; it
+// is not a boundary against a determined adversary.
 const DESTRUCTIVE = [
   /\brm\s+-[a-z]*[rf]/i,
-  // Long-form rm flags (--recursive, --force, --no-preserve-root), possibly with other
-  // tokens/flags between "rm" and the dangerous long flag.
-  /\brm\s+(?:\S+\s+)*(?:--recursive|--force|--no-preserve-root)\b/i,
+  // Long-form / abbreviated-long-form rm flags (--recursive.../--force.../
+  // --no-preserve-root...), possibly with other tokens/flags before the dangerous one.
+  new RegExp(`\\brm\\s+(?:\\S+\\s+)*--(?:${RM_LONG_FLAGS})\\b`, "i"),
   /\bdd\s+if=/i, /\bmkfs(\.\w+)?\b/i, /\bshutdown\b/i,
   /\breboot\b/i, /\bhalt\b/i, /\bmkswap\b/i, /\bfdisk\b/i, /:\s*\(\s*\)\s*\{.*\|\s*:\s*&/,
   /\bchmod\s+-R\s+777\s+\//, /\b(curl|wget)\b[^|]*\|\s*(ba)?sh\b/i,
@@ -31,12 +51,78 @@ const DESTRUCTIVE = [
 // The payload library is reachable through tools, never through a shell command — so any
 // shell command that so much as names the raw/normalized directories is wrong, regardless
 // of the verb around it (a "cd into it, then read with a relative path" trick defeats a
-// verb-adjacent-to-path check; naming the path at all does not) (spec 9.4).
-const BULK_LIBRARY_READ = /\/opt\/payload-library\/(raw|normalized)\b/i;
+// verb-adjacent-to-path check; naming the path at all does not). The lookahead requires a
+// "/", whitespace, or end-of-string right after the directory name so an unrelated sibling
+// such as raw-notes/ does not false-match (spec 9.4).
+const BULK_LIBRARY_READ = /\/opt\/payload-library\/(raw|normalized)(?=\/|\s|$)/i;
+
+// Strips URL substrings before destructive-pattern matching. URLs are scope-checked
+// separately — inScope() is called on every URL gate() finds in the command — so leaving
+// them in here would let attacker-controlled query-string content masquerade as a
+// destructive keyword (e.g. `?cmd=eval`) and falsely deny an ordinary probe.
+function stripUrls(cmd: string): string {
+  return cmd.replace(/https?:\/\/\S+/gi, " ");
+}
+
+// A second matching pass that collapses bash constructs which defeat a `\s+`-as-
+// token-boundary assumption — IFS substitution and brace expansion — down to plain
+// whitespace, so e.g. `{rm,-rf,/}` reads as `rm -rf /` to the patterns above.
+// Deliberately does NOT touch `;`, `|`, or `&` (the pipe-to-shell pattern needs them
+// literal) and does NOT strip quotes (stripping quotes would let
+// `bash -c "rm -rf /"` slip through).
+function collapseTokenSeparators(cmd: string): string {
+  return cmd
+    .replace(/\$\{?IFS\}?/gi, " ")
+    .replace(/[{},\t\n]/g, " ")
+    .replace(/ {2,}/g, " ");
+}
 
 function hostPort(u: URL): string {
   const port = u.port || (u.protocol === "https:" ? "443" : "80");
   return `${u.protocol}//${u.hostname}:${port}`;
+}
+
+function normalizeSlashes(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+}
+
+function stripTrailingSlash(path: string): string {
+  return path === "/" ? "" : path.replace(/\/+$/, "");
+}
+
+// A request path "covers" (matches, or is nested under) an out-of-scope path only on a
+// segment boundary — equal, or continuing past a "/" — never a bare prefix match, which
+// would treat "/administrator" as covered by an out-of-scope "/admin". Both sides have
+// trailing slashes stripped first, so an out-of-scope entry written as "/admin/" still
+// matches a request to exactly "/admin" (and vice versa).
+function pathCoveredBy(requestPath: string, outOfScopePath: string): boolean {
+  const req = stripTrailingSlash(requestPath);
+  const out = stripTrailingSlash(outOfScopePath);
+  return req === out || req.startsWith(`${out}/`);
+}
+
+// Percent-decodes a path iteratively (bounded rounds) so multi-level encoding (e.g.
+// %2569 -> %69 -> "i") cannot hide a match from the out-of-scope check; each level is also
+// slash-normalised (backslashes -> "/", duplicate "/" collapsed) before being returned.
+// Throws if any level contains malformed percent-encoding — callers must fail closed on
+// that, because a path we cannot decode is a path we cannot reason about.
+function decodePathLevels(rawPath: string, maxRounds = 3): string[] {
+  const levels: string[] = [];
+  let current = normalizeSlashes(rawPath);
+  levels.push(current);
+  for (let i = 0; i < maxRounds; i++) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      throw new Error(`malformed percent-encoding in path: ${rawPath}`);
+    }
+    decoded = normalizeSlashes(decoded);
+    if (decoded === current) break;
+    levels.push(decoded);
+    current = decoded;
+  }
+  return levels;
 }
 
 export function inScope(e: Engagement, url: string): Decision {
@@ -45,11 +131,22 @@ export function inScope(e: Engagement, url: string): Decision {
   if (u.protocol !== "http:" && u.protocol !== "https:") {
     return deny(`scheme not permitted: ${u.protocol}`);
   }
+
+  let pathLevels: string[];
+  try {
+    pathLevels = decodePathLevels(u.pathname);
+  } catch {
+    return deny(`path cannot be decoded — refusing to reason about it: ${url}`);
+  }
+
   for (const out of e.outOfScope) {
-    if (hostPort(u) === hostPort(out) && u.pathname.startsWith(out.pathname)) {
+    if (hostPort(u) !== hostPort(out)) continue;
+    const outPath = normalizeSlashes(out.pathname);
+    if (pathLevels.some((p) => pathCoveredBy(p, outPath))) {
       return deny(`explicitly out of scope: ${url}`);
     }
   }
+
   const origins = new Set(e.scope.map(hostPort));
   if (!origins.has(hostPort(u))) {
     return deny(`host:port not in SAHW_SCOPE: ${hostPort(u)}`);
@@ -59,10 +156,14 @@ export function inScope(e: Engagement, url: string): Decision {
 
 export function checkCommand(cmd: string): Decision {
   if (typeof cmd !== "string" || !cmd.trim()) return deny("empty command");
+  const withoutUrls = stripUrls(cmd);
+  const collapsed = collapseTokenSeparators(withoutUrls);
   for (const p of DESTRUCTIVE) {
-    if (p.test(cmd)) return deny(`destructive pattern ${p} in: ${cmd}`);
+    if (p.test(withoutUrls) || p.test(collapsed)) {
+      return deny(`destructive pattern ${p} in: ${cmd}`);
+    }
   }
-  if (BULK_LIBRARY_READ.test(cmd)) {
+  if (BULK_LIBRARY_READ.test(withoutUrls) || BULK_LIBRARY_READ.test(collapsed)) {
     return deny("shell command references the payload library; use the payload tools instead");
   }
   return ALLOW;
