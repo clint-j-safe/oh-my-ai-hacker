@@ -333,3 +333,23 @@ test("every VULN_CLASSES value is accepted by isVulnClass, and a prose value is 
   assert.equal(isVulnClass(""), false);
   assert.equal(isVulnClass(undefined), false);
 });
+
+test("a beat that did real work is NOT stalled because one later attempt ran dry", async () => {
+  // Regression. Stall was evaluated per ATTEMPT, so a beat whose first attempt made
+  // five successful requests — mapping the API root among them — was aborted and
+  // discarded the moment a later hypothesis produced no tool calls. Stall is a
+  // BEAT-level rule: the beat plainly executed work.
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),                 // attempt 1: real work
+    say(JSON.stringify(claim("clickjacking", url))),              // -> banks a finding
+    say("I have no further hypothesis worth testing."),           // attempt 2: zero tool calls
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.stalled, false, "a beat with executed work must not report stalled");
+  assert.equal(out.exitCode, 0);
+  assert.equal(out.findings.length, 1, "the finding proved in attempt 1 must survive");
+  assert.doesNotMatch(String(out.reason ?? ""), /0 succeeded tool call/);
+});

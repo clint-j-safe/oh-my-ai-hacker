@@ -325,6 +325,14 @@ export async function runBeat(opts: {
         let messages: any[] | undefined = undefined;  // undefined until the first runAgent call
         let totalTurns = 0;
         let totalTokens = 0;
+        // Stall is a BEAT-level rule, not an attempt-level one. A beat that already
+        // executed real work is not stalled just because one later hypothesis ran dry —
+        // that attempt simply ends, as it does for max_turns. Scoping the check to a
+        // single attempt aborted a beat that had already mapped 5 endpoints including
+        // the API root, discarding every bit of it.
+        let beatSucceededToolCalls = 0;
+        let beatArtifacts = 0;
+        const beatCalls: Array<{ tool: string; args: string }> = [];
 
         /** Builds this beat's contribution to the spine and saves it. Never throws —
          * a save failure is logged and swallowed, exactly like a corrupt read: the
@@ -426,9 +434,13 @@ export async function runBeat(opts: {
             });
           }
 
-          const succeededToolCalls = run.toolCalls.filter((c) => c.ok).length;
+          beatSucceededToolCalls += run.toolCalls.filter((c) => c.ok).length;
+          beatArtifacts += run.artifacts;
+          for (const c of run.toolCalls) beatCalls.push({ tool: c.tool, args: c.args });
+
+          const succeededToolCalls = beatSucceededToolCalls;
           const repeatCounts = new Map<string, number>();
-          for (const c of run.toolCalls) {
+          for (const c of beatCalls) {
             const key = `${c.tool}:${c.args}`;
             repeatCounts.set(key, (repeatCounts.get(key) ?? 0) + 1);
           }
@@ -436,13 +448,12 @@ export async function runBeat(opts: {
           const stall = await startActiveObservation("stall-check", async (stallSpan) => {
             stallSpan.update({
               input: {
-                succeededToolCalls, newArtifacts: run.artifacts,
+                scope: "beat", succeededToolCalls, newArtifacts: beatArtifacts,
                 repeatCounts: Object.fromEntries(repeatCounts),
               },
             });
             const r = isStalled(
-              { succeededToolCalls, newArtifacts: run.artifacts,
-                calls: run.toolCalls.map((c) => ({ tool: c.tool, args: c.args })) },
+              { succeededToolCalls, newArtifacts: beatArtifacts, calls: beatCalls },
               stallCfg);
             stallSpan.update({ output: { stalled: r.stalled, reason: r.reason } });
             return r;
