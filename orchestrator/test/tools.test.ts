@@ -1,0 +1,172 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type OpenAI from "openai";
+import { loadEngagement } from "../src/config.js";
+import { ArtifactStore } from "../src/artifacts.js";
+import { ToolRunner, TOOL_SCHEMAS } from "../src/tools.js";
+
+const E = loadEngagement({
+  SAHW_SCOPE: "http://10.0.0.1:3000",
+  SAHW_AUTH_REF: "ENG-1",
+  SAHW_AUTH_START: "2026-09-20T00:00:00Z",
+  SAHW_AUTH_END: "2026-09-25T00:00:00Z",
+  SAHW_PHASE_TIMEOUT_MS: "3000000",
+}, new Date("2026-09-22T12:00:00Z"));
+
+async function runner(fetchImpl?: typeof fetch) {
+  return new ToolRunner({
+    engagement: E,
+    store: new ArtifactStore(await mkdtemp(join(tmpdir(), "sahw-"))),
+    fetchImpl,
+  });
+}
+
+const okFetch = (async () => new Response("BODY-OK", {
+  status: 200, headers: { "content-type": "text/plain" },
+})) as unknown as typeof fetch;
+
+test("tool schemas are in chat.completions shape with required fields", () => {
+  assert.ok(TOOL_SCHEMAS.length >= 2);
+  for (const t of TOOL_SCHEMAS) {
+    assert.equal(t.type, "function");
+    assert.ok(t.function.name && t.function.description && t.function.parameters);
+  }
+  // Note: the installed `openai` SDK's ChatCompletionTool is a union of function-tool and
+  // custom-tool shapes (a newer shape than the brief's snippet assumed), so `.find()`
+  // needs a type predicate to narrow back to the function-tool member before `.function`
+  // is accessible. This is a type-level fix only; the runtime assertions are unchanged.
+  const http = TOOL_SCHEMAS.find(
+    (t): t is OpenAI.Chat.ChatCompletionFunctionTool =>
+      t.type === "function" && t.function.name === "http_request",
+  );
+  assert.deepEqual((http!.function.parameters as any).required, ["method", "url"]);
+});
+
+test("http_request captures request and response and stores an artifact", async () => {
+  const r = await runner(okFetch);
+  const out = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/x" });
+  assert.equal(out.ok, true);
+  const cap = out.result as any;
+  assert.equal(cap.response.status, 200);
+  assert.equal(cap.response.body, "BODY-OK");
+  assert.match(cap.artifact.sha256, /^[0-9a-f]{64}$/);
+});
+
+test("http_request is denied out of scope and never calls fetch", async () => {
+  let called = false;
+  const spy = (async () => { called = true; return new Response(""); }) as unknown as typeof fetch;
+  const r = await runner(spy);
+  const out = await r.execute("http_request", { method: "GET", url: "http://evil.test/" });
+  assert.equal(out.ok, false);
+  assert.match(out.denied!, /not in SAHW_SCOPE/);
+  assert.equal(called, false, "fetch must not run when the Tether denies");
+});
+
+test("shell_exec is denied for destructive commands without executing", async () => {
+  const r = await runner(okFetch);
+  const out = await r.execute("shell_exec", { command: "rm -rf /" });
+  assert.equal(out.ok, false);
+  assert.match(out.denied!, /destructive/);
+});
+
+test("an unknown tool is denied, not silently ignored", async () => {
+  const r = await runner(okFetch);
+  const out = await r.execute("exfiltrate", {});
+  assert.equal(out.ok, false);
+});
+
+test("identical responses collapse to one artifact", async () => {
+  const r = await runner(okFetch);
+  const a = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/a" });
+  const b = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/a" });
+  assert.equal((a.result as any).artifact.sha256, (b.result as any).artifact.sha256);
+});
+
+// --- Strengthened / additional coverage beyond the brief's baseline ---
+
+test("http_request never calls fetch for an out-of-scope request (network-touch assertion, not just ok flag)", async () => {
+  // Distinct from the baseline out-of-scope test: this drives multiple distinct denied
+  // shapes (bad host, out-of-scope path) through the same spy so the "fetch never runs"
+  // property can't pass by accident of one particular denial reason.
+  for (const url of ["http://evil.test/", "https://10.0.0.1:9999/nope"]) {
+    let called = false;
+    const spy = (async () => { called = true; return new Response(""); }) as unknown as typeof fetch;
+    const r = await runner(spy);
+    const out = await r.execute("http_request", { method: "GET", url });
+    assert.equal(out.ok, false, `expected denial for ${url}`);
+    assert.equal(called, false, `fetch must not run for ${url}`);
+  }
+});
+
+test("denied http_request writes no artifact to the store", async () => {
+  // A denial that still left an artifact behind would be a silent capture of
+  // out-of-scope traffic. Assert the store stays empty, not just that ok is false.
+  let called = false;
+  const spy = (async () => { called = true; return new Response("x"); }) as unknown as typeof fetch;
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const r = new ToolRunner({ engagement: E, store, fetchImpl: spy });
+  const out = await r.execute("http_request", { method: "GET", url: "http://evil.test/" });
+  assert.equal(out.ok, false);
+  assert.equal(called, false);
+  // No artifact directory should have been created by this call.
+  const { readdir } = await import("node:fs/promises");
+  const entries = await readdir(dir);
+  assert.equal(entries.length, 0, "no fan-out directory should exist after a denied request");
+});
+
+test("shell_exec destructive commands are denied with a destructive reason across several command shapes", async () => {
+  // Note: ToolRunner has no shell executor implemented at all (only http_request and
+  // read_artifact have branches in execute()), so this test cannot and does not claim to
+  // verify "no shell hook ran" — there is no hook to run. What it verifies is that
+  // gate()'s destructive-command denial reaches the caller through ToolRunner's own
+  // { ok:false, denied } shape, consistently, across several distinct destructive
+  // command patterns (not just one regex match).
+  const r = await runner(okFetch);
+  for (const command of ["rm -rf /", "rm --recursive --force /", "dd if=/dev/zero of=/dev/sda"]) {
+    const out = await r.execute("shell_exec", { command });
+    assert.equal(out.ok, false, `expected denial for: ${command}`);
+    assert.match(out.denied!, /destructive/, `expected destructive reason for: ${command}`);
+  }
+});
+
+test("read_artifact denies a malformed sha256 via the upfront format check, not just the store's throw", async () => {
+  const r = await runner(okFetch);
+  // Not 64 hex chars — must not be handed raw to ArtifactStore.get(), which throws on
+  // a non-canonical hash. Assert the SPECIFIC message from ToolRunner's own upfront
+  // CANONICAL_SHA256 check ("invalid sha256: ..."), which is distinct from
+  // ArtifactStore's own message ("Invalid SHA-256 hash: ..."). This pins the upfront
+  // validation itself — deleting it and relying solely on the catch-all try/catch
+  // around store.get() would still pass a weaker assertion that only checked
+  // `out.denied` was truthy, but would fail this one.
+  const out = await r.execute("read_artifact", { sha256: "not-a-hash" });
+  assert.equal(out.ok, false);
+  assert.match(out.denied!, /invalid sha256/i);
+});
+
+test("read_artifact denies a well-formed but unknown sha256 via the store's not-found error", async () => {
+  const r = await runner(okFetch);
+  const fakeButCanonical = "a".repeat(64);
+  const out = await r.execute("read_artifact", { sha256: fakeButCanonical });
+  assert.equal(out.ok, false);
+  // This is the ArtifactStore.get() -> readFile ENOENT path, caught by ToolRunner's
+  // try/catch and reported as "tool execution error: ...ENOENT...". Distinguishing this
+  // from the malformed-hash case (asserted above) proves the two failure paths are both
+  // actually exercised, not just that one of them happens to satisfy a loose assertion.
+  assert.match(out.denied!, /ENOENT|no such file/i);
+});
+
+test("read_artifact round-trips content actually written by http_request", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const r = new ToolRunner({ engagement: E, store, fetchImpl: okFetch });
+  const put = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/y" });
+  const sha256 = (put.result as any).artifact.sha256 as string;
+  const out = await r.execute("read_artifact", { sha256 });
+  assert.equal(out.ok, true);
+  const content = (out.result as any).content as string;
+  assert.match(content, /BODY-OK/);
+});
