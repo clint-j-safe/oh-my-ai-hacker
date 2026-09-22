@@ -3,12 +3,19 @@ description: >-
   SAFE AI Hacker shared system preamble (SAHW). Included at the top of every
   SAHW agent. Establishes identity, operating principles, phases, validation
   discipline, and hard safety rules. Not spawned directly.
-mode: primary
-# model / temperature are set per concrete agent that includes this preamble.
-permission:
-  edit: deny
-  bash: deny
-  webfetch: deny
+kind: preamble
+# model / temperature are set by each concrete agent that includes this preamble.
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: []
+skills: []          # allowlist for skill_run
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: none                # none | scoped (in-scope hosts only) | isolated
+  writable: false
+# NOTE: Not dispatched. Prepended as the first system message of every agent below.
 ---
 
 <!--

@@ -5,9 +5,8 @@
 **Paradigm:** Client-side loop engineering + adversarial verification
 **Status:** *Documentation only.* No code, no runtime wiring, no engagement run in this phase.
 
-> **Supersedes** the v1 OpenCode design (`@opencode-ai/sdk` + OpenRouter) and its
-> `docs/config/opencode.json.md`, both removed. The v1 *target, constraints, prompts,
-> skills and schemas carry over unchanged* — only the runtime is replaced.
+> Every model call in this system is `client.chat.completions.create` through the **openai**
+> npm package. See the changelog at the end for what v2 replaced.
 
 ---
 
@@ -227,33 +226,58 @@ Verdicts use the existing schema enum — no new values are introduced:
 Informational observations are recorded as artifacts, **not** as findings — this is the
 mechanism that keeps the rubric's two non-reproducible observations out of the report.
 
-**Blind vulnerabilities.** `mcp-oast` is granted to `exploit-constructor` **only**: register
+**Blind vulnerabilities.** `oast_register` / `oast_poll` are granted to `exploit-constructor` **only**: register
 a callback, inject, poll for the out-of-band interaction. The correlation is the invariant.
 
 ---
 
-## 7. Agent registry and capability matrix
+## 7. Tool registry, agents, and capability
 
-Agent instructions already exist as target-agnostic files. `core.md` is prepended to every
-agent as the shared preamble. The capability column **is** the `tools` array of the request.
+### 7.0 The canonical tool registry
+
+These are the only function tools that exist. Every name below is a JSON function schema sent
+in the request's `tools` array; the orchestrator implements each one, and the Tether gates
+every call before execution. **There is no ambient capability** — an agent whose `tools` array
+omits `shell_exec` has no shell, and no prompt can conjure one.
+
+| Tool | Does | Granted to |
+|---|---|---|
+| `http_request` | One scoped HTTP request; host/port checked against the engagement allowlist | recon, client-intel, state-mapper, exploit-constructor |
+| `read_artifact` | Read a stored artifact or sandbox file | all agents |
+| `grep_artifact` | Search stored artifacts | most agents |
+| `glob_artifact` | List stored artifacts | recon, client-intel, threat-model, adjudicator |
+| `write_file` | Write **inside the sandbox only** — never target-facing | client-intel, exploit-constructor |
+| `shell_exec` | Run a command in the isolated sandbox; destructive-AST checked | **exploit-constructor only** |
+| `skill_run` | Dispatch one of the 36 skills, resolved against the caller's `skills` allowlist | all but core, threat-model |
+| `graph_query` | Named, parameterised, **read-only** Cypher against the engagement graph | threat-model, stateful-prober, chain-reasoner |
+| `patt_search` | MCP `mcp-patt` — payload corpus retrieval | novelty-synthesizer |
+| `oast_register` / `oast_poll` | MCP `mcp-oast` — out-of-band callback registration and polling | **exploit-constructor only** |
+
+### 7.1 Agent registry
+
+Agent definitions live in `docs/agents/*.md`. Their frontmatter is the request shape, not a
+framework config: `model`, `temperature`, `tools` (the literal `tools` array), `skills` (the
+`skill_run` allowlist), and `sandbox` (container posture the Tether enforces). There is no
+`mode` and no `permission` block — **capability is the `tools` array and nothing else.**
+`core.md` (`kind: preamble`) is prepended as the first `system` message of every agent.
 
 | Agent | Source prompt | Tools (`tools` array) | Skills allowed | Emits | Touches target |
 |---|---|---|---|---|---|
 | `core` | `SAFE_AI_HACKER_CORE_SYSTEM_PROMPT` | — | — | shared preamble | — |
-| `recon` | Core Phase 1 | `http`, `read`, `grep`, `glob`, `skill_run` | `tech-fingerprinting`, `intelligent-crawling`, `scope-discipline` | recon-map JSON | yes (HTTP, Tether-gated) |
-| `client-intel` | Core Phase 1 | `http`, `read`, `grep`, `glob`, `skill_run` | `js-spa-reverse`, `credential-secret-custody` | client-intel JSON | yes (HTTP) |
-| `state-mapper` | Core Phase 1 | `http`, `read`, `grep`, `skill_run` | `account-role-acquisition`, `privilege-matrix-mapping`, `token-session-forensics` | state-machine JSON | yes (HTTP) |
-| `threat-model` | `THREAT_MODEL_PROMPT` | `read`, `grep`, `glob`, `graph_query` | — | per-endpoint strategies | **no** |
-| `novelty-synthesizer` | `NOVELTY_SYNTHESIZER_PROMPT` | `read`, `grep`, `mcp-patt` | `payload-mutator`, `waf-evasion-mastery`, `technique-combinator` | payload + proposed invariant | **no** |
-| `stateful-prober` | `STATEFUL_LOGIC_PROBER_PROMPT` | `read`, `grep`, `graph_query` | `business-logic-state`, `auth-bypass-battery`, `idor-bola-access-control` | step sequence + invariant | **no** |
-| `chain-reasoner` | `CHAIN_REASONER_PROMPT` | `read`, `graph_query` | `chain-construction`, `blast-radius-estimation` | chain artifact | **no** |
-| `exploit-constructor` | Core Phase 3 | `shell` (isolated net), `http`, `read`, `write`, `mcp-oast` | the offensive batteries (`sqli-*`, `xss-*`, `ssrf-*`, `deserialization-rce`, `injection-battery-*`, `file-upload-path-traversal`, `exploit-*`) | PoC + evidence + finding | **yes** |
-| `adjudicator` | Core / Axiom | `read`, `grep`, `glob` | `adversarial-self-review`, `severity-calibration`, `poc-hardening-self-verification` | verdict | **no** |
+| `recon` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `glob_artifact`, `skill_run` | `tech-fingerprinting`, `intelligent-crawling`, `scope-discipline` | recon-map JSON | yes (HTTP, Tether-gated) |
+| `client-intel` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `glob_artifact`, `write_file`, `skill_run` | `js-spa-reverse`, `credential-secret-custody` | client-intel JSON | yes (HTTP) |
+| `state-mapper` | Core Phase 1 | `http_request`, `read_artifact`, `grep_artifact`, `skill_run` | `account-role-acquisition`, `privilege-matrix-mapping`, `token-session-forensics` | state-machine JSON | yes (HTTP) |
+| `threat-model` | `THREAT_MODEL_PROMPT` | `read_artifact`, `grep_artifact`, `glob_artifact`, `graph_query` | — | per-endpoint strategies | **no** |
+| `novelty-synthesizer` | `NOVELTY_SYNTHESIZER_PROMPT` | `read_artifact`, `grep_artifact`, `patt_search`, `skill_run` | `payload-mutator`, `waf-evasion-mastery`, `technique-combinator` | payload + proposed invariant | **no** |
+| `stateful-prober` | `STATEFUL_LOGIC_PROBER_PROMPT` | `read_artifact`, `grep_artifact`, `graph_query`, `skill_run` | `business-logic-state`, `auth-bypass-battery`, `idor-bola-access-control` | step sequence + invariant | **no** |
+| `chain-reasoner` | `CHAIN_REASONER_PROMPT` | `read_artifact`, `graph_query`, `skill_run` | `chain-construction`, `blast-radius-estimation` | chain artifact | **no** |
+| `exploit-constructor` | Core Phase 3 | `shell_exec`, `http_request`, `read_artifact`, `write_file`, `oast_register`, `oast_poll`, `skill_run` | the offensive batteries (`sqli-*`, `xss-*`, `ssrf-*`, `deserialization-rce`, `injection-battery-*`, `file-upload-path-traversal`, `exploit-*`) | PoC + evidence + finding | **yes** |
+| `adjudicator` | Core / Axiom | `read_artifact`, `grep_artifact`, `glob_artifact`, `skill_run` | `adversarial-self-review`, `severity-calibration`, `poc-hardening-self-verification` | verdict | **no** |
 
 **Invocation rule:** agents do not spawn each other. The orchestrator dispatches. The finder
 cannot reach the adjudicator, and the adjudicator cannot reach the finder.
 
-### 7.1 Skills — compatible as-is, no re-authoring
+### 7.2 Skills — compatible as-is, no re-authoring
 
 Each of the 36 skills is a self-contained unit: `SKILL.md` (with `allowed-tools` frontmatter
 and its own `references/artifact.schema.json`) plus `scripts/run.py`, which takes JSON in and
@@ -271,7 +295,7 @@ that skill's artifact schema, and hashes it into the artifact store. A skill's o
 `allowed-tools` frontmatter is enforced by the Tether as a second boundary. **No plugin layer
 and no skill rewriting is required.**
 
-### 7.2 Class coverage routing
+### 7.3 Class coverage routing
 
 Every `vuln_class` in `finding.schema.json` must have a path to `CONFIRMED` — a discovering
 agent, an executing skill, and an invariant type that can mechanically prove it. This table
@@ -535,6 +559,16 @@ const verdict = await client.chat.completions.create(
 
 await sdk.shutdown();   // flush batched spans
 ```
+
+---
+
+## Changelog
+
+**v2 (this document)** replaces v1, which ran on the OpenCode SDK (`@opencode-ai/sdk`) with
+OpenRouter routing and an `opencode.json` config. That config file is deleted and the agent
+frontmatter has been rewritten from OpenCode's schema (`mode`, `permission`, tool toggles) to
+the OpenAI SDK request shape (`tools`, `skills`, `sandbox`). The *target, hard constraints,
+prompts, skills and artifact schemas are unchanged* — only the runtime moved.
 
 ---
 

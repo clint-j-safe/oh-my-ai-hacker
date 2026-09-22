@@ -4,17 +4,29 @@ description: >-
   target's own served JavaScript (bundles + source maps) to extract API routes,
   request envelopes, serialization gadgets, crypto routines, and hardcoded
   secret references. Black-box; uses only target-delivered assets.
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.2
-permission:
-  edit: deny
-  webfetch: allow
-  bash: allow                # gated by AI Hacker Tether
-tools:
-  read: true
-  write: true                # may write parser scripts into the sandbox (dynamic skills)
-# skills: js-spa-reverse, tech-fingerprinting
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - http_request
+  - read_artifact
+  - grep_artifact
+  - glob_artifact
+  - write_file
+  - skill_run
+skills: 
+  - js-spa-reverse
+  - credential-secret-custody
+  - tech-fingerprinting
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: scoped                # none | scoped (in-scope hosts only) | isolated
+  writable: true
+# NOTE: write_file is sandbox-local only: parser scripts for recovered bundles, never target-facing.
 ---
 
 <!-- Prepend docs/agents/core.md. SOURCE: Core Phase 1 client-intel (docs/PROMPTS.md

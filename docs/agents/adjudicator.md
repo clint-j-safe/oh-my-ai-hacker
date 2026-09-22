@@ -4,17 +4,27 @@ description: >-
   escalates an inconclusive/low-confidence verdict, this agent reasons over the exact PoC,
   requests, and responses and returns a strictly-formatted verdict. No network,
   no writes.
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.0
-permission:
-  edit: deny
-  bash: deny
-  webfetch: deny
-tools:
-  read: true
-  write: false
-# skills: adversarial-self-review, severity-calibration
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - read_artifact
+  - grep_artifact
+  - glob_artifact
+  - skill_run
+skills: 
+  - adversarial-self-review
+  - severity-calibration
+  - poc-hardening-self-verification
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: none                # none | scoped (in-scope hosts only) | isolated
+  writable: false
+# NOTE: NO execution, NO network. Rules only on captured artifacts. Default stance: false positive.
 ---
 
 <!-- Prepend docs/agents/core.md. SOURCE: Core validation core / Axiom (docs/PROMPTS.md

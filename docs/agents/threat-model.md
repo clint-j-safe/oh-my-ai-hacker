@@ -4,16 +4,23 @@ description: >-
   WHICH invariants must hold, and HOW they could be violated, then emits a
   prioritized, per-endpoint set of at most 3 test strategies. Does NOT emit an
   endpoint × vuln-class matrix. Black-box.
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.3
-permission:
-  edit: deny
-  bash: deny
-  webfetch: deny
-tools:
-  read: true
-  write: false
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - read_artifact
+  - grep_artifact
+  - glob_artifact
+  - graph_query
+skills: []          # allowlist for skill_run
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: none                # none | scoped (in-scope hosts only) | isolated
+  writable: false
 ---
 
 <!-- Prepend docs/agents/core.md. CANONICAL SOURCE: docs/PROMPTS.md → THREAT_MODEL_PROMPT

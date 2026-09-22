@@ -3,18 +3,27 @@ description: >-
   Phase 1 reconnaissance. Fingerprints the in-scope target(s), enumerates the
   HTTP service surface, and emits a structured attack-surface map. Black-box:
   works from the provided in-scope URLs only.
-mode: subagent
-model: "{{FAST_MODEL}}"     # logical name; resolved by the orchestrator to the SageMaker GLM endpoint
+kind: agent
+model: "{{FAST_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.2
-permission:
-  edit: deny
-  webfetch: allow
-  bash: allow                # gated by AI Hacker Tether (deterministic scope + destructive-AST)
-tools:
-  read: true
-  write: false
-# skills surfaced through the skill_run tool; allow-list the recon skills:
-#   tech-fingerprinting, intelligent-crawling
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - http_request
+  - read_artifact
+  - grep_artifact
+  - glob_artifact
+  - skill_run
+skills: 
+  - tech-fingerprinting
+  - intelligent-crawling
+  - scope-discipline
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: scoped                # none | scoped (in-scope hosts only) | isolated
+  writable: false
 ---
 
 <!-- Prepend docs/agents/core.md at build time. SOURCE: derived from Core Phase 1

@@ -4,17 +4,26 @@ description: >-
   application's exact language (its serialization formats, envelopes, crypto
   routines) instead of generic scanner payloads. Emits one replayable payload +
   invariant per interesting primitive. Black-box; read-only (proposes, never executes).
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.4
-permission:
-  edit: deny
-  bash: deny
-  webfetch: deny
-tools:
-  read: true
-  write: false
-# MCP: mcp-patt (PayloadsAllTheThings retrieval) for context-aware payload building
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - read_artifact
+  - grep_artifact
+  - patt_search
+  - skill_run
+skills: 
+  - payload-mutator
+  - waf-evasion-mastery
+  - technique-combinator
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: none                # none | scoped (in-scope hosts only) | isolated
+  writable: false
 ---
 
 <!-- Prepend docs/agents/core.md. CANONICAL SOURCE: docs/PROMPTS.md → NOVELTY_SYNTHESIZER_PROMPT

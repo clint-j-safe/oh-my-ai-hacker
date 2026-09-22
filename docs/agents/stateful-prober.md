@@ -4,17 +4,26 @@ description: >-
   flaws living in state transitions (balances, OTP binding, workflow order,
   missing verification, rate-limit absence). Every mutation has pre/post-state
   observation and a restoration step. Black-box; proposes, never executes.
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.3
-permission:
-  edit: deny
-  bash: deny
-  webfetch: deny
-tools:
-  read: true
-  write: false
-# MCP: mcp-oast (out-of-band callback registration) for blind flaws
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - read_artifact
+  - grep_artifact
+  - graph_query
+  - skill_run
+skills: 
+  - business-logic-state
+  - auth-bypass-battery
+  - idor-bola-access-control
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: none                # none | scoped (in-scope hosts only) | isolated
+  writable: false
 ---
 
 <!-- Prepend docs/agents/core.md. CANONICAL SOURCE: docs/PROMPTS.md → STATEFUL_LOGIC_PROBER_PROMPT

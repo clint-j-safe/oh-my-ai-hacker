@@ -3,17 +3,28 @@ description: >-
   Phase 1 state-machine reconstruction. Merges the recon map and client-intel
   into a single graph of authentication flows, business workflows, forms, and
   file-upload paths that Phase 2 reasons over. Black-box.
-mode: subagent
-model: "{{REASONING_MODEL}}"
+kind: agent
+model: "{{REASONING_MODEL}}"           # logical name; the orchestrator resolves it to the SageMaker GLM endpoint
 temperature: 0.2
-permission:
-  edit: deny
-  webfetch: allow
-  bash: allow                # gated by AI Hacker Tether; used only to observe flows, never to exploit
-tools:
-  read: true
-  write: false
-# skills: account-role-acquisition, privilege-matrix-mapping, business-logic-state
+
+# OpenAI SDK request shape. `tools` below IS the request's tools array —
+# capability is declarative: a function not listed here cannot be called.
+tools: 
+  - http_request
+  - read_artifact
+  - grep_artifact
+  - skill_run
+skills: 
+  - account-role-acquisition
+  - privilege-matrix-mapping
+  - token-session-forensics
+  - business-logic-state
+
+# Container posture, enforced by AI Hacker Tether (not by the model).
+sandbox:
+  network: scoped                # none | scoped (in-scope hosts only) | isolated
+  writable: false
+# NOTE: Observes flows only; never exploits.
 ---
 
 <!-- Prepend docs/agents/core.md. SOURCE: Core Phase 1 state-machine reconstruction
