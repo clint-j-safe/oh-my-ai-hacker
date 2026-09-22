@@ -596,6 +596,17 @@ git commit -m "feat(orchestrator): content-addressed artifact store"
 
 ---
 
+> **Post-implementation correction (Task 3).** The code block above shipped and was then
+> found defective by review — the defects are the plan's, not the implementer's. Do not reuse
+> it verbatim. `has()` returned `true` for `""`, `"."` and `".."` because `path.join` drops
+> empty segments, so `pathFor("")` resolved to the store root and `access()` on a directory
+> succeeded; guard `pathFor` with `/^[0-9a-f]{64}$/`. `put()`'s check-then-write also trusted
+> any existing file, so a crash mid-write left a truncated artifact that `has()` reported as
+> present forever; write to a temp file in the same directory and `rename()` into place. The
+> idempotency test asserted only that two paths matched, which is a restatement of
+> content-addressing rather than proof no rewrite occurred. See `orchestrator/src/artifacts.ts`
+> for the corrected implementation.
+
 ### Task 4: Tools — schemas and Tether-gated executors
 
 **Files:**
@@ -809,6 +820,16 @@ git commit -m "feat(orchestrator): Tether-gated tool executors with captured art
 ```
 
 ---
+
+> **Post-implementation correction (Task 4).** The `http()` snippet above calls `fetchImpl`
+> with no `redirect` option, so the WHATWG default `redirect: "follow"` applies and the Tether
+> gates only the INITIAL URL. An in-scope target answering `302 Location: http://evil.test/` is
+> followed transparently — the framework contacts a host scope never approved, and the stored
+> artifact records the original URL, so the evidence misrepresents which host was reached.
+> Verified with a local 302 server. Use `redirect: "manual"`, capture the 3xx as an artifact,
+> and require an explicit re-request so the new host passes `gate()` on its own. Also note the
+> `denied` field must carry a discriminated `kind` (policy / no-executor / execution-error), not
+> prose — the agent loop in Task 9 needs to branch on it. See `orchestrator/src/tools.ts`.
 
 ### Task 5: The Axiom — control-differential invariant replay
 
