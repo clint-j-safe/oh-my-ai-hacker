@@ -130,22 +130,38 @@ Agent files already reference **logical** model names (`{{REASONING_MODEL}}`,
 `{{FAST_MODEL}}`), resolved by the orchestrator at dispatch. That indirection is what makes
 the cutover a config change: no agent file is edited when the provider moves.
 
-**Two things genuinely differ, and both must be handled before the cutover:**
+**Two things genuinely differ.** *The budget stop loses its unit:* OpenRouter bills per token,
+so USD is real; a self-hosted endpoint bills for **uptime**, has no per-token price, and a
+naive accumulator reads `cost: 0` forever — silently disabling the stop. Ceilings are therefore
+tokens and turns, which both profiles report (§11). *Profile is a scope decision:* under `test`,
+engagement traffic — including recovered `{{secret:ref}}` context — transits a third party, so
+only targets whose rules of engagement permit that may run under it.
 
-1. **The budget stop loses its unit.** OpenRouter bills per token, so `maxBudgetUsd` is real.
-   A self-hosted SageMaker endpoint bills for *uptime* — there is no per-token price, and a
-   naive cost accumulator reads **`cost: 0` forever**, silently disabling the budget stop.
-   The ceiling is therefore defined in **tokens and turns**, which both profiles report, with
-   USD derived only when the profile supplies a price. See §12.
-2. **Scope discipline must survive the profile.** Under `test`, engagement traffic — including
-   recovered `{{secret:ref}}` context — transits a third party. Only authorized targets whose
-   rules of engagement permit third-party model routing may run under `test`; anything else
-   waits for `prod`. This is a scope decision, not a performance one.
+Both profiles are assumed to support `tools`, `parallel_tool_calls`, `response_format` and a
+populated `usage`. OpenRouter does; that proves nothing about the SageMaker shim, so verifying
+it is a **cutover gate, not a Phase 1 gate**.
 
-The shared assumption is the OpenAI-compatible surface itself: `tools`, `parallel_tool_calls`,
-`response_format`, and a populated `usage`. OpenRouter supports all four, so building on
-`test` does **not** prove the SageMaker shim does — that verification is a cutover gate, not a
-Phase 1 gate.
+### 4.2 Configuration contract
+
+Everything tunable lives in `.env`; `.env.example` is the committed, secret-free reference and
+the single list of knobs. **No behaviour is tuned by editing a prompt, an agent file or a
+skill** — those are target-agnostic by design, and an engagement-specific value in one of them
+would break the black-box rule in §3.
+
+| Group | Controls | Prefix |
+|---|---|---|
+| Scope | in/out-of-scope URLs, CIDRs, authorization window, max safety tier | `SAHW_SCOPE`, `SAHW_AUTH_*`, `SAHW_AUTHORIZED_TIERS` |
+| Provider | profile select, both base URLs, keys, logical→concrete model mapping | `SAHW_PROFILE`, `OPENROUTER_*`, `SAGEMAKER_*` |
+| Budget | turn / token / USD ceilings, request and phase timeouts, retries | `SAHW_BUDGET_*`, `SAHW_MAX_TURNS`, `SAHW_*_TIMEOUT_MS` |
+| Stall | the four detection thresholds and the failure exit code | `SAHW_STALL_*` |
+| Verdicts | escalation confidence, judge threshold, adjudicator count and quorum | `SAHW_AXIOM_*`, `SAHW_ADJUDICATOR_*` |
+| State | workspace, engagement graph, **separate** coverage graph | `SAHW_WORKSPACE`, `NEO4J_*` |
+| Observability | Langfuse host and keys | `SAHW_LANGFUSE_*`, `LANGFUSE_*` |
+| Out-of-band | OAST listener address and ports | `OOB_*` |
+
+Two of these are correctness-critical rather than preference: `SAHW_SCOPE` **is** the Tether's
+allowlist — it is not a hint — and `NEO4J_COVERAGE_*` is deliberately a different credential
+from `NEO4J_*` so the benchmark answer key cannot reach an agent (§8).
 
 ---
 
@@ -186,9 +202,35 @@ never as an `instructions` field.
 
 - **Success** — the Axiom invariant passes with full provenance, and the targeted benchmark
   class is covered.
-- **Limit** — USD, turn or token ceiling reached.
-- **No progress** — stall detected (`skills/stall-ambiguity-resolution`,
-  `skills/cognitive-pruning`); the beat ends and the Spine records why.
+- **Limit** — token, turn or (where priced) USD ceiling reached.
+- **No progress** — a stall, defined below.
+
+### 5.4 Stall detection is measured in executed work
+
+A loop that is still ticking is not a loop that is working. Stall detection therefore keys on
+**work that actually executed**, never on liveness, elapsed time, or the model still producing
+text. A beat is **stalled** if any of these hold:
+
+| Condition | Env knob |
+|---|---|
+| Fewer than *n* **succeeded** tool executions in the beat | `SAHW_STALL_MIN_TOOL_CALLS` |
+| Fewer than *n* new hashed artifacts written to the store | `SAHW_STALL_MIN_ARTIFACTS` |
+| The same `(tool, arguments)` pair repeated *n* times | `SAHW_STALL_MAX_REPEAT_CALLS` |
+| *n* consecutive stalled beats | `SAHW_STALL_MAX_BARREN_BEATS` → abort the run |
+
+**Three invariants the runner must satisfy:**
+
+1. **A phase timeout is a stall, not a completion.** If a phase times out having executed
+   nothing, the run is stalled — reporting "not stalled" because the process stayed alive is
+   the failure this section exists to prevent.
+2. **A stalled run exits non-zero** (`SAHW_STALL_EXIT_CODE`). Exit 0 after producing no work
+   is a false success, and a false success is worse than a crash: it is silently trusted.
+3. **The orchestrator's `AbortSignal` must trip before the per-phase timeout**
+   (`SAHW_PHASE_TIMEOUT_MS` < `SAHW_REQUEST_TIMEOUT_MS`). If the transport times out first,
+   the orchestrator never gets to classify the beat and the stall goes unrecorded.
+
+`skills/stall-ambiguity-resolution` and `skills/cognitive-pruning` are how an agent *recovers*
+from a stall the orchestrator has already detected — they are not the detector.
 
 Human involvement is minimal and non-blocking: authorization at the start, and a queue of
 `NEEDS_REVIEW` escalations. Everything inside L2 runs unattended.
@@ -201,16 +243,13 @@ Findings pass four sequential, adversarial layers. Each layer can only downgrade
 
 ### Layer 1 — Hypothesis validation (read-only)
 
-Filters structurally implausible claims before anything is fired at the target. The validator
-must state an explicit, **evidence-cited** claim.
+Filters implausible claims before anything is fired at the target. **No execution, no
+network** — read/grep/glob over recovered artifacts only.
 
-> **Adapted for black-box.** The source-code `file:line` taint chain of a grey-box pipeline
-> does not exist here. The equivalent evidence is **client-intel**: served JS bundles, source
-> maps, the request envelope the client builds, serialization gadget shapes, crypto routines,
-> and observed response differentials. A claim that cannot cite recovered client-intel *or*
-> an observed differential is downgraded, not tested.
-
-Tools: read/grep/glob over recovered artifacts. **No execution, no network.**
+The grey-box `file:line` taint chain does not exist black-box. The equivalent evidence is
+**client-intel**: served JS bundles, source maps, the request envelope the client builds,
+gadget shapes, crypto routines, observed response differentials. A claim citing neither
+recovered client-intel nor an observed differential is downgraded, not tested.
 
 ### Layer 2 — Dynamic exploit verification
 
@@ -224,7 +263,7 @@ Two agents, strictly separated:
 
 ### Layer 3 — Hybrid replay: autonomous proposal, deterministic decision
 
-This is the layer that kills false positives, and it is deliberately split.
+The layer that kills false positives, deliberately split.
 
 | Half | Who | What it does |
 |---|---|---|
@@ -235,16 +274,14 @@ Invariant types are exactly those in `docs/schemas/finding.schema.json`:
 `body_contains` · `status_in` · `derived` · `state_changed` · `state_violated` ·
 `file_created_then_deleted`.
 
-Two properties make this the black-box equivalent of a proof:
+Two properties make this the black-box equivalent of a proof. **Control-differential:** the
+exploit and a benign control run against the same state, and a finding is real only if they
+*differ* as the invariant predicts — which separates a genuine file read from an error page
+that happens to contain the string. **Idempotent replay:** a replay that does not reproduce
+yields `NEEDS_REVIEW`, never `CONFIRMED`.
 
-- **Control-differential.** The exploit and a benign control run against the same state. A
-  finding is only real if they *differ* in the way the invariant predicts — this is what
-  separates a genuine file read from an error page that happens to contain the string.
-- **Idempotent replay.** A replay that does not reproduce yields `NEEDS_REVIEW`, never
-  `CONFIRMED`.
-
-Formal model checking (CBMC/KLEE) is **not** part of this architecture: it requires C/C++
-source, and the engagement is black-box with no source access.
+Formal model checking (CBMC/KLEE) is **not** part of this architecture — it requires C/C++
+source, and the engagement is black-box.
 
 ### Layer 4 — Independent parallel adjudication
 
@@ -317,11 +354,10 @@ cannot reach the adjudicator, and the adjudicator cannot reach the finder.
 
 ### 7.2 Skills — compatible as-is, no re-authoring
 
-Each of the 36 skills is a self-contained unit: `SKILL.md` (with `allowed-tools` frontmatter
-and its own `references/artifact.schema.json`) plus `scripts/run.py`, which takes JSON in and
-emits a strict JSON artifact on stdout with raw logs offloaded to a spill store.
-
-That shape is already a function tool. One generic tool serves all of them:
+Each of the 36 skills is self-contained: `SKILL.md` (with `allowed-tools` frontmatter and its
+own `references/artifact.schema.json`) plus `scripts/run.py`, which takes JSON in and emits a
+strict JSON artifact on stdout, raw logs offloaded to a spill store. That shape is already a
+function tool, so one generic tool serves all of them:
 
 ```
 skill_run(skill_name: string, input: object) -> artifact JSON
@@ -355,17 +391,12 @@ is the completeness check; a class with no row is a class the pipeline structura
 | `info_disclosure` | `recon`, `client-intel` | `intelligent-crawling`, `js-spa-reverse` | `status_in` / `body_contains` |
 | `ssrf` | `threat-model` → `novelty-synthesizer` | `ssrf-internal-pivot`, `oob-blind-vuln-correlation` | `derived` (OAST correlation) |
 
-Two classes are deliberately hard, and the architecture is built to get them *right rather
-than often*:
-
-- **Blind classes** (`ssrf`, blind injection) only reach `CONFIRMED` through an `mcp-oast`
-  correlation. **No callback means no finding** — this is exactly where an over-eager
-  pipeline manufactures a false positive, and where the control-differential in Layer 3
-  refuses to.
-- **`deserialization_rce`** requires a client-intel gadget *and* a safe, self-deleting PoC.
-  The `file_created_then_deleted` invariant is what makes the proof both convincing and L2-safe:
-  it demonstrates execution and leaves nothing behind. `exploit-safety-auditor` reviews the
-  PoC before it runs.
+Two classes are deliberately hard. **Blind classes** (`ssrf`, blind injection) reach
+`CONFIRMED` only through an OAST correlation — **no callback means no finding**, which is
+exactly where an over-eager pipeline manufactures a false positive. **`deserialization_rce`**
+needs a client-intel gadget *and* a self-deleting PoC; `file_created_then_deleted` is what
+makes the proof both convincing and L2-safe, demonstrating execution while leaving nothing
+behind. `exploit-safety-auditor` reviews that PoC before it runs.
 
 ---
 
@@ -420,9 +451,8 @@ MERGE (e:Endpoint {url: $url, method: $method})
 SET e.auth_required = $authRequired
 ```
 
-Reads are the `graph_query` tool: the orchestrator runs **parameterised, read-only, named
-Cypher queries** — agents choose a query by name and supply arguments; they never author
-Cypher. Two queries carry the chain work:
+Reads go through `graph_query`: **parameterised, read-only, named** Cypher. Agents choose a
+query by name and supply arguments; they never author Cypher. Two queries carry the chain work:
 
 - **Secret-reachability** — `(:Finding)-[:YIELDS]->(:Secret)-[:UNLOCKS]->(:Endpoint)`,
   which surfaces "a confirmed finding produced material that opens a surface we have not
@@ -439,19 +469,9 @@ into the threat-model hypothesis queue — that is the graph closing the loop.
 
 ## 9. Langfuse — observability and the trace spine
 
-Instrumented through OpenTelemetry so every model call and tool call is captured without
-threading a logger through the orchestrator:
-
-```ts
-const sdk = new NodeSDK({ spanProcessors: [new LangfuseSpanProcessor()] });
-sdk.start();
-
-const client = observeOpenAI(
-  new OpenAI({ baseURL: process.env.SAGEMAKER_GLM_ENDPOINT_URL, apiKey: engagementKey })
-);
-// ... run the beat ...
-await sdk.shutdown();   // REQUIRED: batched spans are lost at exit otherwise
-```
+`NodeSDK` + `LangfuseSpanProcessor` + `observeOpenAI` (see the appendix) capture every model
+and tool call without threading a logger through the orchestrator. `sdk.shutdown()` is
+required — batched spans are lost at exit otherwise.
 
 | Level | Span |
 |---|---|
@@ -476,16 +496,12 @@ internally consistent:
 4. `provenance.sandbox_id` and `provenance.exit_code`.
 5. `provenance.langfuse_trace_id` resolving to a real trace.
 
-Anything missing or inconsistent → `NEEDS_REVIEW`.
-
-Note that this is **deliberately stricter than the schema**: `finding.schema.json` only
-*requires* `utc`, `stdout_sha256` and `sandbox_id`. The gate additionally demands
-`langfuse_trace_id`, `exploit_request_hash` and `exit_code` — a record can be schema-valid
-and still fail the gate. The schema defines a well-formed finding; the gate defines a
-believable one. The gate exists to prevent one specific
-and well-documented failure mode: **placeholder or model-generated text being mistaken for
-real tool output.** A finding whose evidence cannot be traced back to a hashed artifact
-produced by a recorded command did not happen.
+Anything missing or inconsistent → `NEEDS_REVIEW`. This is **deliberately stricter than the
+schema**, which only *requires* `utc`, `stdout_sha256` and `sandbox_id`: a record can be
+schema-valid and still fail the gate. The schema defines a well-formed finding; the gate
+defines a believable one. It exists to prevent one failure mode — **placeholder or
+model-generated text mistaken for real tool output.** A finding whose evidence cannot be
+traced to a hashed artifact produced by a recorded command did not happen.
 
 ### 10.1 The learning loop
 
@@ -497,39 +513,27 @@ imagined evidence.
 
 ---
 
-## 11. Security and isolation
+## 11. Security, isolation, reliability
 
-- **Untrusted target by definition.** Every execution happens in an ephemeral container with
-  no route to internal networks and no orchestrator credentials mounted.
-- **Credentials.** Under `prod`, SageMaker access is a short-lived, per-engagement credential
-  issued by the AI Gateway from a scoped IAM role. Under `test`, it is `OPENROUTER_API_KEY`.
-  Either way: never hardcoded, never in the workspace, never in a trace.
-- **Profile is a scope decision.** `test` routes engagement traffic through a third party. Only
-  targets whose rules of engagement permit that may run under it (§4.1).
-- **MCP servers** are version-pinned and audited; custom verification tools are preferred over
-  third-party plugins; each runs least-privilege and scoped to the engagement target.
-- **Secrets never materialise** in prompts, the graph, traces, or reports — only
-  `{{secret:ref}}` handles. Resolution happens inside the sandbox at execution time.
-- **Blast radius.** The exploit sandbox is disposable; mutations are restored and the
-  restoration is verified before the finding is closed.
+The harness is pointed at hostile input by definition, and the SDK defaults are wrong for this
+workload. Both are handled by explicit settings, not by convention.
 
----
-
-## 12. Reliability
-
-The SDK defaults are wrong for this workload and must be overridden explicitly:
-
-| Concern | Setting |
+| Concern | Position |
 |---|---|
-| Timeout | Default is 10 minutes. Set a multi-hour `timeout` for long dynamic sequences, wrapped in an orchestrator `AbortSignal` that trips first |
-| Retries | Default is 2 with exponential backoff. Keep retries for transport errors; set `maxRetries: 0` on any call whose tool execution is **not** idempotent |
-| Streaming | Treat streamed content as progress, not as data of record. The terminal non-streamed response object is the source of truth |
-| Budget | Read `usage` off every completion. The ceiling is **tokens and turns** — both profiles report those. USD is derived only when the profile supplies a price, so a self-hosted endpoint reporting `cost: 0` cannot silently disable the stop |
-| Idempotence | Every tool is designed to be safely re-run, because retries and replays both re-run it |
+| Execution | Ephemeral container per agent/iteration; no route to internal networks, no orchestrator credentials mounted, disposable after the beat |
+| Credentials | `prod`: short-lived per-engagement credential from the AI Gateway. `test`: `OPENROUTER_API_KEY`. Never hardcoded, never in the workspace, never in a trace |
+| Profile as scope | `test` routes engagement traffic through a third party — permitted only where the RoE allows it (§4.1) |
+| Secrets | Only `{{secret:ref}}` handles in prompts, graph, traces and reports; resolved inside the sandbox at execution time |
+| MCP | Version-pinned and audited; custom tools preferred over third-party plugins; least-privilege, scoped to the target |
+| Blast radius | Mutations restored and the restoration verified before a finding closes |
+| Timeout | SDK default 600 000 ms is far too short. `SAHW_REQUEST_TIMEOUT_MS`, with the orchestrator `AbortSignal` tripping **first** (§5.4) |
+| Retries | SDK default is 2. `SAHW_MAX_RETRIES=0` — the orchestrator owns retry policy, since a retried tool call re-executes against the target |
+| Streaming | Progress only. The terminal non-streamed response is the data of record |
+| Budget | `usage` per completion; ceilings in **tokens and turns**, USD only where the profile is priced, so `cost: 0` cannot disable the stop |
 
 ---
 
-## 13. Benchmark harness
+## 12. Benchmark harness
 
 Runs **after** the engagement, outside every agent context. It reads the pipeline's
 `CONFIRMED` findings and chains, joins them to `docs/bench/human-test-benchmark.md`, writes
@@ -548,7 +552,7 @@ is counted as a false positive.
 
 ---
 
-## 14. Roadmap
+## 13. Roadmap
 
 Phases are gated on benchmark milestones, not on calendar time.
 
@@ -561,7 +565,7 @@ Phases are gated on benchmark milestones, not on calendar time.
 
 ---
 
-## 15. Appendix — client and a capability-bounded call
+## 14. Appendix — client and a capability-bounded call
 
 ```ts
 import OpenAI from "openai";
@@ -572,32 +576,17 @@ import { observeOpenAI } from "@langfuse/openai";
 const sdk = new NodeSDK({ spanProcessors: [new LangfuseSpanProcessor()] });
 sdk.start();
 
-// One client, two profiles. Nothing below this line knows which provider is live.
-const PROFILES = {
-  test: {                                     // building and testing, today
-    baseURL: "https://openrouter.ai/api/v1",
-    apiKey:  process.env.OPENROUTER_API_KEY,
-    models:  { REASONING_MODEL: process.env.OR_REASONING, FAST_MODEL: process.env.OR_FAST },
-    pricedPerToken: true,                     // real USD → maxBudgetUsd is meaningful
-  },
-  prod: {                                     // self-hosted, later
-    baseURL: process.env.SAGEMAKER_GLM_ENDPOINT_URL,   // https://<endpoint>/openai/v1
-    apiKey:  await gateway.issueEngagementCredential(engagementId),  // short-lived
-    models:  { REASONING_MODEL: "glm-5.3", FAST_MODEL: "glm-5.3" },
-    pricedPerToken: false,                    // endpoint bills for uptime → token/turn ceilings
-  },
-} as const;
-
-const profile = PROFILES[process.env.SAHW_PROFILE ?? "test"];
+// One client, two profiles (§4.1). Nothing below this line knows which provider is live.
+const profile = resolveProfile(process.env.SAHW_PROFILE ?? "test");  // baseURL, key, models, pricedPerToken
 
 const client = observeOpenAI(
   new OpenAI({
     baseURL: profile.baseURL,
     apiKey:  profile.apiKey,
-    timeout: 60 * 60 * 1000,                  // default is 10 min — far too short
-    maxRetries: 0,                            // orchestrator owns retry policy
+    timeout: Number(process.env.SAHW_REQUEST_TIMEOUT_MS),  // SDK default 600_000 is too short
+    maxRetries: Number(process.env.SAHW_MAX_RETRIES),      // 0 — orchestrator owns retries
   }),
-  { traceName: "sahw-beat", sessionId: engagementId, tags: [process.env.SAHW_PROFILE ?? "test"] }
+  { traceName: "sahw-beat", sessionId: engagementId, tags: [profile.name] }
 );
 
 // The adjudicator's capability boundary IS this tools array.
@@ -622,15 +611,13 @@ await sdk.shutdown();   // flush batched spans
 
 ## Changelog
 
-**v2 (this document)** replaces v1, which ran on the OpenCode SDK (`@opencode-ai/sdk`) with
-OpenRouter routing and an `opencode.json` config. That config file is deleted and the agent
-frontmatter has been rewritten from OpenCode's schema (`mode`, `permission`, tool toggles) to
-the OpenAI SDK request shape (`tools`, `skills`, `sandbox`). The *target, hard constraints,
-prompts, skills and artifact schemas are unchanged* — only the runtime moved.
-
-Note that OpenRouter is **not** gone: v1 used it as the primary router, and v2 keeps it as the
-`test` provider profile (§4.1) while SageMaker GLM 5.3 becomes the `prod` target. What v1 got
-wrong was binding the *runtime* to OpenCode, not the choice of router.
+**v2 (this document)** replaces v1, which ran on the OpenCode SDK (`@opencode-ai/sdk`) with an
+`opencode.json` config. That file is deleted and the agent frontmatter is rewritten from
+OpenCode's schema (`mode`, `permission`, tool toggles) to the OpenAI SDK request shape
+(`tools`, `skills`, `sandbox`). Target, hard constraints, prompts, skills and artifact schemas
+are unchanged — only the runtime moved. OpenRouter is **not** gone: v1 used it as the primary
+router, v2 keeps it as the `test` profile (§4.1). What v1 got wrong was binding the *runtime*
+to OpenCode, not the choice of router.
 
 ---
 
