@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession } from "../src/beat.js";
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
@@ -1515,4 +1515,23 @@ test("registration phase: a later beat RE-REGISTERS from the persisted recipe be
   assert.ok(fetchedUrls.includes(SIGNUP_INTEL.signup_url), "beat 2 MUST re-register from the recipe — stale spine metadata carries no live token");
   assert.ok(sessions2.allMeta().length >= 1, "beat 2's own live session store must gain live account(s) this beat");
   assert.ok(sessions2.allMeta().some((m) => m.has_auth_material), "the re-registered session must carry a live token this beat");
+});
+
+test("buildRunSession: every beat of the SAME run shares ONE session id (run-stable, not per-beat) so a run is one Langfuse timeline", () => {
+  const scope = [new URL("http://10.0.0.1:3000")];
+  const runId = "authcont-1790168108";
+  // Two beats of the SAME run, started ~8 minutes apart.
+  const beatA = buildRunSession({ scope, runId, now: new Date("2026-09-23T15:16:54Z") });
+  const beatB = buildRunSession({ scope, runId, now: new Date("2026-09-23T15:24:31Z") });
+  assert.equal(beatA.sessionId, beatB.sessionId, "beats of one run must not fragment into separate sessions");
+  assert.equal(beatA.codename, beatB.codename);
+  // The per-beat start time is still distinct (used for the beat record), even though
+  // the session id is shared.
+  assert.notEqual(beatA.startedUtc, beatB.startedUtc);
+  // A DIFFERENT run gets a DIFFERENT session.
+  const otherRun = buildRunSession({ scope, runId: "authcont-1790170000", now: new Date("2026-09-23T15:16:54Z") });
+  assert.notEqual(otherRun.sessionId, beatA.sessionId);
+  // An explicit override still wins.
+  const forced = buildRunSession({ scope, runId, now: new Date(), override: "my-session" });
+  assert.equal(forced.sessionId, "my-session");
 });

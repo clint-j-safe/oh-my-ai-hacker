@@ -473,7 +473,18 @@ function codenameFor(runId: string): string {
 export function buildRunSession(opts: {
   scope: URL[]; runId: string; now: Date; override?: string;
 }): { sessionId: string; runId: string; codename: string; startedUtc: string } {
-  const t = opts.now.toISOString();                       // 2026-09-22T08:07:15.123Z
+  // The session id must be STABLE across every beat of one run, or each beat lands
+  // in its own ~8-minute Langfuse session and the run cannot be watched as a single
+  // timeline. The bug: the timestamp below was taken from `now` (the per-beat start),
+  // so a 20-beat run fragmented into 20 sessions that only shared a codename. The fix:
+  // derive the timestamp from the RUN itself — the epoch embedded in the run id
+  // (authloop sets SAHW_RUN_ID=authcont-<epoch>, identical for every beat) — so all
+  // beats collapse into one session. codename and tail were already run-stable.
+  const epoch = opts.runId.match(/(\d{9,13})/);
+  const runStart = epoch
+    ? new Date(Number(epoch[1]) * (epoch[1].length <= 10 ? 1000 : 1))
+    : opts.now;                                           // no epoch in the id -> best effort
+  const t = runStart.toISOString();                       // 2026-09-22T08:07:15.123Z (RUN start)
   const stamp = `${t.slice(0, 10).replace(/-/g, "")}-${t.slice(11, 19).replace(/:/g, "")}Z`;
   const host = opts.scope[0]?.hostname ?? "unknown-target";
   const codename = codenameFor(opts.runId);
@@ -485,7 +496,9 @@ export function buildRunSession(opts: {
     sessionId: opts.override?.trim() || `sahw-${host}-${stamp}-${codename}-${tail}`,
     runId: opts.runId,
     codename,
-    startedUtc: t,
+    // The BEAT's own start time (per-beat), used for the beat record — distinct from
+    // the run-stable timestamp baked into sessionId above.
+    startedUtc: opts.now.toISOString(),
   };
 }
 
