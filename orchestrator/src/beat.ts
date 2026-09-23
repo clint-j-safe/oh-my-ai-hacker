@@ -635,7 +635,14 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
   // registered a tokenless account therefore still re-enters this phase.
   const usable = (metas: { has_auth_material: boolean }[]): number =>
     metas.filter((m) => m.has_auth_material).length;
-  if (usable(spine.sessions) >= 2) return;
+  // Do NOT gate on spine.sessions: that is cross-beat METADATA (label +
+  // has_auth_material), never a live token — auth material lives only in-process for
+  // the beat that minted it (session.ts), so at the start of THIS beat the runner's
+  // SessionStore is always empty regardless of how many "usable" sessions the spine
+  // records. Gating on stale spine metadata was making a beat skip re-registration
+  // and then try to use a session label with no token behind it. The only thing
+  // worth persisting across beats is the RECIPE (recovered_intel), which lets this
+  // phase mint FRESH live tokens here, every beat, at zero model cost.
   if (openAuthenticatedClasses(spine.proved).length === 0) return;
   const flow = discoveredSignupFlow(spine.recovered_intel);
   if (!flow) return;

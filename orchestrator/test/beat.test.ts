@@ -1412,7 +1412,7 @@ test("registration phase: when the signup flow is NOT yet known, no blind regist
   assert.match(systemPrompt, /register_account/);
 });
 
-test("registration phase regression: once 2 accounts already exist for this engagement, a later beat does not re-register even though the signup flow is still known", async () => {
+test("registration phase: a later beat RE-REGISTERS from the persisted recipe because live tokens never persist across beats (only metadata does)", async () => {
   const env = await ENV();
   const reconUrl = "http://10.0.0.1:3000/recon";
 
@@ -1447,8 +1447,11 @@ test("registration phase regression: once 2 accounts already exist for this enga
   const spineAfterBeat1 = JSON.parse(raw);
   assert.equal(spineAfterBeat1.sessions.length, 2, "sanity: beat 1 must have registered both accounts into the spine");
 
-  // Beat 2: 2 accounts already known in the spine — the trigger condition itself
-  // must gate this off, even though recovered_intel still carries the flow.
+  // Beat 2: the spine records 2 "usable" sessions from beat 1, but those are
+  // METADATA only — the tokens lived in beat 1's in-process store and are gone. So
+  // beat 2, starting with a FRESH live session store, MUST re-register from the
+  // persisted recipe to obtain live tokens for THIS beat. Gating on the stale spine
+  // metadata (the old behavior) left the beat with session labels and no tokens.
   const fetchedUrls: string[] = [];
   const spyFetch = (async (u: string | URL) => {
     const s = String(u);
@@ -1464,6 +1467,7 @@ test("registration phase regression: once 2 accounts already exist for this enga
     env: { ...env, SAHW_CLAIM_REVIEW: "off" },
     client: recordingScriptedClient(script2), fetchImpl: spyFetch, now: NOW, sessionStore: sessions2,
   });
-  assert.ok(!fetchedUrls.includes(SIGNUP_INTEL.signup_url), "must not re-register once 2 accounts already exist for this engagement");
-  assert.equal(sessions2.allMeta().length, 0, "beat 2's own live session store must gain no new accounts");
+  assert.ok(fetchedUrls.includes(SIGNUP_INTEL.signup_url), "beat 2 MUST re-register from the recipe — stale spine metadata carries no live token");
+  assert.ok(sessions2.allMeta().length >= 1, "beat 2's own live session store must gain live account(s) this beat");
+  assert.ok(sessions2.allMeta().some((m) => m.has_auth_material), "the re-registered session must carry a live token this beat");
 });
