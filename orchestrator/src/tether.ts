@@ -250,6 +250,7 @@ export const SKILL_EGRESS: Readonly<Record<string, SkillEgress>> = Object.freeze
   "stall-ambiguity-resolution": "none",
   "technique-combinator": "none",
   "token-session-forensics": "none",
+  "payload-library": "none",   // pure file lookup over the shipped wordlists/payloads; no network
 
   // -- target: run.py itself (or a subprocess it drives) contacts the engagement target --
   "account-role-acquisition": "target",

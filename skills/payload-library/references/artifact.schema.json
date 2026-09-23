@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload-library artifact",
+  "type": "object",
+  "required": ["payloads", "vuln_class", "count", "meta"],
+  "additionalProperties": true,
+  "properties": {
+    "vuln_class": { "type": "string" },
+    "technique": { "type": "string" },
+    "count": { "type": "integer", "minimum": 0 },
+    "payloads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["value", "note"],
+        "additionalProperties": true,
+        "properties": {
+          "value": { "type": "string", "description": "The payload/probe string to send (fill into the target's parameter)." },
+          "note": { "type": "string", "description": "What signal to look for in the response if this hits." },
+          "technique": { "type": "string" }
+        }
+      }
+    },
+    "sources": { "type": "array", "items": { "type": "string" } },
+    "usage": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "required": ["skill", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "skill": { "type": "string" },
+        "status": { "enum": ["ok", "error"] },
+        "generated_at": { "type": "string" }
+      }
+    }
+  }
+}

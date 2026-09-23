@@ -37,7 +37,13 @@ export type { VulnClass };
 // which stays denied until the declared-egress mechanism (see the TODO in tether.ts)
 // exists. Widening this list is a one-line change PROVIDED the new skill's own egress
 // classification is "none" — gate() enforces that independently either way.
-export const HUNTER_SKILL_ALLOWLIST = ["adversarial-self-review", "severity-calibration"] as const;
+export const HUNTER_SKILL_ALLOWLIST = [
+  "adversarial-self-review", "severity-calibration",
+  // Queryable arsenal (none-egress, pure file lookup): the hunter pulls TARGETED
+  // payloads/wordlist entries for the class it is testing instead of guessing, then
+  // fires them via http_request — cheap-probe-first, escalate-on-signal.
+  "payload-library",
+] as const;
 
 export interface RejectedClaim {
   raw: unknown;
