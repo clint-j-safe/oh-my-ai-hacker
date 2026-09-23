@@ -14,10 +14,10 @@ import { initObservability, type FindingRow } from "./obs/index.js";
 import { VULN_CLASSES, isVulnClass, type VulnClass } from "./vuln-classes.js";
 import {
   loadSpine, saveSpine, updateSpine,
-  type SpineEndpoint, type ProvedEntry, type AttemptedEntry, type RecoveredIntel,
+  type Spine, type SpineEndpoint, type ProvedEntry, type AttemptedEntry, type RecoveredIntel,
   type SpineBeatRecord,
 } from "./spine.js";
-import { buildHunterBrief } from "./brief.js";
+import { buildHunterBrief, openAuthenticatedClasses } from "./brief.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -548,6 +548,96 @@ function inferRecoveredIntel(scopeOrigins: string[], endpoints: SpineEndpoint[])
   return intel;
 }
 
+// ---- Registration phase: "make it a beat PHASE, not an optional tool" ----------
+//
+// OBSERVED PROBLEM this section exists to fix: across real host beats,
+// register_account was never called — accounts=0 in the spine every time — so
+// every authenticated finding (idor, change-password, negative-transfer
+// business_logic, jwt, otp, ...) was structurally unreachable. Describing the
+// capability in the brief's <tool_guidance> was not enough (same lesson as
+// skill_run before it): a capability the loop should reliably use belongs in the
+// FLOW, not just the toolbox. See AUTHENTICATED_VULN_CLASSES in brief.ts for the
+// (security-domain, non-benchmark) judgment of which classes need a session.
+
+const SIGNUP_FLOW_INTEL_KEYS = [
+  "signup_url", "signup_method", "signup_body_template", "signup_response_token_path",
+  "login_url", "login_method", "login_body_template", "login_response_token_path",
+  "auth_header_name",
+] as const;
+
+type SignupFlowArgs = Record<(typeof SIGNUP_FLOW_INTEL_KEYS)[number], string>;
+
+/**
+ * Reads register_account's own required inputs back out of recovered_intel, under
+ * the SAME generic key names register_account's tool schema already uses
+ * (tools.ts) — never a target-specific literal hardcoded here; every value, if
+ * present at all, arrived at runtime from a PRIOR beat's own discovery (see
+ * brief.ts's <account_objective>, which tells the hunter to attach these exact
+ * keys). Returns null when the flow has not been discovered yet — the minimum
+ * bar is register_account's own contract (tools.ts: signup_url and
+ * auth_header_name are required, and a body template that cannot fill/parse
+ * throws invalid_argument there anyway), so anything short of that is "not yet
+ * known", not a malformed call worth attempting.
+ */
+function discoveredSignupFlow(intel: RecoveredIntel): SignupFlowArgs | null {
+  const str = (k: string): string => {
+    const v = (intel as Record<string, unknown>)[k];
+    return typeof v === "string" ? v.trim() : "";
+  };
+  const signup_url = str("signup_url");
+  const signup_body_template = str("signup_body_template");
+  const auth_header_name = str("auth_header_name");
+  if (!signup_url || !signup_body_template || !auth_header_name) return null;
+  return {
+    signup_url,
+    signup_method: str("signup_method") || "POST",
+    signup_body_template,
+    signup_response_token_path: str("signup_response_token_path"),
+    login_url: str("login_url"),
+    login_method: str("login_method") || "POST",
+    login_body_template: str("login_body_template"),
+    login_response_token_path: str("login_response_token_path"),
+    auth_header_name,
+  };
+}
+
+/**
+ * THE DETERMINISTIC HALF of the registration phase. Runs ONCE, before the hunter
+ * ever sees a system prompt this beat, using ONLY what a PRIOR beat already
+ * recorded in the spine. Three ways it can end:
+ *   - already have >=2 accounts, or no open vuln_class needs one: no-op (the
+ *     trigger conditions below are the ONLY gate — see the task's brief).
+ *   - the signup/login flow is already known (discoveredSignupFlow found it):
+ *     call register_account directly through the SAME Tether-gated ToolRunner
+ *     path the hunter itself would use, up to 2 accounts, stopping at the first
+ *     denial/failure — never retried blindly (a policy denial or a cap hit will
+ *     fail identically on a retry; see tools.ts's ToolFailureKind doc).
+ *   - the flow is NOT yet known: nothing is called here. Forcing a BLIND
+ *     registration is impossible by construction — register_account's own
+ *     contract requires a discovered signup_url/envelope/token-path (tools.ts).
+ *     brief.ts's <account_objective> directive carries the load instead, making
+ *     discovery + registration this beat's primary objective for the model to
+ *     pursue itself, through recon + register_account.
+ * Never throws: a register_account failure here is exactly as legitimate an
+ * outcome as the hunter's own attempt failing, and must not abort the beat.
+ */
+async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<void> {
+  if (spine.sessions.length >= 2) return;
+  if (openAuthenticatedClasses(spine.proved).length === 0) return;
+  const flow = discoveredSignupFlow(spine.recovered_intel);
+  if (!flow) return;
+  for (let i = 0; i < 2; i++) {
+    if (runner.getSessionMeta().length >= 2) break;
+    let result;
+    try {
+      result = await runner.execute("register_account", { ...flow });
+    } catch {
+      break;
+    }
+    if (!result.ok) break;
+  }
+}
+
 export async function runBeat(opts: {
   env: Record<string, string | undefined>;
   client: MinimalClient;
@@ -610,6 +700,13 @@ export async function runBeat(opts: {
   // same posture as loadEngagement above.
   const spineLoad = await loadSpine({ workspace, authRef: engagement.authRef, scopeOrigins });
 
+  // Registration phase (deterministic half) — runs BEFORE the brief is built so
+  // the brief always reflects POST-registration state this beat, never the
+  // spine's stale pre-registration account count. See runRegistrationPhase's own
+  // doc comment above for the full trigger/outcome contract.
+  await runRegistrationPhase(runner, spineLoad.spine);
+  const sessionsThisBeat = runner.getSessionMeta().length;
+
   // GENERATED FROM STATE, AS XML. Built once, from the spine as loaded — the
   // conversation's system message is only set on the FIRST runAgent call of the
   // beat (see agent.ts: system/user are ignored once `messages` is supplied), so
@@ -622,6 +719,7 @@ export async function runBeat(opts: {
     attempted: spineLoad.spine.attempted,
     turnsRemaining: engagement.maxTurns,
     findingsRemaining: maxFindings,
+    sessionsCount: sessionsThisBeat,
   });
 
   try {

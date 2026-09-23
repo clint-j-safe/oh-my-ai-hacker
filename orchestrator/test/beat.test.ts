@@ -1240,3 +1240,195 @@ test("a session created during a beat is persisted to the spine as label-only me
   // ...and the token must NOT be anywhere in the written file.
   assert.ok(!/TOKEN-A/.test(raw), "the auth token must never be written to the spine");
 });
+
+// ---- Registration phase (Task: "registration is a beat PHASE, not an optional tool") --
+//
+// OBSERVED PROBLEM: register_account was never called across real beats — accounts=0
+// every time — so every authenticated finding (idor, business_logic, jwt, ...) was
+// unreachable, even though register_account itself worked and the brief described it.
+// The fix has two halves, both exercised here:
+//   (a) buildHunterBrief's <account_objective> imperatively names registration THIS
+//       BEAT'S FIRST PRIORITY whenever fewer than 2 accounts are known and an
+//       AUTHENTICATED_VULN_CLASSES member is still open — and drops that directive
+//       once 2 accounts exist.
+//   (b) beat.ts's runRegistrationPhase calls register_account ITSELF, through the
+//       same Tether-gated ToolRunner path, BEFORE the hunter's first turn, whenever a
+//       prior beat's recovered_intel already carries a discovered signup flow.
+
+const SIGNUP_INTEL = {
+  signup_url: "http://10.0.0.1:3000/api/signup",
+  signup_method: "POST",
+  signup_body_template: '{"user":{"username":"{{username}}","email":"{{email}}","password":"{{password}}"}}',
+  signup_response_token_path: "token",
+  login_url: "",
+  login_method: "POST",
+  login_body_template: "",
+  login_response_token_path: "",
+  auth_header_name: "Authorization",
+};
+
+test("brief: 0 sessions + open authenticated classes -> <account_objective> imperatively names registration this beat's FIRST PRIORITY", () => {
+  const state: HunterBriefState = { ...BRIEF_EMPTY_STATE, sessionsCount: 0, proved: [] };
+  const xml = buildHunterBrief(state);
+  const section = briefSection(xml, "account_objective");
+  assert.match(section, /FIRST PRIORITY/, "must be imperative, not merely descriptive");
+  assert.match(section, /register(ing)?\s+TWO\s+disposable\s+accounts/i);
+  assert.match(section, /register_account/);
+  // Names at least the classes this module judges to require a session.
+  assert.match(section, /idor/);
+});
+
+test("brief: 2 sessions already known -> <account_objective> DROPS the registration directive and pushes authenticated-class coverage instead", () => {
+  const state: HunterBriefState = { ...BRIEF_EMPTY_STATE, sessionsCount: 2, proved: [] };
+  const xml = buildHunterBrief(state);
+  const section = briefSection(xml, "account_objective");
+  assert.doesNotMatch(section, /FIRST PRIORITY/i, "the directive must be gone once 2 accounts exist");
+  assert.doesNotMatch(section, /register_account/i);
+  assert.match(section, /existing session labels/i, "must push the hunter toward using the sessions already on hand");
+});
+
+test("brief: no open authenticated class -> <account_objective> drops the directive even at 0 sessions", () => {
+  const state: HunterBriefState = {
+    ...BRIEF_EMPTY_STATE, sessionsCount: 0,
+    proved: [
+      { vuln_class: "idor", endpoint: "x", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" },
+      { vuln_class: "business_logic", endpoint: "x", invariant_type: "state_changed", verdict: "CONFIRMED", finding_id: "SAHW-2" },
+      { vuln_class: "auth_bypass", endpoint: "x", invariant_type: "status_in", verdict: "CONFIRMED", finding_id: "SAHW-3" },
+      { vuln_class: "jwt_weak_key", endpoint: "x", invariant_type: "derived", verdict: "CONFIRMED", finding_id: "SAHW-4" },
+      { vuln_class: "improper_session_invalidation", endpoint: "x", invariant_type: "response_asserted", verdict: "CONFIRMED", finding_id: "SAHW-5" },
+      { vuln_class: "deserialization_rce", endpoint: "x", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-6" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const section = briefSection(xml, "account_objective");
+  assert.doesNotMatch(section, /FIRST PRIORITY/i, "every authenticated class is already proved — nothing left to gate registration on");
+});
+
+test("registration phase: when the signup flow is already known from a prior beat's recovered_intel, the orchestrator calls register_account deterministically, twice, before the hunter's own turn", async () => {
+  const env = await ENV();
+  const reconUrl = "http://10.0.0.1:3000/recon";
+
+  // Beat 1: the hunter recovers the signup flow and attaches it under "intel"
+  // using EXACTLY the generic key names discoveredSignupFlow() (beat.ts) reads
+  // back out — mirroring register_account's own tool-schema field names.
+  const script1 = [
+    call("http_request", { method: "GET", url: reconUrl }),
+    say(JSON.stringify({ ...claim("clickjacking", reconUrl), intel: SIGNUP_INTEL })),
+    say("Nothing else to report."),
+  ];
+  const first = await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script1), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(first.findings.length, 1, "sanity: beat 1 banked the intel-carrying claim");
+
+  // Beat 2, SAME engagement/workspace: the model's own script here NEVER calls
+  // register_account or even mentions it — the ONLY way a request can reach
+  // SIGNUP_INTEL.signup_url is the orchestrator's own deterministic phase.
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    const s = String(u);
+    fetchedUrls.push(s);
+    if (s === SIGNUP_INTEL.signup_url) {
+      return new Response(JSON.stringify({ token: "DETERMINISTIC-TOKEN" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  const script2 = [
+    call("http_request", { method: "GET", url: reconUrl }),
+    say("Nothing else to report."),
+  ];
+  await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script2), fetchImpl: spyFetch, now: NOW, sessionStore: sessions,
+  });
+
+  const signupCalls = fetchedUrls.filter((u) => u === SIGNUP_INTEL.signup_url).length;
+  assert.equal(signupCalls, 2, "the orchestrator itself must call register_account twice (A then B) via the discovered flow");
+  assert.equal(sessions.allMeta().length, 2);
+  assert.ok(sessions.allMeta().every((m) => m.has_auth_material), "both deterministically-created sessions must have obtained auth material");
+  assert.deepEqual(sessions.labels(), ["A", "B"]);
+});
+
+test("registration phase: when the signup flow is NOT yet known, no blind registration is attempted, and the brief carries the discovery directive instead", async () => {
+  const url = "http://10.0.0.1:3000/recon";
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    fetchedUrls.push(String(u));
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say("Nothing else to report."),
+  ];
+  const client = recordingScriptedClient(script);
+  await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client, fetchImpl: spyFetch, now: NOW, sessionStore: sessions,
+  });
+  assert.equal(sessions.allMeta().length, 0, "no account may be created without a discovered signup flow — blind registration is impossible by construction");
+  assert.deepEqual(fetchedUrls, [url], "only the hunter's own recon call may reach fetch — no forced/blind signup attempt");
+  const systemPrompt = client.seen[0]?.messages?.[0]?.content as string;
+  assert.match(systemPrompt, /FIRST PRIORITY/, "the brief must carry the discovery+registration directive instead");
+  assert.match(systemPrompt, /register_account/);
+});
+
+test("registration phase regression: once 2 accounts already exist for this engagement, a later beat does not re-register even though the signup flow is still known", async () => {
+  const env = await ENV();
+  const reconUrl = "http://10.0.0.1:3000/recon";
+
+  // Beat 0: seed recovered_intel with the discovered signup flow (no registration
+  // yet — the flow was not known at the START of this beat).
+  const script0 = [
+    call("http_request", { method: "GET", url: reconUrl }),
+    say(JSON.stringify({ ...claim("clickjacking", reconUrl), intel: SIGNUP_INTEL })),
+    say("Nothing else to report."),
+  ];
+  await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script0), fetchImpl: bareFetch, now: NOW,
+  });
+
+  const signupFetch = (async (u: string | URL) => {
+    const s = String(u);
+    if (s === SIGNUP_INTEL.signup_url) {
+      return new Response(JSON.stringify({ token: "TOK" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+
+  // Beat 1: the flow is now known -> the deterministic phase registers A and B.
+  const script1 = [call("http_request", { method: "GET", url: reconUrl }), say("Nothing else to report.")];
+  await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script1), fetchImpl: signupFetch, now: NOW,
+    sessionStore: new SessionStore({ maxAccounts: 2 }),
+  });
+  const raw = await readFile(join(env.SAHW_WORKSPACE!, "spine", "progress.json"), "utf8");
+  const spineAfterBeat1 = JSON.parse(raw);
+  assert.equal(spineAfterBeat1.sessions.length, 2, "sanity: beat 1 must have registered both accounts into the spine");
+
+  // Beat 2: 2 accounts already known in the spine — the trigger condition itself
+  // must gate this off, even though recovered_intel still carries the flow.
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    const s = String(u);
+    fetchedUrls.push(s);
+    if (s === SIGNUP_INTEL.signup_url) {
+      return new Response(JSON.stringify({ token: "TOK-3" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const script2 = [call("http_request", { method: "GET", url: reconUrl }), say("Nothing else to report.")];
+  const sessions2 = new SessionStore({ maxAccounts: 2 });
+  await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script2), fetchImpl: spyFetch, now: NOW, sessionStore: sessions2,
+  });
+  assert.ok(!fetchedUrls.includes(SIGNUP_INTEL.signup_url), "must not re-register once 2 accounts already exist for this engagement");
+  assert.equal(sessions2.allMeta().length, 0, "beat 2's own live session store must gain no new accounts");
+});

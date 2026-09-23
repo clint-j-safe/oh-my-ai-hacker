@@ -1,5 +1,47 @@
-import { VULN_CLASSES } from "./vuln-classes.js";
+import { VULN_CLASSES, type VulnClass } from "./vuln-classes.js";
 import type { AttemptedEntry, ProvedEntry, RecoveredIntel, SpineEndpoint } from "./spine.js";
+
+/**
+ * SECURITY-DOMAIN JUDGMENT, not read from the benchmark's answer key (that would
+ * read the scoring data — forbidden; see the black-box rule). This is a small,
+ * defensible, GENERIC call about which VULN_CLASSES vocabulary members are
+ * INHERENTLY authenticated — i.e. their mechanism cannot be meaningfully proved
+ * without at least one established session, and for idor specifically, two
+ * distinct ones (a resource owner and an accessor). Ordinary web-security testing
+ * practice, not this engagement's specifics, is what justifies each entry:
+ *   idor                          cross-user access — needs two distinct sessions
+ *                                 by construction (one to create, one to access).
+ *   business_logic                a financial/authorization rule almost always
+ *                                 gates on an account (transfer, balance, order).
+ *   auth_bypass                   proving a BYPASS needs a legitimate session as
+ *                                 the baseline the bypass circumvents.
+ *   jwt_weak_key                  there is no JWT to attack until one is issued,
+ *                                 which happens at login.
+ *   improper_session_invalidation there is nothing to invalidate without a
+ *                                 session existing in the first place.
+ *   deserialization_rce           commonly reached through an authenticated
+ *                                 endpoint (profile/upload/settings), unlike the
+ *                                 other injection classes which are frequently
+ *                                 reachable pre-auth.
+ * Deliberately LEFT OUT even though they touch registration: disposable_email_
+ * accepted, weak_password_policy, user_enumeration. Those are proved by PROBING
+ * the signup/login flow itself, not by USING an already-established session
+ * afterward — so they do not belong in a "need an account first" set, and
+ * including them would falsely gate the registration phase on classes that don't
+ * actually need it.
+ */
+export const AUTHENTICATED_VULN_CLASSES: readonly VulnClass[] = [
+  "idor", "business_logic", "auth_bypass", "jwt_weak_key",
+  "improper_session_invalidation", "deserialization_rce",
+];
+
+/** AUTHENTICATED_VULN_CLASSES minus whatever is already proved anywhere in this
+ * engagement — the set a registration phase (beat.ts) or this brief's
+ * <account_objective> section should actually still care about. */
+export function openAuthenticatedClasses(proved: ProvedEntry[]): VulnClass[] {
+  const provedSet = new Set(proved.map((p) => p.vuln_class));
+  return AUTHENTICATED_VULN_CLASSES.filter((c) => !provedSet.has(c));
+}
 
 /**
  * THE HUNTER BRIEF — the system prompt, GENERATED from the Spine every beat.
@@ -33,6 +75,16 @@ export interface HunterBriefState {
   attempted: AttemptedEntry[];
   turnsRemaining: number;
   findingsRemaining: number;
+  /** Accounts already known for this engagement THIS beat (post any deterministic
+   * registration beat.ts already performed before building this brief — see
+   * runRegistrationPhase there). Never the spine's stale pre-registration count:
+   * beat.ts computes this from the live ToolRunner/SessionStore AFTER attempting
+   * registration, so the directive below always reflects what the hunter can
+   * actually see this beat (e.g. via a prior register_account call it can still
+   * reference by label). Optional (defaults to 0, "no accounts known yet") so an
+   * existing caller/test that predates this field still compiles and renders
+   * sensibly. */
+  sessionsCount?: number;
 }
 
 function esc(v: unknown): string {
@@ -368,6 +420,61 @@ function renderCoverageGoal(proved: ProvedEntry[]): string {
   ].join("\n");
 }
 
+/**
+ * <account_objective> — makes registration a PHASE, not a tool the model may
+ * ignore (this is the whole point of this section; see beat.ts's
+ * runRegistrationPhase for the deterministic half of the same fix). Two states,
+ * driven purely by spine-derived facts passed in from beat.ts — never a literal
+ * target value:
+ *   - fewer than 2 accounts known AND at least one AUTHENTICATED_VULN_CLASSES
+ *     member is still open: an IMPERATIVE directive naming registration THIS
+ *     BEAT'S FIRST PRIORITY, ahead of further unauthenticated hunting. Also
+ *     tells the hunter the EXACT generic intel key names to attach once it
+ *     recovers the flow (the same field names register_account's own tool
+ *     schema already takes — see tools.ts), so a LATER beat's orchestrator can
+ *     replay the registration deterministically instead of the model having to
+ *     rediscover it every beat. Black-box: names no target path/field/envelope,
+ *     only register_account's own generic parameter vocabulary.
+ *   - otherwise (2 accounts already exist, or nothing open needs one): the
+ *     directive is DROPPED entirely and replaced with a push toward the
+ *     authenticated-class coverage that remains, using the sessions already on
+ *     hand.
+ */
+function renderAccountObjective(sessionsCount: number, proved: ProvedEntry[]): string {
+  const open = openAuthenticatedClasses(proved);
+  if (sessionsCount >= 2 || open.length === 0) {
+    return [
+      "  No new registration is needed this beat: either two accounts already",
+      "  exist for this engagement, or no OPEN vuln_class requires one. Do NOT",
+      "  register another account. Spend this beat on <coverage_goal>'s OPEN",
+      "  classes, using the existing session labels (via http_request's `session`",
+      "  argument) wherever a class needs an authenticated or cross-user request.",
+    ].join("\n");
+  }
+  return [
+    "  MOST OF WHAT REMAINS OPEN for this engagement requires an AUTHENTICATED",
+    "  session to prove at all — see the list below. Discovering the target's",
+    "  signup (and, if needed, login) flow and registering TWO disposable",
+    "  accounts, A and B, via register_account is THIS BEAT'S FIRST PRIORITY —",
+    "  ahead of pursuing further unauthenticated findings, even ones ranked",
+    "  higher by <prioritization_rules> below. Do this before anything else.",
+    "",
+    "  Once you recover the signup/login envelope, attach it under an \"intel\"",
+    "  object on your claim (see <output_contract>) using EXACTLY these key",
+    "  names — the same fields register_account itself takes — so the flow",
+    "  survives into recovered_intel for a later beat even if this particular",
+    "  claim is rejected: signup_url, signup_method, signup_body_template,",
+    "  signup_response_token_path, login_url, login_method, login_body_template,",
+    "  login_response_token_path, auth_header_name.",
+    "",
+    "  After registering, pursue the authenticated classes below, and prove",
+    "  cross-user access by sending a request with session \"B\" against a",
+    "  resource created under session \"A\".",
+    "",
+    `  Authenticated classes still OPEN: ${open.join(", ")}`,
+  ].join("\n");
+}
+
 function renderDeadEnds(attempted: AttemptedEntry[]): string {
   if (attempted.length === 0) {
     return "  EMPTY. Nothing has been tried and failed yet — no dead ends to avoid.";
@@ -389,6 +496,7 @@ export function buildHunterBrief(state: HunterBriefState): string {
     `<recovered_intel>\n${renderRecoveredIntel(state.recoveredIntel)}\n</recovered_intel>`,
     `<already_proved>\n${renderAlreadyProved(state.proved)}\n</already_proved>`,
     `<coverage_goal>\n${renderCoverageGoal(state.proved)}\n</coverage_goal>`,
+    `<account_objective>\n${renderAccountObjective(state.sessionsCount ?? 0, state.proved)}\n</account_objective>`,
     `<dead_ends>\n${renderDeadEnds(state.attempted)}\n</dead_ends>`,
     `<thinking_framework>\n${THINKING_FRAMEWORK}\n</thinking_framework>`,
     `<prioritization_rules>\n${PRIORITIZATION_RULES}\n</prioritization_rules>`,
