@@ -722,22 +722,28 @@ test("the hunter's feedback for a non-CONFIRMED finding contains the SPECIFIC ca
 // the point is what beat.ts assembles as evidence.captures / evidence.derivedInput
 // before calling axiom.evaluate().
 
-test("state_changed: steps producing an appeared-marker delta are assembled into captures and CONFIRMED", async () => {
+test("state_changed: re-observing the SAME resource before/after a mutating action (marker appears) is CONFIRMED", async () => {
   const url = (p: string) => `http://10.0.0.1:3000/${p}`;
   const marker = "sc-marker-77";
-  const stepFetch = (async (u: string | URL) => {
+  // A genuine state change: the SAME observation (GET /observe) yields the marker only
+  // AFTER the mutating POST /action ran — proving the action changed server state, not
+  // that two different requests happen to differ (which would be a read differential).
+  let mutated = false;
+  const stepFetch = (async (u: string | URL, init?: RequestInit) => {
     const s = String(u);
-    return s.endsWith("/post") ? new Response(`ok ${marker}`) : new Response("ok plain");
+    if (s.endsWith("/action")) { mutated = true; return new Response("done"); }
+    if (s.endsWith("/observe")) return new Response(mutated ? `ok ${marker}` : "ok plain");
+    return new Response("ok plain");
   }) as unknown as typeof fetch;
   const script = [
     call("http_request", { method: "GET", url: url("a") }),
     say(JSON.stringify({
-      vuln_class: "business_logic", endpoint: url("a"),
+      vuln_class: "business_logic", endpoint: url("observe"),
       invariant: { statement: "resource mutated by the action", type: "state_changed", expression: `appeared:${marker}` },
       steps: [
-        { method: "GET", url: url("pre") },
-        { method: "POST", url: url("action") },
-        { method: "GET", url: url("post") },
+        { method: "GET", url: url("observe") },   // pre: same resource, no marker yet
+        { method: "POST", url: url("action") },   // the mutating action
+        { method: "GET", url: url("observe") },   // post: SAME resource, marker now present
       ],
     })),
     say("Nothing else to report."),
@@ -749,6 +755,37 @@ test("state_changed: steps producing an appeared-marker delta are assembled into
   assert.equal(out.findings.length, 1);
   assert.equal(out.findings[0].vuln_class, "business_logic");
   assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("state_changed rigor: a marker that appears across DIFFERENT pre/post requests is NOT a state change (read differential) — NEEDS_REVIEW", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "victim-pii-42";
+  // The loophole this guards: pre and post are DIFFERENT requests, the marker is only
+  // in the post request's own response — that proves a read (e.g. reading another
+  // user's record), not that the action changed anything. Must be body_contains.
+  const stepFetch = (async (u: string | URL) => {
+    const s = String(u);
+    return s.endsWith("/read-victim") ? new Response(`data ${marker}`) : new Response("ok plain");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "idor", endpoint: url("read-victim"),
+      invariant: { statement: "read another user's record", type: "state_changed", expression: `appeared:${marker}` },
+      steps: [
+        { method: "GET", url: url("own-record") },    // pre: a DIFFERENT request
+        { method: "GET", url: url("noop") },          // "action" that mutates nothing
+        { method: "GET", url: url("read-victim") },   // post: a DIFFERENT request carrying the marker
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: stepFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW", "a read differential dressed as state_changed must not confirm");
 });
 
 test("state_violated single_use: a marker reused across 2 steps is CONFIRMED", async () => {

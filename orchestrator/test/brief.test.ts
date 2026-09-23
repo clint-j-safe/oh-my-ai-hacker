@@ -20,8 +20,8 @@ test("the brief is well-formed: opens and closes with the root tag, one concern 
   assert.match(xml.trim(), /<\/safe_ai_hacker_hunter>$/);
   for (const tag of [
     "system_identity", "operational_principles", "attack_surface", "recovered_intel",
-    "already_proved", "dead_ends", "thinking_framework", "prioritization_rules",
-    "evidence_discipline", "tool_guidance", "output_contract", "budget",
+    "already_proved", "dead_ends", "thinking_framework", "parameter_analysis",
+    "prioritization_rules", "evidence_discipline", "tool_guidance", "output_contract", "budget",
   ]) {
     assert.match(xml, new RegExp(`<${tag}>`), `missing <${tag}>`);
     assert.match(xml, new RegExp(`</${tag}>`), `missing </${tag}>`);
