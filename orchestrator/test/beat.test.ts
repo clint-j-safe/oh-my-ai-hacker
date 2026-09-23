@@ -1213,3 +1213,30 @@ test("brief: <evidence_discipline> forbids a behaviour claim on a static asset, 
   assert.match(outputContract, /vuln_class must be exactly one of these snake_case strings/i);
   assert.match(outputContract, /no prose, no\s+parentheses/i);
 });
+
+test("a session created during a beat is persisted to the spine as label-only metadata (no token), so a later beat's hunter knows the account exists", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  sessions.create({
+    credentials: generateDisposableCredentials("A"), authMaterial: "TOKEN-A", authHeaderName: "Authorization",
+  });
+  const env = await ENV();  // fresh temp workspace
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({ ...claim("clickjacking", url), session: "A" })),
+    say("Nothing else to report."),
+  ];
+  await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script),
+    fetchImpl: (async () => new Response("OK")) as unknown as typeof fetch,
+    now: NOW, sessionStore: sessions,
+  });
+  const raw = await readFile(join(env.SAHW_WORKSPACE!, "spine", "progress.json"), "utf8");
+  const spine = JSON.parse(raw);
+  // The label and non-secret metadata must be there...
+  assert.ok(spine.sessions?.some((s: any) => s.label === "A" && s.has_auth_material === true),
+    "session A must be recorded in the spine so the next beat does not re-register it");
+  // ...and the token must NOT be anywhere in the written file.
+  assert.ok(!/TOKEN-A/.test(raw), "the auth token must never be written to the spine");
+});

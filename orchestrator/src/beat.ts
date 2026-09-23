@@ -735,6 +735,10 @@ export async function runBeat(opts: {
             recoveredIntel: { ...inferred, ...recoveredIntelFromClaims },
             proved: provedEntries,
             attempted: attemptedEntries,
+            // Persist account LABELS + non-secret metadata (no token, no password —
+            // getSessionMeta/SessionMeta carry neither) so a later beat's hunter knows
+            // accounts A/B already exist and does not re-register them.
+            sessions: runner.getSessionMeta(),
           });
           try {
             await saveSpine(workspace, nextSpine);
