@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createCipheriv, createHmac, randomBytes } from "node:crypto";
 import { evaluate } from "../src/axiom.js";
 import type { HttpCapture } from "../src/tools.js";
 
@@ -239,4 +240,367 @@ test("response_asserted FALSE_POSITIVE when one clause of a conjunction fails (A
   );
   assert.equal(v.status, "FALSE_POSITIVE");
   assert.match(v.reason, /x-frame-options/);
+});
+
+// =========================================================================================
+// derived — the model may only SELECT a registered deriver; it never gets to assert the
+// answer itself. inv.expression is exactly the deriver name; typed inputs travel through
+// the fourth `evidence` argument (evidence.derivedInput).
+// =========================================================================================
+
+function b64u(s: string): string {
+  return Buffer.from(s).toString("base64url");
+}
+
+// Builds a real compact JWT (header.payload.signature) signed with node:crypto — never a
+// pasted token literal — so the deriver is exercised against a genuine HMAC-SHA256
+// signature it must actually verify.
+function makeHs256Jwt(payload: Record<string, unknown>, key: string): string {
+  const header = b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = b64u(JSON.stringify(payload));
+  const signingInput = `${header}.${body}`;
+  const sig = createHmac("sha256", key).update(signingInput).digest("base64url");
+  return `${signingInput}.${sig}`;
+}
+
+test("derived hs256_weak_key CONFIRMED when a candidate key verifies the JWT signature", () => {
+  const jwt = makeHs256Jwt({ sub: "alice" }, "changeit");
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "hs256_weak_key" },
+    cap(200, ""), null,
+    { derivedInput: { jwt, candidates: ["password", "changeit", "secret"] } },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("derived hs256_weak_key FALSE_POSITIVE when the JWT is signed with a strong key not in the candidate list", () => {
+  const strongKey = randomBytes(32).toString("hex");
+  const jwt = makeHs256Jwt({ sub: "alice" }, strongKey);
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "hs256_weak_key" },
+    cap(200, ""), null,
+    { derivedInput: { jwt, candidates: ["password", "changeit", "secret"] } },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+});
+
+test("derived hs256_weak_key NEEDS_REVIEW when derivedInput is missing", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "hs256_weak_key" },
+    cap(200, ""), null,
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /derivedInput/);
+});
+
+test("derived aes_cbc_decrypt_matches CONFIRMED when it decrypts to the expected shape", () => {
+  const key = randomBytes(16);
+  const iv = randomBytes(16);
+  const cipher = createCipheriv("aes-128-cbc", key, iv);
+  const ciphertext = Buffer.concat([cipher.update("account_number:9988776655"), cipher.final()]);
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "aes_cbc_decrypt_matches" },
+    cap(200, ""), null,
+    {
+      derivedInput: {
+        ciphertext: ciphertext.toString("base64"),
+        key: key.toString("base64"),
+        iv: iv.toString("base64"),
+        expectedPattern: "^account_number:\\d+$",
+      },
+    },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("derived aes_cbc_decrypt_matches FALSE_POSITIVE with the wrong key", () => {
+  const key = randomBytes(16);
+  const wrongKey = randomBytes(16);
+  const iv = randomBytes(16);
+  const cipher = createCipheriv("aes-128-cbc", key, iv);
+  const ciphertext = Buffer.concat([cipher.update("account_number:9988776655"), cipher.final()]);
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "aes_cbc_decrypt_matches" },
+    cap(200, ""), null,
+    {
+      derivedInput: {
+        ciphertext: ciphertext.toString("base64"),
+        key: wrongKey.toString("base64"),
+        iv: iv.toString("base64"),
+        expectedPattern: "^account_number:\\d+$",
+      },
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+});
+
+test("derived jwt_payload_contains CONFIRMED when the named claims are present", () => {
+  const jwt = makeHs256Jwt({ sub: "alice", ssn: "078-05-1120", email: "alice@example.com" }, "k");
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "jwt_payload_contains" },
+    cap(200, ""), null,
+    { derivedInput: { jwt, claims: ["ssn", "email"] } },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("derived jwt_payload_contains FALSE_POSITIVE when a named claim is missing", () => {
+  const jwt = makeHs256Jwt({ sub: "alice" }, "k");
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "jwt_payload_contains" },
+    cap(200, ""), null,
+    { derivedInput: { jwt, claims: ["ssn"] } },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+  assert.match(v.reason, /ssn/);
+});
+
+test("derived tls_unavailable CONFIRMED when the injected prober reports no HTTPS reachable", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "tls_unavailable" },
+    cap(200, ""), null,
+    { derivedInput: { origins: ["https://a.example", "https://b.example"], prober: () => false } },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("derived tls_unavailable FALSE_POSITIVE when the injected prober reports HTTPS reachable", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "tls_unavailable" },
+    cap(200, ""), null,
+    {
+      derivedInput: {
+        origins: ["https://a.example"],
+        prober: (origin: string) => origin === "https://a.example",
+      },
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+  assert.match(v.reason, /a\.example/);
+});
+
+test("derived with an unknown deriver name is NEEDS_REVIEW naming it, never a guess", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "made_up_deriver" },
+    cap(200, ""), null,
+    { derivedInput: { anything: true } },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /made_up_deriver/);
+});
+
+// =========================================================================================
+// state_changed — pre/action/post captures plus an expression naming the delta.
+// =========================================================================================
+
+test("state_changed CONFIRMED when an appeared: marker shows up between pre and post", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "appeared:role=admin" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "role=user"),
+        cap(200, "ok=true"),
+        cap(200, "role=admin"),
+      ],
+    },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("state_changed FALSE_POSITIVE when there is no delta", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "appeared:role=admin" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "role=user"),
+        cap(200, "ok=true"),
+        cap(200, "role=user"),
+      ],
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+});
+
+test("state_changed NEEDS_REVIEW when restoration is required but no restoration evidence was supplied", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "appeared:role=admin" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "role=user"),
+        cap(200, "ok=true"),
+        cap(200, "role=admin"),
+      ],
+      restoration: { required: true, performed: false },
+    },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /restoration/i);
+});
+
+test("state_changed CONFIRMED when restoration is required and proof was supplied", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "appeared:role=admin" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "role=user"),
+        cap(200, "ok=true"),
+        cap(200, "role=admin"),
+      ],
+      restoration: { required: true, performed: true, proof: cap(200, "role=user") },
+    },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("state_changed NEEDS_REVIEW when fewer than 3 captures are supplied", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "appeared:role=admin" },
+    cap(200, ""), null,
+    { captures: [cap(200, "a"), cap(200, "b")] },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /3 ordered captures/);
+});
+
+// =========================================================================================
+// state_violated — a rule that must hold across a sequence is broken.
+// =========================================================================================
+
+test("state_violated single_use CONFIRMED when the marker is accepted more than once", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "single_use:otp-229104-accepted" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "otp-229104-accepted"),
+        cap(200, "otp-229104-accepted"),
+      ],
+    },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("state_violated single_use FALSE_POSITIVE when the marker is accepted at most once", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "single_use:otp-229104-accepted" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "otp-229104-accepted"),
+        cap(400, "otp already used"),
+      ],
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+});
+
+test("state_violated single_use NEEDS_REVIEW when fewer than 2 captures are supplied", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "single_use:otp-229104-accepted" },
+    cap(200, ""), null,
+    { captures: [cap(200, "otp-229104-accepted")] },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /at least 2/);
+});
+
+test("state_violated lockout_absent CONFIRMED when 5 attempts never produce the lockout status", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "lockout_absent:429" },
+    cap(200, ""), null,
+    { captures: Array.from({ length: 5 }, () => cap(401, "bad credentials")) },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("state_violated lockout_absent FALSE_POSITIVE when the lockout status appears", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "lockout_absent:429" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(401, "bad credentials"),
+        cap(401, "bad credentials"),
+        cap(401, "bad credentials"),
+        cap(401, "bad credentials"),
+        cap(429, "locked out"),
+      ],
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+});
+
+test("state_violated lockout_absent NEEDS_REVIEW when fewer than 5 attempts are supplied", () => {
+  const v = evaluate(
+    { statement: "s", type: "state_violated", expression: "lockout_absent:429" },
+    cap(200, ""), null,
+    { captures: [cap(401, "bad credentials"), cap(401, "bad credentials")] },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /at least 5/);
+});
+
+// =========================================================================================
+// file_created_then_deleted — absent -> present -> absent.
+// =========================================================================================
+
+test("file_created_then_deleted CONFIRMED for absent -> present -> absent", () => {
+  const v = evaluate(
+    { statement: "s", type: "file_created_then_deleted", expression: "poc-marker-7f3a" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(404, "not found"),
+        cap(200, "poc-marker-7f3a"),
+        cap(404, "not found"),
+      ],
+    },
+  );
+  assert.equal(v.status, "CONFIRMED");
+});
+
+test("file_created_then_deleted FALSE_POSITIVE naming 'still present at the end' when cleanup did not happen", () => {
+  const v = evaluate(
+    { statement: "s", type: "file_created_then_deleted", expression: "poc-marker-7f3a" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(404, "not found"),
+        cap(200, "poc-marker-7f3a"),
+        cap(200, "poc-marker-7f3a"),
+      ],
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+  assert.match(v.reason, /still present at the end/);
+});
+
+test("file_created_then_deleted FALSE_POSITIVE naming 'present throughout' when the marker always existed", () => {
+  const v = evaluate(
+    { statement: "s", type: "file_created_then_deleted", expression: "poc-marker-7f3a" },
+    cap(200, ""), null,
+    {
+      captures: [
+        cap(200, "poc-marker-7f3a"),
+        cap(200, "poc-marker-7f3a"),
+        cap(200, "poc-marker-7f3a"),
+      ],
+    },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE");
+  assert.match(v.reason, /present throughout/);
+});
+
+test("file_created_then_deleted NEEDS_REVIEW when captures are missing or not exactly 3", () => {
+  const v = evaluate(
+    { statement: "s", type: "file_created_then_deleted", expression: "poc-marker-7f3a" },
+    cap(200, ""), null,
+    { captures: [cap(404, "not found"), cap(200, "poc-marker-7f3a")] },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW");
+  assert.match(v.reason, /exactly 3/);
 });
