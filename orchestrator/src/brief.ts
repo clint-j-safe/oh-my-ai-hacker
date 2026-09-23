@@ -502,13 +502,21 @@ function renderRecoveredIntel(intel: RecoveredIntel): string {
 function renderCanonicalTargets(intel: RecoveredIntel): string {
   const text = Object.entries(intel)
     .filter(([k, v]) => typeof v === "string"
-      && (k === "api_route_table" || /route|endpoint|_path\b/i.test(k)))
+      && (k === "api_route_table" || /_route$|_routes$|route_table/i.test(k)))
     .map(([, v]) => String(v))
     .join(" ");
-  const paths = [...new Set((text.match(/\/[A-Za-z0-9_\-./]*(?:\?[A-Za-z0-9_=&%.\-]*)?/g) ?? [])
+  let paths = [...new Set((text.match(/\/[a-z0-9][A-Za-z0-9_\-./]*(?:\?[A-Za-z0-9_=&%.\-]*)?/g) ?? [])
     .map((s) => s.replace(/[).,;]+$/, "").trim())
-    .filter((s) => s.length > 1 && !/\.(js|css|map|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(s)))]
-    .sort();
+    // real routes are lowercase-initial and not static assets; drop prose fragments
+    // that slipped in (a leading-uppercase segment, obvious non-route words).
+    .filter((s) => s.length > 1
+      && !/\.(js|css|map|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(s)
+      && !/^\/(POST|GET|PUT|host|html|control|controllers|lastName|firstName|\d)/i.test(s)))];
+  // Prefer canonical bases: drop a path when a strict PREFIX of it is also present
+  // (e.g. drop /api/contactUs/index when /api/contactUs is in the table). This is the
+  // whole point — steer to the canonical route, not the aliased sub-path.
+  paths = paths.filter((p) => !paths.some((q) => q !== p && p.startsWith(q + "/")));
+  paths.sort();
   if (paths.length === 0) {
     return [
       "  EMPTY. No route table recovered yet. Get a file-read/source-disclosure",
