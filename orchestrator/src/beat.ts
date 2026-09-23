@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
+import type { spawn } from "node:child_process";
 import { loadEngagement } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
-import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture } from "./tools.js";
+import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
 import { runAgent, type MinimalClient } from "./agent.js";
-import { evaluate, type Invariant } from "./axiom.js";
+import { evaluate, type Invariant, type InvariantType } from "./axiom.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
@@ -42,13 +43,62 @@ export interface RejectedClaim {
   reason: string;
 }
 
+/**
+ * WHY a non-CONFIRMED finding failed, assigned deterministically from structured
+ * facts this module already holds (the invariant type, whether a control existed,
+ * whether the differential signal was present in the exploit/control, and whether
+ * the endpoint can plausibly support the claimed class) — NEVER by pattern-matching
+ * axiom.ts's prose `reason` string, and never guessed. See classifyFailureCause().
+ *
+ *   wrong_invariant_type   the invariant TYPE chosen cannot prove this vuln_class's
+ *                          mechanism (e.g. rate_limit_absence needs status_in, not
+ *                          body_contains) — includes any type M0's Axiom cannot
+ *                          mechanically evaluate at all.
+ *   endpoint_implausible   the endpoint served a static asset (by content-type),
+ *                          but the claim is a BEHAVIOUR claim, not a disclosure one —
+ *                          see <evidence_discipline> in brief.ts.
+ *   no_control             a differential claim needed a control response and none
+ *                          was captured.
+ *   marker_absent          the differential signal (marker / status) the invariant
+ *                          expects was absent from the EXPLOIT response itself.
+ *   control_shared_marker  the differential signal was present in the exploit AND
+ *                          the control — it does not distinguish anything.
+ *   review_rejected        adversarial-self-review rejected the claim before the
+ *                          Axiom ever replayed it.
+ *   unknown                none of the above applied. Meant to be RARE — if it
+ *                          dominates the summary, that is itself a finding.
+ */
+export type FailureCause =
+  | "wrong_invariant_type" | "control_shared_marker" | "marker_absent"
+  | "no_control" | "endpoint_implausible" | "review_rejected" | "unknown";
+
+const FAILURE_CAUSES: readonly FailureCause[] = [
+  "wrong_invariant_type", "control_shared_marker", "marker_absent",
+  "no_control", "endpoint_implausible", "review_rejected", "unknown",
+];
+
+function emptyFailureCauses(): Record<FailureCause, number> {
+  const out = {} as Record<FailureCause, number>;
+  for (const c of FAILURE_CAUSES) out[c] = 0;
+  return out;
+}
+
+/** A FindingRow (obs/clickhouse.ts's schema, unmodified — every field the writers
+ * actually insert) plus the LOCAL, M0-only failure_cause annotation. Never passed to
+ * obs.recordFinding/mergeFinding directly — those keep receiving the plain FindingRow
+ * so an unexpected extra column never reaches a configured ClickHouse table. */
+export type FindingRowWithCause = FindingRow & { failure_cause?: FailureCause };
+
 type BeatResult = {
   exitCode: number;
-  findings: FindingRow[];
+  findings: FindingRowWithCause[];
   stalled: boolean;
   reason: string | null;
   duplicates_suppressed: number;
   rejected_claims: RejectedClaim[];
+  /** Count of each FailureCause across every non-CONFIRMED finding this beat. Every
+   * member of FailureCause is present, defaulting to 0 — never a sparse object. */
+  failure_causes: Record<FailureCause, number>;
   /** true if this beat started from a brand-new Spine (no prior file, a corrupt
    * one, or one for a different engagement/scope) rather than continuing a prior
    * one. See src/spine.ts loadSpine. */
@@ -66,12 +116,53 @@ function numEnv(env: Env, key: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function feedbackForVerdict(vuln_class: string, endpoint: string, verdict: string, reason: string): string {
-  return [
-    `Verdict for ${vuln_class} @ ${endpoint}: ${verdict} (${reason}).`,
-    "That pair is now banked — do not report it again this beat.",
-    "Continue hunting: find a DIFFERENT vulnerability class or endpoint.",
-  ].join(" ");
+function boolEnv(env: Env, key: string, fallback: boolean): boolean {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (["off", "false", "0", "no"].includes(v)) return false;
+  if (["on", "true", "1", "yes"].includes(v)) return true;
+  return fallback;
+}
+
+// Actionable, cause-specific guidance — "your control shared the marker" is
+// actionable, "false positive" is not (see DEFECT 2 in the report). Keyed so
+// feedbackForVerdict can put the SPECIFIC cause in front of the hunter, not a
+// generic verdict string.
+const CAUSE_GUIDANCE: Record<FailureCause, string> = {
+  wrong_invariant_type:
+    "The invariant TYPE you chose cannot prove this vuln_class's mechanism — re-read " +
+    "<output_contract> and <evidence_discipline> and pick a type that actually proves " +
+    "what you did.",
+  control_shared_marker:
+    "Your control shared the same marker/status as the exploit, so the differential " +
+    "proves nothing — pick a control that should NOT exhibit the issue.",
+  marker_absent:
+    "The exploit response itself did not contain the marker/status you expected — " +
+    "re-read the ACTUAL response before re-claiming this.",
+  no_control:
+    "No control response could be captured for a differential claim — without one the " +
+    "invariant cannot be evaluated at all.",
+  endpoint_implausible:
+    "That endpoint served a static asset, not application logic — a behaviour claim " +
+    "against a static file is almost never provable; only a disclosure claim fits it.",
+  review_rejected:
+    "adversarial-self-review rejected this claim before it ever reached the target.",
+  unknown:
+    "The verifier could not attribute a specific cause to this failure.",
+};
+
+function feedbackForVerdict(
+  vuln_class: string, endpoint: string, verdict: string, reason: string,
+  cause?: FailureCause, causeDetail?: string | null,
+): string {
+  const parts = [`Verdict for ${vuln_class} @ ${endpoint}: ${verdict} (${reason}).`];
+  if (cause) {
+    parts.push(`Cause: ${cause} — ${(causeDetail && causeDetail.trim()) || CAUSE_GUIDANCE[cause]}`);
+  }
+  parts.push("That pair is now banked — do not report it again this beat.");
+  parts.push("Continue hunting: find a DIFFERENT vulnerability class or endpoint.");
+  return parts.join(" ");
 }
 
 function feedbackForDuplicate(vuln_class: string, endpoint: string): string {
@@ -96,6 +187,212 @@ function feedbackForInvalidVulnClass(got: unknown): string {
     "No prose, no parentheses, no capitalisation — re-emit your claim with one of",
     "those exact values.",
   ].join(" ");
+}
+
+// ---- Failure-cause taxonomy (Defect 2) -------------------------------------------
+//
+// A codified mirror of brief.ts's <evidence_discipline> "admissible evidence per
+// class" table: which invariant TYPE can actually prove which vuln_class's
+// mechanism. Generic vocabulary only (never a target endpoint/param/payload) — see
+// the black-box rule. Used ONLY to attribute a failure cause; the Axiom (axiom.ts)
+// remains the sole authority on the verdict itself.
+const DIFFERENTIAL_ONLY_CLASSES = new Set<VulnClass>([
+  "sqli", "xss_reflected", "xss_stored", "xxe", "path_traversal",
+  "deserialization_rce", "ssrf", "idor", "business_logic", "auth_bypass",
+]);
+const ASSERTED_ONLY_CLASSES = new Set<VulnClass>([
+  "cors_misconfig", "insecure_transport", "clickjacking", "jwt_weak_key",
+  "improper_session_invalidation",
+]);
+const RATE_LIMIT_CLASSES = new Set<VulnClass>(["rate_limit_absence"]);
+const ENUMERATION_CLASSES = new Set<VulnClass>([
+  "user_enumeration", "forced_browsing", "disposable_email_accepted", "weak_password_policy",
+]);
+// Disclosure classes are the ONE exception EVIDENCE_DISCIPLINE names for a static
+// asset: "Static assets support only disclosure claims." Also broad on invariant
+// type — the sensitive content can show up in the body or a header.
+const DISCLOSURE_CLASSES = new Set<VulnClass>(["info_disclosure", "crypto_disclosure"]);
+
+function allowedInvariantTypes(vulnClass: VulnClass): ReadonlySet<InvariantType> {
+  if (DIFFERENTIAL_ONLY_CLASSES.has(vulnClass)) return new Set<InvariantType>(["body_contains", "status_in"]);
+  if (ASSERTED_ONLY_CLASSES.has(vulnClass)) return new Set<InvariantType>(["response_asserted"]);
+  if (RATE_LIMIT_CLASSES.has(vulnClass)) return new Set<InvariantType>(["status_in"]);
+  if (ENUMERATION_CLASSES.has(vulnClass)) return new Set<InvariantType>(["status_in", "body_contains"]);
+  if (DISCLOSURE_CLASSES.has(vulnClass)) {
+    return new Set<InvariantType>(["body_contains", "response_asserted", "status_in"]);
+  }
+  // Every VulnClass is covered by exactly one of the buckets above — this is a
+  // defensive fallback only, never expected to run.
+  return new Set<InvariantType>(["body_contains", "status_in", "response_asserted"]);
+}
+
+// A conservative content-type sniff for "this is a static asset, not application
+// logic" — scripts, stylesheets, images, fonts, binary blobs. Deliberately does NOT
+// include text/html or application/json: those are exactly the shapes a dynamic
+// endpoint legitimately answers with, so treating them as "static" would make every
+// ordinary JSON API response look implausible.
+const STATIC_ASSET_CONTENT_TYPE =
+  /^(text\/(javascript|css)|application\/(javascript|x-javascript|font[-\w]*|wasm|octet-stream)|image\/|font\/)/i;
+
+function isStaticAssetCapture(capture: HttpCapture | null): boolean {
+  if (!capture) return false;
+  const ct = headerValueCI(capture.response.headers, "content-type");
+  return Boolean(ct) && STATIC_ASSET_CONTENT_TYPE.test(ct as string);
+}
+
+/** Recomputes, from the SAME structured facts axiom.ts itself used (the invariant's
+ * own expression against the exploit/control responses), whether the differential
+ * signal the invariant expects was present in each side — never by reading
+ * axiom.ts's prose `reason`. Intentionally a simpler check than axiom.ts's own
+ * serializeExchange (body + headers, unsorted) — good enough to ATTRIBUTE a cause;
+ * the Axiom's own evaluate() remains the sole source of the actual verdict. */
+function computeDifferentialSignal(
+  inv: Invariant, exploit: HttpCapture, control: HttpCapture | null,
+): { markerInExploit: boolean | null; markerInControl: boolean | null } {
+  if (inv.type === "body_contains") {
+    const marker = inv.expression;
+    const has = (c: HttpCapture) =>
+      c.response.body.includes(marker) || Object.values(c.response.headers).some((v) => v.includes(marker));
+    return { markerInExploit: has(exploit), markerInControl: control ? has(control) : null };
+  }
+  if (inv.type === "status_in") {
+    const wanted = inv.expression.split(",").map((s) => Number(s.trim())).filter(Number.isFinite);
+    return {
+      markerInExploit: wanted.includes(exploit.response.status),
+      markerInControl: control ? wanted.includes(control.response.status) : null,
+    };
+  }
+  return { markerInExploit: null, markerInControl: null };
+}
+
+/** Deterministic cause attribution for a non-CONFIRMED finding. Returns null for
+ * CONFIRMED (no cause needed). Every branch reads only structured facts this module
+ * already holds — never axiom.reason's prose. Order matters: a wrong invariant TYPE
+ * or an implausible endpoint explain the failure more fundamentally than a
+ * downstream marker/control fact, so both are checked first. */
+function classifyFailureCause(facts: {
+  axiomStatus: string;
+  vulnClass: VulnClass;
+  invariantType: InvariantType;
+  hasControl: boolean;
+  markerInExploit: boolean | null;
+  markerInControl: boolean | null;
+  endpointIsStaticAsset: boolean;
+}): FailureCause | null {
+  if (facts.axiomStatus === "CONFIRMED") return null;
+  if (!allowedInvariantTypes(facts.vulnClass).has(facts.invariantType)) return "wrong_invariant_type";
+  if (facts.endpointIsStaticAsset && !DISCLOSURE_CLASSES.has(facts.vulnClass)) return "endpoint_implausible";
+  if (!facts.hasControl && facts.invariantType !== "response_asserted") return "no_control";
+  if (facts.markerInExploit === false) return "marker_absent";
+  if (facts.markerInExploit === true && facts.markerInControl === true) return "control_shared_marker";
+  return "unknown";
+}
+
+// ---- Claim review: a mandatory pre-Axiom stage (Defect 1) -------------------------
+//
+// "Availability is not adoption." skill_run was wired and adversarial-self-review
+// permitted, but leaving it to the model's discretion meant it was called once in a
+// 31-turn beat — never at the moment it mattered. Maker != checker: the agent that
+// writes the claim must not be the agent that approves it. This makes the review a
+// stage the ORCHESTRATOR runs, not a tool the hunter may or may not reach for.
+//
+// The review does NOT replace the Axiom — evaluate() in axiom.ts remains the sole
+// deterministic verdict authority. This is a pre-filter: adversarial-self-review is
+// designed (see skills/adversarial-self-review/SKILL.md) as the FINAL skeptical gate
+// over ALREADY-VERIFIED findings (oracle_verifications, reproduced evidence, ...).
+// Run here, BEFORE the Axiom has replayed anything, the only verification pass that
+// genuinely exists yet is the hunter's own single observation — the one that produced
+// the claim in the first place. That is reported honestly as oracle_verifications: 1
+// (not 2, not "reproduced" text) — enough for the skill's reproduced() signal without
+// asserting more than is actually true. The hunter's own invariant.statement is
+// handed back as data_accessed: it IS the hunter's description of what it observed,
+// and the skill's signals only check that field for presence, never its content.
+const CLAIM_REVIEW_SKILL = "adversarial-self-review";
+
+function claimReviewEnabled(env: Env): boolean {
+  return boolEnv(env, "SAHW_CLAIM_REVIEW", true);
+}
+
+function buildClaimReviewInput(claim: {
+  vuln_class: string; endpoint: string; control_url?: string;
+  invariant: { type: string; statement?: string; expression: string };
+}): string {
+  const invType = claim.invariant.type;
+  const isDifferential = invType === "body_contains" || invType === "status_in";
+  const methods = isDifferential ? [invType, "differential"] : [invType, "assertion"];
+  const statement = typeof claim.invariant.statement === "string" ? claim.invariant.statement.trim() : "";
+  const finding: Record<string, unknown> = {
+    finding_id: `pending:${claim.vuln_class}:${claim.endpoint}`,
+    vuln_class: claim.vuln_class,
+    oracle_verifications: 1,
+    methods,
+    endpoint: claim.endpoint,
+    control_url: claim.control_url ?? null,
+  };
+  if (statement) finding.data_accessed = statement;
+  return JSON.stringify({ verified_findings: [finding] });
+}
+
+export interface ClaimReviewOutcome {
+  verdict: "survives" | "downgraded" | "rejected" | "unavailable";
+  reasoning: string;
+}
+
+/** Bounds text pulled from a skill artifact before it reaches a span or the hunter —
+ * defense in depth even though adversarial-self-review's own challenge strings are
+ * short, canned prose (never a response body). */
+function boundedReviewText(s: string, max = 600): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/**
+ * Runs the mandatory claim-review pre-filter through the SAME skill_run dispatch path
+ * (ToolRunner.execute) the hunter's own skill_run tool calls use — gated by the same
+ * Tether allowlist/egress check, just invoked by the orchestrator instead of proposed
+ * by the model. Never throws: unavailable/denied/erroring/timed-out all collapse to
+ * verdict "unavailable" so the caller can fail OPEN to the Axiom exactly as if this
+ * stage did not exist — a broken pre-filter must never block a verdict.
+ */
+async function runClaimReview(
+  runner: ToolRunner,
+  claim: { vuln_class: string; endpoint: string; control_url?: string;
+    invariant: { type: string; statement?: string; expression: string } },
+): Promise<ClaimReviewOutcome> {
+  let result;
+  try {
+    result = await runner.execute("skill_run", {
+      skill_name: CLAIM_REVIEW_SKILL,
+      input_json: buildClaimReviewInput(claim),
+    });
+  } catch (err) {
+    return { verdict: "unavailable", reasoning: `claim-review threw: ${(err as Error)?.message ?? String(err)}` };
+  }
+  if (!result.ok) {
+    return { verdict: "unavailable", reasoning: `claim-review unavailable (${result.kind}): ${boundedReviewText(result.denied)}` };
+  }
+  try {
+    const output = (result.result as SkillRunOutcome).output as {
+      reviews?: Array<{ verdict?: string; rejection_reason?: string | null;
+        challenges?: Array<{ resolution?: string; evidence_cited?: string }> }>;
+    };
+    const review = output?.reviews?.[0];
+    if (!review || typeof review.verdict !== "string") {
+      return { verdict: "unavailable", reasoning: "claim-review returned no review entry" };
+    }
+    const unresolved = review.challenges?.find((c) => c.resolution === "unresolved")?.evidence_cited;
+    const reasoning = boundedReviewText(
+      review.rejection_reason
+      ?? unresolved
+      ?? review.challenges?.map((c) => c.evidence_cited).filter(Boolean).join(" | ")
+      ?? "",
+    );
+    if (review.verdict === "rejected" || review.verdict === "downgraded" || review.verdict === "survives") {
+      return { verdict: review.verdict, reasoning };
+    }
+    return { verdict: "unavailable", reasoning: `claim-review returned an unrecognized verdict: ${review.verdict}` };
+  } catch (err) {
+    return { verdict: "unavailable", reasoning: `claim-review output malformed: ${(err as Error)?.message ?? String(err)}` };
+  }
 }
 
 /**
@@ -221,6 +518,11 @@ export async function runBeat(opts: {
   env: Record<string, string | undefined>;
   client: MinimalClient;
   fetchImpl?: typeof fetch;
+  /** Overrides node:child_process's real `spawn` for skill_run (including the
+   * mandatory claim-review call below). Mirrors fetchImpl — production omits it and
+   * gets the real `spawn`; tests use it to inject a fixture skill or spy on call
+   * order (see ToolRunner's own spawnImpl in tools.ts). */
+  spawnImpl?: typeof spawn;
   now?: Date;
 }): Promise<BeatResult> {
   const engagement = loadEngagement(opts.env, opts.now);   // throws outside the window — MUST run
@@ -237,8 +539,15 @@ export async function runBeat(opts: {
   const workspace = opts.env.SAHW_WORKSPACE ?? ".";
   const store = new ArtifactStore(join(workspace, "artifacts"));
   const runner = new ToolRunner({
-    engagement, store, fetchImpl: opts.fetchImpl,
+    engagement, store, fetchImpl: opts.fetchImpl, spawnImpl: opts.spawnImpl,
     skillAllowlist: HUNTER_SKILL_ALLOWLIST,
+    // Both fall back to ToolRunner's own defaults (the repo's skills/ dir, 120s) when
+    // unset — this only lets an env override reach the runner the same way
+    // SAHW_SKILLS_ROOT / SAHW_SKILL_TIMEOUT_MS already do at the module level in
+    // tools.ts, but scoped to THIS beat's env object rather than process.env, so tests
+    // can point at a fixture skill directory without touching global state.
+    skillsRoot: opts.env.SAHW_SKILLS_ROOT?.trim() || undefined,
+    skillTimeoutMs: numEnv(opts.env, "SAHW_SKILL_TIMEOUT_MS", 120_000),
   });
   const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(HUNTER_SKILL_ALLOWLIST)];
 
@@ -325,10 +634,12 @@ export async function runBeat(opts: {
        * hypothesis cannot consume the whole beat's turn budget.
        */
       async function hunt(): Promise<BeatResult> {
-        const findings: FindingRow[] = [];
+        const findings: FindingRowWithCause[] = [];
         const seen = new Set<string>();               // `${vuln_class}::${endpoint}`
         let duplicatesSuppressed = 0;
         const rejectedClaims: RejectedClaim[] = [];
+        const failureCauses = emptyFailureCauses();
+        const reviewEnabled = claimReviewEnabled(opts.env);
 
         // What THIS beat learns, folded into the spine at every exit — including a
         // stall or a failure. This is the whole point: a beat that learned "this
@@ -387,6 +698,7 @@ export async function runBeat(opts: {
             exitCode, findings, stalled, reason,
             duplicates_suppressed: duplicatesSuppressed,
             rejected_claims: rejectedClaims,
+            failure_causes: failureCauses,
             spine_fresh: spineLoad.fresh,
             spine_fresh_reason: spineLoad.freshReason,
           };
@@ -545,6 +857,63 @@ export async function runBeat(opts: {
             continue;
           }
 
+          // Mandatory claim review (Defect 1) — runs BEFORE the Axiom replays anything.
+          // Switchable via SAHW_CLAIM_REVIEW (default on); a broken/denied/timed-out
+          // review must never block a verdict, so every non-"rejected" outcome
+          // (including "unavailable") falls straight through to the Axiom exactly as
+          // if this stage did not exist.
+          if (reviewEnabled) {
+            const review = await startActiveObservation("claim-review", async (crSpan) => {
+              crSpan.update({
+                input: {
+                  vuln_class: claim.vuln_class, endpoint: claim.endpoint,
+                  control_url: claim.control_url ?? null, invariant_type: claim.invariant.type,
+                },
+              });
+              const r = await runClaimReview(runner, claim);
+              crSpan.update({ output: { verdict: r.verdict, reasoning: r.reasoning } });
+              return r;
+            });
+
+            if (review.verdict === "rejected") {
+              // Skip the Axiom replay entirely — this is the whole point: no exploit or
+              // control request is ever sent for a claim the reviewer judged
+              // unsupportable, saving target traffic on a claim that was never going
+              // to hold.
+              failureCauses.review_rejected += 1;
+              const row: FindingRow = {
+                engagement_id: engagement.authRef,
+                finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
+                vuln_class: claim.vuln_class,
+                endpoint: claim.endpoint,
+                verdict: "FALSE_POSITIVE",
+                invariant_type: claim.invariant.type,
+                langfuse_trace_id: obs.traceId(),
+                utc: new Date().toISOString(),
+              };
+              attemptedEntries.push({
+                vuln_class: claim.vuln_class, endpoint: claim.endpoint,
+                invariant_type: claim.invariant.type, outcome: "REVIEW_REJECTED",
+                why: review.reasoning || "adversarial-self-review rejected this claim before replay",
+              });
+              findings.push({ ...row, failure_cause: "review_rejected" });
+              seen.add(dedupeKey);
+              await obs.mergeEndpoint(claim.endpoint, "GET");
+              await obs.mergeFinding(row);
+              await obs.recordFinding(row);
+              messages.push({
+                role: "user",
+                content: feedbackForVerdict(
+                  row.vuln_class, row.endpoint, row.verdict,
+                  review.reasoning || "rejected by the adversarial-self-review pre-filter",
+                  "review_rejected", review.reasoning,
+                ),
+              });
+              continue;
+            }
+            // "survives" / "downgraded" / "unavailable" all proceed to the Axiom below.
+          }
+
           // Axiom: replay the exploit AND a control, then evaluate the typed invariant.
           const exploit = await capture(runner, claim.endpoint);
           const control = claim.invariant.type === "response_asserted"
@@ -610,6 +979,21 @@ export async function runBeat(opts: {
             utc: new Date().toISOString(),
           };
 
+          // Defect 2: classify WHY a non-CONFIRMED finding failed, from structured
+          // facts only — never by reading axiom.reason's prose. Uses the RAW axiom
+          // verdict (see the routing comment below for why raw, not gated).
+          const differentialSignal = computeDifferentialSignal(claim.invariant as Invariant, exploit!, control);
+          const failureCause = classifyFailureCause({
+            axiomStatus: axiom.status,
+            vulnClass: claim.vuln_class,
+            invariantType: claim.invariant.type,
+            hasControl: control !== null,
+            markerInExploit: differentialSignal.markerInExploit,
+            markerInControl: differentialSignal.markerInControl,
+            endpointIsStaticAsset: isStaticAssetCapture(exploit),
+          });
+          if (failureCause) failureCauses[failureCause] += 1;
+
           // Route into the spine on the RAW axiom verdict, not the provenance-gated
           // one: a hypothesis whose invariant genuinely passed (axiom.status ===
           // "CONFIRMED") belongs in `proved` even if gateProvenance downgraded the
@@ -631,7 +1015,7 @@ export async function runBeat(opts: {
 
           // Bank it as soon as it's confirmed, not at the end of the beat — a run
           // that dies mid-way must still have what it already proved.
-          findings.push(row);
+          findings.push(failureCause ? { ...row, failure_cause: failureCause } : row);
           seen.add(dedupeKey);
           await obs.mergeEndpoint(claim.endpoint, "GET");
           await obs.mergeFinding(row);
@@ -639,7 +1023,10 @@ export async function runBeat(opts: {
 
           messages.push({
             role: "user",
-            content: feedbackForVerdict(row.vuln_class, row.endpoint, row.verdict, axiom.reason),
+            content: feedbackForVerdict(
+              row.vuln_class, row.endpoint, row.verdict, axiom.reason,
+              failureCause ?? undefined,
+            ),
           });
         }
         }

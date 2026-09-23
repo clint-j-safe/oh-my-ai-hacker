@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
 import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
 
@@ -352,4 +353,330 @@ test("a beat that did real work is NOT stalled because one later attempt ran dry
   assert.equal(out.exitCode, 0);
   assert.equal(out.findings.length, 1, "the finding proved in attempt 1 must survive");
   assert.doesNotMatch(String(out.reason ?? ""), /0 succeeded tool call/);
+});
+
+// ---- Claim review: a mandatory pre-Axiom stage ------------------------------------
+//
+// The real adversarial-self-review skill runs end to end in these tests (default
+// skillsRoot resolution — see tools.ts's defaultSkillsRoot — finds the repo's real
+// skills/ dir, exactly as skill-run.test.ts's "real severity-calibration" test
+// does), never a fixture, EXCEPT where a test needs to simulate the skill being
+// unavailable/erroring/hanging, where a temporary skillsRoot is substituted via
+// SAHW_SKILLS_ROOT.
+
+/** Writes a minimal fixture skill directory at <root>/adversarial-self-review, so a
+ * test can simulate the review skill erroring or hanging without touching the real
+ * skill. Mirrors skill-run.test.ts's writeFixtureSkill. */
+async function writeFixtureReviewSkill(root: string, pySource: string): Promise<void> {
+  const dir = join(root, "adversarial-self-review");
+  await mkdir(join(dir, "scripts"), { recursive: true });
+  await writeFile(join(dir, "scripts", "run.py"), pySource, "utf8");
+  await mkdir(join(dir, "references"), { recursive: true });
+  await writeFile(
+    join(dir, "references", "artifact.schema.json"),
+    JSON.stringify({ type: "object", required: ["reviews"], properties: { reviews: { type: "array" } } }),
+    "utf8",
+  );
+}
+
+test("claim review runs before the Axiom replay on every claim when enabled (ordering, via a spawn/fetch call-order spy)", async () => {
+  const calls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    calls.push(`fetch:${String(u)}`);
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const spySpawn = ((...args: Parameters<typeof realSpawn>) => {
+    calls.push("spawn:skill_run");
+    return realSpawn(...args);
+  }) as typeof realSpawn;
+
+  // The stall rule needs at least one succeeded tool call + artifact before ANY
+  // claim can be parsed (beat-level, see stall.ts) — the hunter's own recon probe
+  // supplies that, deliberately against a DIFFERENT url than the claim's endpoint so
+  // the ordering assertion below is unambiguous about which fetch is the Axiom's.
+  const reconUrl = "http://10.0.0.1:3000/recon";
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url: reconUrl }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script),
+    fetchImpl: spyFetch, spawnImpl: spySpawn, now: NOW,
+  });
+  const spawnIdx = calls.findIndex((c) => c === "spawn:skill_run");
+  const exploitFetchIdx = calls.findIndex((c) => c === `fetch:${url}`);
+  assert.ok(spawnIdx >= 0, "the claim-review skill must actually have run (real, network-free skill)");
+  assert.ok(exploitFetchIdx >= 0, "the Axiom must actually have replayed the exploit");
+  assert.ok(spawnIdx < exploitFetchIdx, "claim review must run before the Axiom replay");
+  assert.equal(out.exitCode, 0);
+});
+
+test("a claim rejected by adversarial-self-review skips the Axiom replay entirely (target fetch never called) and records review_rejected", async () => {
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    fetchedUrls.push(String(u));
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const reconUrl = "http://10.0.0.1:3000/recon";
+  const url = "http://10.0.0.1:3000/ssrf";
+  const controlUrl = "http://10.0.0.1:3000/control";
+  // ssrf's only class-specific false-positive challenge (dns_rebinding) resolves
+  // ONLY on out-of-band evidence, which M0's control-differential model can never
+  // produce pre-Axiom — so an ssrf claim is deterministically rejected by the
+  // reviewer regardless of any other field. See src/beat.ts's claim-review doc
+  // comment and skills/adversarial-self-review/scripts/run.py's generate_challenges().
+  const ssrfClaim = {
+    vuln_class: "ssrf", endpoint: url, control_url: controlUrl,
+    invariant: {
+      statement: "internal service reached via attacker-controlled URL",
+      type: "body_contains", expression: "internal-marker-xyz",
+    },
+  };
+  const script = [
+    call("http_request", { method: "GET", url: reconUrl }),
+    say(JSON.stringify(ssrfClaim)),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW,
+  });
+  assert.ok(!fetchedUrls.includes(url), "the claimed exploit endpoint must never be contacted");
+  assert.ok(!fetchedUrls.includes(controlUrl), "the claimed control endpoint must never be contacted");
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].vuln_class, "ssrf");
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "review_rejected");
+  assert.equal(out.failure_causes.review_rejected, 1);
+  assert.equal(out.exitCode, 0);
+  // The hunter is told WHY, not just "rejected".
+  assert.ok(out.rejected_claims.length === 0, "a review rejection is a finding (dead end), not a malformed-claim rejection");
+});
+
+test("SAHW_CLAIM_REVIEW=off skips the claim-review stage entirely (no skill process spawned)", async () => {
+  let spawnCalls = 0;
+  const spySpawn = ((...args: Parameters<typeof realSpawn>) => {
+    spawnCalls++;
+    return realSpawn(...args);
+  }) as typeof realSpawn;
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, spawnImpl: spySpawn, now: NOW,
+  });
+  assert.equal(spawnCalls, 0, "no skill process may be spawned when claim review is disabled");
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.failure_causes.review_rejected, 0);
+});
+
+test("claim review that is UNAVAILABLE (no adversarial-self-review under the configured skills root) still reaches the Axiom and produces a verdict", async () => {
+  const emptyRoot = await mkdtemp(join(tmpdir(), "sahw-noreview-"));
+  const url = "http://10.0.0.1:3000/exploit";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "path_traversal", endpoint: url, control_url: "http://10.0.0.1:3000/control",
+      invariant: { statement: "file contents returned", type: "body_contains", expression: "root:x:0:0" },
+    })),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_SKILLS_ROOT: emptyRoot },
+    client: recordingScriptedClient(script), fetchImpl: differentialFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1, "the Axiom must still have produced a finding");
+  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW"); // untraced env caps CONFIRMED, per the earlier test
+  assert.equal((out.findings[0] as any).failure_cause, undefined,
+    "the underlying mechanism WAS confirmed by the Axiom — an unavailable reviewer must not fabricate a cause");
+  assert.equal(out.failure_causes.review_rejected, 0);
+});
+
+test("claim review that ERRORS (skill exits non-zero) still reaches the Axiom and produces a verdict", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sahw-badreview-"));
+  await writeFixtureReviewSkill(root, [
+    "import sys",
+    "sys.stdin.read()",
+    "sys.stderr.write('simulated crash')",
+    "sys.exit(1)",
+    "",
+  ].join("\n"));
+
+  const url = "http://10.0.0.1:3000/a";
+  const script = [call("http_request", { method: "GET", url }), say(JSON.stringify(claim("cors_misconfig", url)))];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_SKILLS_ROOT: root },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1, "the Axiom must still have produced a finding");
+  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW"); // untraced env caps CONFIRMED
+  assert.equal(out.failure_causes.review_rejected, 0);
+});
+
+test("claim review that TIMES OUT still reaches the Axiom and produces a verdict, without waiting for the full hang", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sahw-hangreview-"));
+  await writeFixtureReviewSkill(root, ["import sys, time", "sys.stdin.read()", "time.sleep(30)", ""].join("\n"));
+
+  const url = "http://10.0.0.1:3000/a";
+  const script = [call("http_request", { method: "GET", url }), say(JSON.stringify(claim("cors_misconfig", url)))];
+  const started = Date.now();
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_SKILLS_ROOT: root, SAHW_SKILL_TIMEOUT_MS: "300" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 5000, `must not wait for the full hang, took ${elapsed}ms`);
+  assert.equal(out.findings.length, 1, "the Axiom must still have produced a finding");
+  assert.equal(out.failure_causes.review_rejected, 0);
+});
+
+// ---- Failure-cause taxonomy --------------------------------------------------------
+
+test("wrong_invariant_type: a differential invariant against a class that needs a self-contained assertion", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "cors_misconfig", endpoint: url, control_url: "http://10.0.0.1:3000/control",
+      invariant: { statement: "arbitrary origin reflected", type: "body_contains", expression: "wrong-marker-abc" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "wrong_invariant_type");
+  assert.equal(out.failure_causes.wrong_invariant_type, 1);
+});
+
+test("no_control: a differential claim whose control cannot be captured is attributed no_control", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const badControl = "http://evil.example.com:9999/control"; // out of scope: gate() denies, capture() returns null
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "auth_bypass", endpoint: url, control_url: badControl,
+      invariant: { statement: "authorization bypassed", type: "body_contains", expression: "admin-marker" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "no_control");
+  assert.equal(out.failure_causes.no_control, 1);
+});
+
+test("marker_absent: the exploit response itself lacks the expected differential marker", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "xss_reflected", endpoint: url, control_url: "http://10.0.0.1:3000/control",
+      invariant: { statement: "payload reflected unescaped", type: "body_contains", expression: "xss-marker-zzz" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "marker_absent");
+  assert.equal(out.failure_causes.marker_absent, 1);
+});
+
+test("control_shared_marker: exploit AND control both exhibit the differential signal", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const sharedFetch = (async () => new Response("root:x:0:0:root:/root:/bin/bash")) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "deserialization_rce", endpoint: url, control_url: "http://10.0.0.1:3000/control",
+      invariant: { statement: "gadget chain executed", type: "body_contains", expression: "root:x:0:0" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: sharedFetch, now: NOW,
+  });
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "control_shared_marker");
+  assert.equal(out.failure_causes.control_shared_marker, 1);
+});
+
+test("endpoint_implausible: a BEHAVIOUR claim against a response whose content-type is a static asset", async () => {
+  const url = "http://10.0.0.1:3000/bundle.js";
+  const jsAssetFetch = (async () =>
+    new Response("var x = 1;", { headers: { "content-type": "application/javascript" } })) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "sqli", endpoint: url, control_url: "http://10.0.0.1:3000/control.js",
+      invariant: { statement: "boolean differential observed", type: "body_contains", expression: "sql-marker-xyz" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: jsAssetFetch, now: NOW,
+  });
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal((out.findings[0] as any).failure_cause, "endpoint_implausible");
+  assert.equal(out.failure_causes.endpoint_implausible, 1);
+});
+
+test("failure_causes counts each distinct cause across a beat, every FailureCause defaulting to 0", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const badControl = "http://evil.example.com:9999/control";
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "auth_bypass", endpoint: url("a"), control_url: badControl,
+      invariant: { statement: "authz bypassed", type: "body_contains", expression: "admin-marker" },
+    })),
+    call("http_request", { method: "GET", url: url("b") }),
+    say(JSON.stringify({
+      vuln_class: "xss_reflected", endpoint: url("b"), control_url: url("c"),
+      invariant: { statement: "payload reflected", type: "body_contains", expression: "xss-marker-zzz" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 2);
+  assert.equal(out.failure_causes.no_control, 1);
+  assert.equal(out.failure_causes.marker_absent, 1);
+  assert.equal(out.failure_causes.wrong_invariant_type, 0);
+  assert.equal(out.failure_causes.control_shared_marker, 0);
+  assert.equal(out.failure_causes.endpoint_implausible, 0);
+  assert.equal(out.failure_causes.review_rejected, 0);
+  assert.equal(out.failure_causes.unknown, 0);
+});
+
+test("the hunter's feedback for a non-CONFIRMED finding contains the SPECIFIC cause, not a generic verdict-only string", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const sharedFetch = (async () => new Response("shared-marker-1234")) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "idor", endpoint: url, control_url: "http://10.0.0.1:3000/control",
+      invariant: { statement: "other user's record returned", type: "body_contains", expression: "shared-marker-1234" },
+    })),
+    say("Nothing else to report."),
+  ];
+  const client = recordingScriptedClient(script);
+  const out = await runBeat({ env: await ENV(), client, fetchImpl: sharedFetch, now: NOW });
+  assert.equal((out.findings[0] as any).failure_cause, "control_shared_marker");
+
+  const sawSpecificCause = client.seen.some((params: any) =>
+    params.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("Cause: control_shared_marker")
+      && /shared the same marker/i.test(m.content)));
+  assert.ok(sawSpecificCause, "feedback must name the SPECIFIC cause and actionable reasoning, not just the verdict");
 });
