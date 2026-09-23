@@ -407,13 +407,15 @@ function renderAlreadyProved(proved: ProvedEntry[]): string {
     .join("\n");
   const rule = [
     "",
-    "  RULE: every vuln_class listed above is PROVED for the WHOLE engagement, not",
-    "  for the single endpoint shown next to it. Do NOT re-report a proved",
-    "  vuln_class on ANY endpoint — including an endpoint different from the one",
-    "  listed above. A second endpoint of an already-proved class is NOT a new",
-    "  finding; it is a wasted beat. If the vuln_class you are about to test is",
-    "  listed here, DISCARD that hypothesis before spending a turn on it and pick a",
-    "  DIFFERENT vuln_class from <coverage_goal>'s OPEN list instead.",
+    "  RULE: each row above is a finding ALREADY BANKED for its exact",
+    "  (vuln_class, endpoint) pair. Do NOT re-report the SAME class on the SAME",
+    "  endpoint — that exact pair is done and re-proving it is wasted budget. But",
+    "  the SAME class on a DIFFERENT endpoint IS a new, separate finding worth",
+    "  banking: findings are scored per (class, endpoint), and many classes recur",
+    "  across the app (missing rate limiting, broken access control, injection, and",
+    "  validation flaws typically appear on SEVERAL routes). So after proving a",
+    "  class once, actively hunt the SAME class on OTHER endpoints. Only the exact",
+    "  pairs listed above are off-limits.",
   ].join("\n");
   return rows + "\n" + rule;
 }
@@ -422,25 +424,32 @@ function renderCoverageGoal(proved: ProvedEntry[]): string {
   const provedSet = new Set(
     proved.map((p) => p.vuln_class).filter((v) => (VULN_CLASSES as readonly string[]).includes(v)),
   );
-  const provedClasses = VULN_CLASSES.filter((v) => provedSet.has(v));
   const openClasses = VULN_CLASSES.filter((v) => !provedSet.has(v));
+  // Show what is proved AS (class @ endpoint) pairs — a class is NOT "done" just
+  // because it was proved once; the same class on a DIFFERENT endpoint is a separate
+  // finding worth banking. Only an exact (class, endpoint) re-proof is wasted.
+  const provedPairs = [...new Set(proved
+    .filter((p) => (VULN_CLASSES as readonly string[]).includes(p.vuln_class))
+    .map((p) => `${p.vuln_class} @ ${p.endpoint}`))].sort();
   return [
-    "  Your objective this beat is BREADTH: cover as many DISTINCT vuln_classes as",
-    "  possible against this engagement, not re-confirm a class you already own. A",
-    "  strong beat proves several DIFFERENT classes once each; a beat that proves",
-    "  the same class on a second or third endpoint is not progress — the class was",
-    "  already proved the first time, so every re-proof after that displaces a",
-    "  finding you could have banked in a class that is still open.",
+    "  Your objective is COVERAGE of distinct FINDINGS, scored per",
+    "  (vuln_class, endpoint): every vuln_class that is present, on every distinct",
+    "  endpoint where it manifests. Prioritise in this order:",
+    "    1. OPEN classes below — a class not yet proved ANYWHERE is the highest",
+    "       value; prove each at least once.",
+    "    2. A proved class on a NEW endpoint — many classes recur across the app",
+    "       (rate limiting is typically absent on MANY endpoints, not one; access",
+    "       control / IDOR, injection, and validation flaws each tend to appear on",
+    "       several distinct routes). If you have proved a class once, actively look",
+    "       for the SAME class on OTHER endpoints — each distinct endpoint is a",
+    "       separate finding that counts.",
     "",
-    "  ANTI-PATTERN, name it and forbid it: re-probing an endpoint that already",
-    "  yielded a CONFIRMED finding of some class, in order to claim that SAME class",
-    "  again — whether on that same endpoint or a different one — is the single",
-    "  most common way a beat wastes its budget. Recognize it before you start the",
-    "  probe, not after: if the class you are about to test is already proved (see",
-    "  <already_proved>), stop and choose a different one from OPEN below.",
+    "  The ONE thing that is pure waste: re-proving the EXACT same (class, endpoint)",
+    "  pair you already banked (see <already_proved>). A different endpoint of a",
+    "  proved class is NOT waste — it is a new finding. Do not stop at one-per-class.",
     "",
-    `  PROVED — ${provedClasses.length}/${VULN_CLASSES.length}, do not re-report: ${provedClasses.length ? provedClasses.join(", ") : "none yet"}`,
-    `  OPEN — ${openClasses.length}/${VULN_CLASSES.length}, this is your target list this beat: ${openClasses.length ? openClasses.join(", ") : "none — every class is already proved"}`,
+    `  OPEN classes — ${openClasses.length}/${VULN_CLASSES.length}, prove each at least once: ${openClasses.length ? openClasses.join(", ") : "none — now widen every proved class to its OTHER endpoints"}`,
+    `  ALREADY BANKED (class @ endpoint) — do not repeat these exact pairs, but DO pursue the same classes on other endpoints: ${provedPairs.length ? provedPairs.join("; ") : "none yet"}`,
   ].join("\n");
 }
 

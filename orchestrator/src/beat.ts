@@ -819,7 +819,17 @@ export async function runBeat(opts: {
         // the spine's prior beats, then grown as THIS beat itself confirms classes (see
         // the provedEntries.push() site below) — so a second CONFIRMED hit on the SAME
         // class later in this same beat is caught too, not just across beats.
-        const provedVulnClasses = new Set(spineLoad.spine.proved.map((p) => p.vuln_class));
+        // Keyed on (class, endpoint), NOT class alone: the benchmark scores each
+        // (vuln_class, endpoint, invariant) finding separately, and several classes
+        // legitimately have MULTIPLE findings on distinct endpoints (e.g. rate-limit
+        // absence at login vs signup vs OTP; auth_bypass at the reset chain vs the
+        // change-password endpoint). Suppressing every re-use of a proved CLASS made
+        // those extra findings structurally unreachable. We still suppress an exact
+        // (class, endpoint) re-proof — that IS pure waste — but a proved class on a
+        // NEW endpoint is now allowed through to the Axiom, which still requires a
+        // genuine proof, so this can never manufacture a finding that isn't real.
+        const provedByEndpoint = new Set(
+          spineLoad.spine.proved.map((p) => `${p.vuln_class}::${p.endpoint}`));
         let alreadyProvedSuppressed = 0;
         const rejectedClaims: RejectedClaim[] = [];
         const failureCauses = emptyFailureCauses();
@@ -1054,16 +1064,13 @@ export async function runBeat(opts: {
             continue;
           }
 
-          // A class already CONFIRMED anywhere in this engagement (a prior beat, or an
-          // earlier finding banked THIS beat) is never replayed — neither claim review
-          // nor the Axiom ever runs, and no request reaches the target. The rubric
-          // scores a class once, so re-proving it on a different endpoint is pure
-          // budget waste; this is a deterministic backstop to the brief's
-          // <prioritization_rules> guidance, which a prompt cannot itself guarantee
-          // under budget pressure. Distinct from a rejection — the claim is not wrong,
-          // it is redundant — so it is fed back and counted separately, never banked
-          // as a finding.
-          if (provedVulnClasses.has(claim.vuln_class)) {
+          // An exact (class, endpoint) already CONFIRMED anywhere in this engagement
+          // (a prior beat, or an earlier finding banked THIS beat) is never replayed —
+          // that is pure budget waste. A proved class on a DIFFERENT endpoint is NOT
+          // suppressed: the benchmark scores per (class, endpoint, invariant), so a
+          // second finding of the same class elsewhere is real progress, and the Axiom
+          // still gates it on a genuine proof.
+          if (provedByEndpoint.has(`${claim.vuln_class}::${claim.endpoint}`)) {
             alreadyProvedSuppressed += 1;
             messages.push({ role: "user", content: feedbackForAlreadyProved(claim.vuln_class, claim.endpoint) });
             continue;
@@ -1268,8 +1275,9 @@ export async function runBeat(opts: {
               invariant_type: claim.invariant.type, verdict: gated.status, finding_id: row.finding_id,
             });
             // Grow the same-beat set immediately — a second CONFIRMED hit on this
-            // class later in THIS beat must be short-circuited too, not just next beat.
-            provedVulnClasses.add(claim.vuln_class);
+            // (class, endpoint) later in THIS beat must be short-circuited too, not
+            // just next beat. A DIFFERENT endpoint of the same class stays allowed.
+            provedByEndpoint.add(`${claim.vuln_class}::${claim.endpoint}`);
           } else {
             attemptedEntries.push({
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,

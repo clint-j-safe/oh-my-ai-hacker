@@ -1069,12 +1069,12 @@ test("a session-threaded claim's auth token never appears in the spine's persist
 
 // ---- Already-proved short-circuit (Gap 2: beats re-proving already-CONFIRMED classes) --
 //
-// The coverage-brief prompt asks the hunter not to re-report a class already proved,
-// but a prompt cannot guarantee that under budget pressure. This is the deterministic
-// backstop: a claim whose vuln_class is already CONFIRMED anywhere in the engagement
-// (a prior beat's spine.proved) is never replayed against the target at all.
+// The deterministic backstop is keyed on (class, endpoint): re-claiming the EXACT
+// same pair already banked is short-circuited, but the SAME class on a DIFFERENT
+// endpoint is a distinct finding (the benchmark scores per class+endpoint) and must
+// be allowed through to the Axiom — the loop must not stop at one-per-class.
 
-test("a claim whose vuln_class is already proved in the spine is short-circuited before the Axiom — the target fetch is never called for it", async () => {
+test("only the EXACT (class, endpoint) re-proof is short-circuited; the same class on a NEW endpoint reaches the Axiom", async () => {
   const env = await TRACED_ENV();
   const urlA = "http://10.0.0.1:3000/a";
   const urlRecon = "http://10.0.0.1:3000/recon";
@@ -1093,19 +1093,18 @@ test("a claim whose vuln_class is already proved in the spine is short-circuited
   assert.equal(first.findings.length, 1);
   assert.equal(first.findings[0].verdict, "CONFIRMED");
 
-  // Beat 2, SAME engagement/workspace: the hunter explores an unrelated recon endpoint
-  // (satisfying the beat's own minimum-activity stall rule) then — wrongly, or under
-  // budget pressure — re-claims clickjacking on a DIFFERENT endpoint (/b) it never
-  // actually probed, proving the short-circuit fires from the claim alone, before any
-  // replay of /b would ever occur.
+  // Beat 2, SAME engagement/workspace: re-claim clickjacking on the ALREADY-PROVED
+  // endpoint /a (must be suppressed), and ALSO claim clickjacking on a NEW endpoint
+  // /b (must NOT be suppressed — a distinct finding that reaches the target/Axiom).
   const fetchedUrls: string[] = [];
   const spyFetch = (async (u: string | URL) => {
     fetchedUrls.push(String(u));
-    return new Response("OK");
+    return new Response("OK");   // bare response -> a "!header:x-frame-options" claim holds
   }) as unknown as typeof fetch;
   const script2 = [
     call("http_request", { method: "GET", url: urlRecon }),
-    say(JSON.stringify(claim("clickjacking", urlB))),
+    say(JSON.stringify(claim("clickjacking", urlA))),   // exact re-proof -> suppressed
+    say(JSON.stringify(claim("clickjacking", urlB))),   // new endpoint -> allowed
     say("Nothing else to report."),
   ];
   const client2 = recordingScriptedClient(script2);
@@ -1114,10 +1113,13 @@ test("a claim whose vuln_class is already proved in the spine is short-circuited
     client: client2, fetchImpl: spyFetch, now: NOW,
   });
 
-  assert.equal(second.already_proved_suppressed, 1);
-  assert.equal(second.findings.length, 0, "a short-circuited claim must not be banked as a finding");
-  assert.ok(fetchedUrls.includes(urlRecon), "sanity: the unrelated recon call itself did reach fetch");
-  assert.ok(!fetchedUrls.includes(urlB), "the already-proved claim must never reach the target at all");
+  assert.equal(second.already_proved_suppressed, 1, "the exact (clickjacking, /a) re-proof is suppressed");
+  assert.ok(!fetchedUrls.includes(urlA), "the already-proved exact pair must never reach the target");
+  assert.ok(fetchedUrls.includes(urlB), "the same class on a NEW endpoint MUST reach the Axiom/target");
+  assert.ok(
+    second.findings.some((f) => f.endpoint === urlB && f.vuln_class === "clickjacking"),
+    "the same class on a new endpoint is banked as a distinct finding, not suppressed",
+  );
 
   // Fed back as already-covered, distinct wording from the plain duplicate-in-beat path.
   const sawFeedback = client2.seen.some((params: any) =>
@@ -1141,13 +1143,13 @@ test("a claim whose vuln_class is NOT yet proved still reaches the Axiom normall
   assert.equal(out.findings[0].verdict, "CONFIRMED");
 });
 
-test("a class CONFIRMED earlier in THIS SAME beat also short-circuits a later same-class claim (no second-beat round trip needed)", async () => {
+test("within one beat, the same class on a NEW endpoint is a distinct finding (both banked) — coverage is per (class, endpoint), not per class", async () => {
   const urlA = "http://10.0.0.1:3000/a";
   const urlB = "http://10.0.0.1:3000/b";
   const fetchedUrls: string[] = [];
   const spyFetch = (async (u: string | URL) => {
     fetchedUrls.push(String(u));
-    return new Response("OK");
+    return new Response("OK");   // bare -> "!header:x-frame-options" holds on both
   }) as unknown as typeof fetch;
   const script = [
     call("http_request", { method: "GET", url: urlA }),
@@ -1159,9 +1161,11 @@ test("a class CONFIRMED earlier in THIS SAME beat also short-circuits a later sa
     env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
     client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW,
   });
-  assert.equal(out.findings.length, 1);
-  assert.equal(out.already_proved_suppressed, 1);
-  assert.ok(!fetchedUrls.includes(urlB), "the second, same-class claim must never reach the target this beat either");
+  assert.equal(out.findings.length, 2, "same class on two distinct endpoints = two findings");
+  assert.equal(out.already_proved_suppressed, 0, "a different endpoint is not an already-proved re-proof");
+  assert.ok(fetchedUrls.includes(urlA) && fetchedUrls.includes(urlB), "both distinct endpoints reach the target");
+  const endpoints = out.findings.map((f) => f.endpoint).sort();
+  assert.deepEqual(endpoints, [urlA, urlB]);
 });
 
 // ---- Brief coverage-breadth discipline (src/brief.ts) -----------------------------
@@ -1200,22 +1204,23 @@ test("brief: a spine with proved classes [clickjacking, cors_misconfig] names bo
   assert.match(alreadyProved, /vuln_class="cors_misconfig"/);
 
   const coverageGoal = briefSection(xml, "coverage_goal");
-  const provedLine = coverageGoal.split("\n").find((l) => /^\s*PROVED/.test(l));
-  const openLine = coverageGoal.split("\n").find((l) => /^\s*OPEN/.test(l));
-  assert.ok(provedLine, "coverage_goal must contain a PROVED line");
-  assert.ok(openLine, "coverage_goal must contain an OPEN line");
-  assert.match(provedLine!, /clickjacking/);
-  assert.match(provedLine!, /cors_misconfig/);
-  // sqli was not proved in this state — it must be presented as an OPEN target,
-  // not lumped in with the proved classes.
+  const openLine = coverageGoal.split("\n").find((l) => /^\s*OPEN classes/.test(l));
+  const bankedLine = coverageGoal.split("\n").find((l) => /ALREADY BANKED/.test(l));
+  assert.ok(openLine, "coverage_goal must contain an OPEN classes line");
+  assert.ok(bankedLine, "coverage_goal must list already-banked (class @ endpoint) pairs");
+  // sqli was not proved — it is an OPEN class to prove at least once.
   assert.match(openLine!, /\bsqli\b/);
-  assert.doesNotMatch(openLine!, /clickjacking/, "a proved class must not also appear in the OPEN target list");
-  assert.doesNotMatch(openLine!, /cors_misconfig/, "a proved class must not also appear in the OPEN target list");
-  // framing: the OPEN line must read as the beat's target, not a neutral list.
-  assert.match(coverageGoal, /target list/i);
+  assert.doesNotMatch(openLine!, /clickjacking/, "a proved class is not in the OPEN-classes list");
+  assert.doesNotMatch(openLine!, /cors_misconfig/, "a proved class is not in the OPEN-classes list");
+  // The banked line shows the exact proved pairs (class @ endpoint), which the hunter
+  // must not repeat — but the SAME classes on other endpoints remain fair game.
+  assert.match(bankedLine!, /clickjacking @ /);
+  assert.match(bankedLine!, /cors_misconfig @ /);
+  // framing: coverage is per-finding and must invite pursuing other endpoints.
+  assert.match(coverageGoal, /other endpoints/i);
 });
 
-test("brief: <already_proved> carries the imperative 'do not re-report a proved class on any endpoint' rule", () => {
+test("brief: <already_proved> forbids re-proving the EXACT (class, endpoint) pair but invites the same class on OTHER endpoints", () => {
   const state: HunterBriefState = {
     ...BRIEF_EMPTY_STATE,
     proved: [
@@ -1224,11 +1229,11 @@ test("brief: <already_proved> carries the imperative 'do not re-report a proved 
   };
   const xml = buildHunterBrief(state);
   const alreadyProved = briefSection(xml, "already_proved");
-  // Must be an imperative NOT to re-report a proved class on ANY endpoint (not just
-  // the one it was first proved on) — this is the exact discipline the observed
-  // 4-beat run's beats 3-4 violated.
-  assert.match(alreadyProved, /do not re-report a proved\s+vuln_class on any endpoint/i);
-  assert.match(alreadyProved, /second endpoint of an already-proved class is not a new/i);
+  // The new per-(class,endpoint) policy: the exact pair is off-limits, but the same
+  // class on a DIFFERENT endpoint is a separate finding to pursue.
+  assert.match(alreadyProved, /same class on a different endpoint is a new/i);
+  assert.match(alreadyProved, /scored per \(class, endpoint\)/i);
+  assert.match(alreadyProved, /only the exact\s+pairs listed above are off-limits/i);
 });
 
 test("brief: <evidence_discipline> forbids a behaviour claim on a static asset, and <output_contract> forbids a prose/parenthetical vuln_class", () => {
