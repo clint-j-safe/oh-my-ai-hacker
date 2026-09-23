@@ -181,12 +181,18 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
             description:
               "The signup request body, JSON-encoded as a string, in EXACTLY the " +
               "envelope shape you recovered from the target — but with the literal " +
-              "placeholder tokens {{username}}, {{email}} and {{password}} in place " +
-              "of real values, inside the JSON string's own quotes. Example: " +
+              "placeholder tokens {{username}}, {{email}}, {{password}} and " +
+              "{{mobile}} in place of real values, inside the JSON string's own " +
+              "quotes. Example: " +
               '\'{"user":{"username":"{{username}}","email":"{{email}}",' +
-              '"password":"{{password}}"}}\'. The orchestrator substitutes ' +
-              "framework-generated disposable credentials for these placeholders " +
-              "before sending; you never see or choose the actual values.",
+              '"password":"{{password}}","mobile":"{{mobile}}"}}\'. The orchestrator ' +
+              "substitutes framework-generated disposable credentials for these " +
+              "placeholders before sending; you never see or choose the actual " +
+              "values. {{mobile}} is a unique 10-digit number for signup forms that " +
+              "require a phone; {{password}} is alphanumeric (mixed case + digit). " +
+              "For any OTHER required field the target has (first/last name, gender, " +
+              "country, dob, ...), put a literal value that satisfies its rule " +
+              "directly in the template — those are not secret.",
           },
           signup_response_token_path: {
             type: "string",
@@ -205,7 +211,22 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
             type: "string",
             description:
               "Same templating convention as signup_body_template, for the login " +
-              "request body. Empty string if login_url is empty.",
+              "request body. Empty string if login_url is empty. In ADDITION to " +
+              "{{username}}/{{email}}/{{password}}/{{mobile}}, you may use " +
+              "{{login_id}} here — it is filled with the value extracted from the " +
+              "signup response at login_id_from_signup_path (see that field). Use it " +
+              "when the target logs you in by a server-assigned id (an account or " +
+              "user id it minted at signup) rather than by the email/username you " +
+              "chose.",
+          },
+          login_id_from_signup_path: {
+            type: "string",
+            description:
+              "Dot-path into the PARSED JSON signup response to a server-assigned " +
+              "identifier that the LOGIN request requires (e.g. \"data.userId\", an " +
+              "account/customer id). Its value is exposed to login_body_template as " +
+              "{{login_id}}. Empty string when login uses the same email/username you " +
+              "supplied at signup and no signup-minted id is needed.",
           },
           login_response_token_path: {
             type: "string",
@@ -223,8 +244,8 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
         },
         required: [
           "signup_url", "signup_method", "signup_body_template", "signup_response_token_path",
-          "login_url", "login_method", "login_body_template", "login_response_token_path",
-          "auth_header_name",
+          "login_url", "login_method", "login_body_template", "login_id_from_signup_path",
+          "login_response_token_path", "auth_header_name",
         ],
       },
     },
@@ -958,7 +979,17 @@ export class ToolRunner {
     }
 
     const credentials = generateDisposableCredentials(label);
-    const vars = { username: credentials.username, email: credentials.email, password: credentials.password };
+    // Placeholders available to BOTH templates. {{login_id}} is added to the login
+    // vars only after signup, from the signup response (see below).
+    const vars = {
+      username: credentials.username, email: credentials.email,
+      password: credentials.password, mobile: credentials.mobile,
+    };
+    // Optional dot-path into the SIGNUP RESPONSE whose value the login request needs
+    // (the common "signup mints a server-assigned identifier — an account number /
+    // user id / cust id — that is the login username" pattern). When set, the value
+    // is extracted after signup and exposed to login_body_template as {{login_id}}.
+    const loginIdPath = String(args.login_id_from_signup_path ?? "").trim();
 
     const signupBody = fillCredentialTemplate(signupTemplate, vars, "signup_body_template");
     const signup = await this.http({
@@ -1003,8 +1034,22 @@ export class ToolRunner {
     let loginDiag: {
       login_status: number; login_artifact: string; login_body_preview?: string;
     } | null = null;
+    // Set when the caller asked for a signup-response id but the path did not resolve
+    // to one — the login is then almost certain to fail, and this steers the fix.
+    let loginIdMissing = false;
     if (authMaterial === null && loginUrl) {
-      const loginBody = fillCredentialTemplate(loginTemplate, vars, "login_body_template");
+      // Thread the server-assigned identifier from the signup response into the login
+      // request as {{login_id}}. It is NOT a secret (it is an account/user id the
+      // target itself just echoed, not a token), so it is safe to substitute into a
+      // request body; the actual token is still only ever read via
+      // login_response_token_path below and never returned.
+      const loginVars: Record<string, string> = { ...vars };
+      if (loginIdPath) {
+        const id = extractTokenFromBody(signup.response.body, loginIdPath);
+        if (id !== null) loginVars.login_id = id;
+        else loginIdMissing = true;
+      }
+      const loginBody = fillCredentialTemplate(loginTemplate, loginVars, "login_body_template");
       const login = await this.http({
         method: loginMethod, url: loginUrl,
         headers: { "content-type": "application/json" }, body: loginBody,
@@ -1039,11 +1084,18 @@ export class ToolRunner {
       signup_artifact: signup.artifact.sha256,
       ...(loginDiag ?? {}),
       ...(meta.has_auth_material ? {} : {
-        hint:
-          "account was CREATED on the target but no auth token was recovered. If a " +
-          "login step is required, set login_url + login_body_template; if the token " +
-          "is present but under a different key, grep_artifact the login/signup " +
-          "artifact to find the real token path and set signup_/login_response_token_path.",
+        hint: loginIdMissing
+          ? "account was CREATED but login_id_from_signup_path did not resolve to a " +
+            "value in the signup response, so {{login_id}} was left unfilled and login " +
+            "could not use the server-assigned id — grep_artifact the signup_artifact " +
+            "to find where the id (account/user/cust id) actually is and fix the path."
+          : "account was CREATED on the target but no auth token was recovered. If a " +
+            "login step is required, set login_url + login_body_template; if login " +
+            "needs a server-assigned id from the signup response (e.g. an account or " +
+            "user id, not the email), set login_id_from_signup_path and reference it " +
+            "as {{login_id}} in login_body_template; if the token is present but under " +
+            "a different key, grep_artifact the login/signup artifact to find the real " +
+            "token path and set signup_/login_response_token_path.",
       }),
     };
   }

@@ -36,8 +36,19 @@ export interface SessionCredentials {
   /** A synthetic, CSPRNG-derived password. Not a "real" secret in the sense of
    * something a human chose or reused — but still handled as one: it is a
    * SessionCredentials field, subject to the same never-persisted discipline as
-   * auth_material. */
+   * auth_material. Charset is deliberately restricted to [A-Za-z0-9] with a
+   * guaranteed upper/lower/digit and length <=20, because exotic specials (- ! + /)
+   * are the single most common reason a target's signup charset filter rejects an
+   * otherwise valid password — a broadly-safe password is generic robustness, not
+   * target knowledge. */
   password: string;
+  /** A synthetic, unique 10-digit numeric identifier for signup forms that require a
+   * phone/mobile-shaped field (a near-universal signup field, frequently with a
+   * uniqueness constraint). CSPRNG-derived per label so two accounts effectively
+   * never collide; if a target enforces uniqueness and one does collide, signup just
+   * rejects it and the caller retries (register_account's envelope-from-error path).
+   * Not a real, dialable number. */
+  mobile: string;
 }
 
 /** Non-secret session metadata — the ONLY shape safe to persist to the spine, log
@@ -89,13 +100,25 @@ export function maxAccountsFromEnv(env: Record<string, string | undefined> = pro
 export function generateDisposableCredentials(label: string): SessionCredentials {
   const suffix = randomBytes(6).toString("hex");
   const tag = `sahw-test-${label.toLowerCase()}-${suffix}`;
+  // Alphanumeric-only, with a guaranteed uppercase + lowercase + digit and length
+  // <=20 (see SessionCredentials.password). "S" + 14 hex chars (0-9a-f) + "z9" = 17
+  // chars, always satisfying upper/lower/digit and matching any [A-Za-z0-9]-only
+  // policy without the exotic specials that trip charset filters.
+  const password = `S${randomBytes(7).toString("hex")}z9`;
+  // A 10-digit synthetic mobile, first digit fixed non-zero, rest CSPRNG-derived (see
+  // SessionCredentials.mobile). Modulo keeps it within 9 digits so the "9" prefix is
+  // never dropped by padding.
+  const nine = (parseInt(randomBytes(5).toString("hex"), 16) % 1_000_000_000)
+    .toString()
+    .padStart(9, "0");
   return {
     username: tag,
     // .test is an IANA-reserved TLD (RFC 2606) that is guaranteed to never resolve
     // to a real mailbox — this is never a real address, and never sent anywhere
     // but the target's own discovered signup/login endpoints.
     email: `${tag}@example.test`,
-    password: `Sahw-Test-${randomBytes(9).toString("base64url")}!1`,
+    password,
+    mobile: `9${nine}`,
   };
 }
 

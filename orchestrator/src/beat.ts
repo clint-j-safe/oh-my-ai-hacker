@@ -561,8 +561,8 @@ function inferRecoveredIntel(scopeOrigins: string[], endpoints: SpineEndpoint[])
 
 const SIGNUP_FLOW_INTEL_KEYS = [
   "signup_url", "signup_method", "signup_body_template", "signup_response_token_path",
-  "login_url", "login_method", "login_body_template", "login_response_token_path",
-  "auth_header_name",
+  "login_url", "login_method", "login_body_template", "login_id_from_signup_path",
+  "login_response_token_path", "auth_header_name",
 ] as const;
 
 type SignupFlowArgs = Record<(typeof SIGNUP_FLOW_INTEL_KEYS)[number], string>;
@@ -596,6 +596,7 @@ function discoveredSignupFlow(intel: RecoveredIntel): SignupFlowArgs | null {
     login_url: str("login_url"),
     login_method: str("login_method") || "POST",
     login_body_template: str("login_body_template"),
+    login_id_from_signup_path: str("login_id_from_signup_path"),
     login_response_token_path: str("login_response_token_path"),
     auth_header_name,
   };

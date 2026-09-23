@@ -708,6 +708,56 @@ test("register_account: a 2xx login whose token path is wrong yields a tokenless
   assert.equal(res.login_body_preview, undefined, "2xx login body is surfaced by artifact id only, never inlined");
 });
 
+test("register_account: threads a server-assigned id from the signup response into the login request via {{login_id}} (and fills {{mobile}} + a charset-safe password)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  let signupMobile = "";
+  let signupPassword = "";
+  const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+    const u = String(url);
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (u.endsWith("/api/signup")) {
+      signupMobile = body.mobile;
+      signupPassword = body.password;
+      // Signup mints a server-assigned customer id and returns NO token — exactly the
+      // shape that structurally defeated the old templating.
+      return new Response(JSON.stringify({ data: { userId: "BNK54321" } }), {
+        status: 201, headers: { "content-type": "application/json" },
+      });
+    }
+    // Login ONLY issues a token when the userid is the signup-minted id, not the email.
+    if (body.userid === "BNK54321") {
+      return new Response(JSON.stringify({ data: { token: "jwt-for-BNK54321" } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ error: "LGN001" }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  const r = new ToolRunner({ engagement: E, store, fetchImpl, sessionStore: new SessionStore({ maxAccounts: 2 }) });
+  const out = await r.execute("register_account", {
+    ...registerArgsBase,
+    signup_url: "http://10.0.0.1:3000/api/signup",
+    signup_body_template: '{"email":"{{email}}","password":"{{password}}","mobile":"{{mobile}}"}',
+    signup_response_token_path: "",   // signup carries no token
+    login_url: "http://10.0.0.1:3000/api/login",
+    login_body_template: '{"userid":"{{login_id}}","passwd":"{{password}}"}',
+    login_id_from_signup_path: "data.userId",
+    login_response_token_path: "data.token",
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  assert.equal((out.result as any).label, "A");
+  assert.equal((out.result as any).obtained_auth_material, true,
+    "login must succeed using the signup-minted id threaded in as {{login_id}}");
+  // {{mobile}} substituted with a unique 10-digit number; {{password}} charset-safe.
+  assert.match(signupMobile, /^\d{10}$/, "{{mobile}} must be a 10-digit number");
+  assert.match(signupPassword, /^[A-Za-z0-9]+$/, "generated password must be alphanumeric (no charset-tripping specials)");
+  assert.ok(signupPassword.length <= 20, "generated password must satisfy a <=20 length policy");
+});
+
 test("http_request with session:A injects auth material; the returned capture and stored artifact redact it", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sahw-"));
   const store = new ArtifactStore(dir);
