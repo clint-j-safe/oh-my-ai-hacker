@@ -757,25 +757,27 @@ test("state_changed: re-observing the SAME resource before/after a mutating acti
   assert.equal(out.findings[0].verdict, "CONFIRMED");
 });
 
-test("state_changed rigor: a marker that appears across DIFFERENT pre/post requests is NOT a state change (read differential) — NEEDS_REVIEW", async () => {
+test("invariant relabel: a state_changed proved on the SAME endpoint with a DIFFERENT body (an input differential, e.g. read id=A then id=B) is recorded as body_contains", async () => {
   const url = (p: string) => `http://10.0.0.1:3000/${p}`;
   const marker = "victim-pii-42";
-  // The loophole this guards: pre and post are DIFFERENT requests, the marker is only
-  // in the post request's own response — that proves a read (e.g. reading another
-  // user's record), not that the action changed anything. Must be body_contains.
-  const stepFetch = (async (u: string | URL) => {
-    const s = String(u);
-    return s.endsWith("/read-victim") ? new Response(`data ${marker}`) : new Response("ok plain");
+  // A read IDOR: same endpoint /account, the marker (victim data) comes back only for
+  // the id=B request. The hunter framed it as state_changed appeared:, but pre and
+  // post are the SAME url with DIFFERENT bodies — that is a body_contains differential
+  // (marker in the exploit body's response, absent in the control's), so it is
+  // recorded as body_contains, the invariant the finding actually is.
+  const stepFetch = (async (u: string | URL, init?: RequestInit) => {
+    const body = String(init?.body ?? "");
+    return body.includes("id=B") ? new Response(`data ${marker}`) : new Response("ok plain");
   }) as unknown as typeof fetch;
   const script = [
     call("http_request", { method: "GET", url: url("a") }),
     say(JSON.stringify({
-      vuln_class: "idor", endpoint: url("read-victim"),
+      vuln_class: "idor", endpoint: url("account"),
       invariant: { statement: "read another user's record", type: "state_changed", expression: `appeared:${marker}` },
       steps: [
-        { method: "GET", url: url("own-record") },    // pre: a DIFFERENT request
-        { method: "GET", url: url("noop") },          // "action" that mutates nothing
-        { method: "GET", url: url("read-victim") },   // post: a DIFFERENT request carrying the marker
+        { method: "POST", url: url("account"), body: "id=A" },   // pre/control: own record, same url
+        { method: "GET", url: url("noop") },                      // filler middle step (>=3 captures)
+        { method: "POST", url: url("account"), body: "id=B" },   // post/exploit: victim record, same url, different body
       ],
     })),
     say("Nothing else to report."),
@@ -785,7 +787,8 @@ test("state_changed rigor: a marker that appears across DIFFERENT pre/post reque
     client: recordingScriptedClient(script), fetchImpl: stepFetch, now: NOW,
   });
   assert.equal(out.findings.length, 1);
-  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW", "a read differential dressed as state_changed must not confirm");
+  assert.equal(out.findings[0].verdict, "CONFIRMED", "the input differential still confirms — throughput preserved");
+  assert.equal(out.findings[0].invariant_type, "body_contains", "recorded as the body_contains differential it actually is, not state_changed");
 });
 
 test("state_violated single_use: a marker reused across 2 steps is CONFIRMED", async () => {

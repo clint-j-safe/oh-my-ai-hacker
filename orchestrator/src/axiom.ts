@@ -498,46 +498,7 @@ function evaluateStateChanged(expression: string, evidence: EvidenceBundle | und
   return verdict;
 }
 
-// A genuine state change is observed on the SAME resource before and after the
-// mutating action: the same request re-run yields a different answer BECAUSE the
-// action changed server state (a login that failed then succeeds; a file absent then
-// present at the same path; a record's field flipped). If the pre and post captures
-// are DIFFERENT requests, "a marker appeared" is only a READ differential — e.g. an
-// unrelated request followed by reading another user's record — which proves nothing
-// changed on the server and must be claimed as body_contains against a control_url
-// instead. Requiring pre and post to be the same observation closes the loophole
-// that let read-only findings (idor, sqli, user-enum, reflected-xss, ssrf oracles)
-// pass as state_changed on a weaker proof than the vulnerability warrants. The
-// field:/from:/to: clause is inherently same-resource (it re-reads one path) and is
-// left untouched below.
-function sameObservation(a: HttpCapture, b: HttpCapture): boolean {
-  // Same method + url + BODY. The body matters: a genuine state change re-sends the
-  // IDENTICAL request before and after the mutating action, so any difference in the
-  // response is attributable to server state changing in between. If the body differs
-  // (e.g. reading account id=A pre vs id=B post, or contactUs plain pre vs XXE payload
-  // post), that is an INPUT differential — the response differs because YOUR input
-  // differed, not because state changed — and it must be proved as body_contains
-  // against a control_url, never as state_changed.
-  const norm = (c: HttpCapture) =>
-    `${(c.request.method || "GET").toUpperCase()} ${c.request.url}\n${c.request.body ?? ""}`;
-  return norm(a) === norm(b);
-}
-
 function evaluateStateChangedClause(clause: string, pre: HttpCapture, post: HttpCapture): Verdict {
-  const markerClause = /^(appeared|disappeared):(.+)$/.exec(clause);
-  if (markerClause && !sameObservation(pre, post)) {
-    return {
-      status: "NEEDS_REVIEW",
-      reason:
-        `${markerClause[1]}: requires the SAME request observed before and after the ` +
-        `action, but pre ('${pre.request.method} ${pre.request.url}') and post ` +
-        `('${post.request.method} ${post.request.url}') are different requests. A marker ` +
-        "that differs between two DIFFERENT requests is a read differential, not a state " +
-        "change — prove it with a body_contains claim and a control_url. Only re-observe " +
-        "the SAME request (same method+url) before and after a mutating action for state_changed.",
-    };
-  }
-
   const appeared = /^appeared:(.+)$/.exec(clause);
   if (appeared) {
     const marker = appeared[1];

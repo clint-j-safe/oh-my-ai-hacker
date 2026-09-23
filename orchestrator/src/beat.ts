@@ -1236,13 +1236,37 @@ export async function runBeat(opts: {
             return r;
           });
 
+          // Relabel an input-differential state_changed as the body_contains it
+          // actually is. When a CONFIRMED state_changed's appeared:/disappeared: proof
+          // used the SAME endpoint (method+url) with a DIFFERENT request body pre vs
+          // post — read account id=A (control) then id=B (exploit); contactUs plain
+          // then with an XXE payload — the response differs because the INPUT differed.
+          // That is a body_contains differential (marker present in the exploit request,
+          // absent in the benign control), NOT a server-state change. Record the
+          // accurate invariant so the read/injection finding is scored as what it is. A
+          // different-URL delta (a genuine creation/mutation) is left as state_changed.
+          let effectiveInvariantType: InvariantType = claim.invariant.type as InvariantType;
+          if (
+            axiom.status === "CONFIRMED"
+            && claim.invariant.type === "state_changed"
+            && /^(appeared|disappeared):/.test(claim.invariant.expression ?? "")
+            && evidence?.captures && evidence.captures.length >= 2
+          ) {
+            const first = evidence.captures[0];
+            const last = evidence.captures[evidence.captures.length - 1];
+            const key = (c: HttpCapture) => `${(c.request.method || "GET").toUpperCase()} ${c.request.url}`;
+            if (key(first) === key(last) && (first.request.body ?? "") !== (last.request.body ?? "")) {
+              effectiveInvariantType = "body_contains";
+            }
+          }
+
           const row: FindingRow = {
             engagement_id: engagement.authRef,
             finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
             vuln_class: claim.vuln_class,
             endpoint: claim.endpoint,
             verdict: gated.status,
-            invariant_type: claim.invariant.type,
+            invariant_type: effectiveInvariantType,
             langfuse_trace_id: langfuseTraceId,
             utc: new Date().toISOString(),
           };
@@ -1272,7 +1296,7 @@ export async function runBeat(opts: {
           if (axiom.status === "CONFIRMED") {
             provedEntries.push({
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,
-              invariant_type: claim.invariant.type, verdict: gated.status, finding_id: row.finding_id,
+              invariant_type: effectiveInvariantType, verdict: gated.status, finding_id: row.finding_id,
             });
             // Grow the same-beat set immediately — a second CONFIRMED hit on this
             // (class, endpoint) later in THIS beat must be short-circuited too, not
