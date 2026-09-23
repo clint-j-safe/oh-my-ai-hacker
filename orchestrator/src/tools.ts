@@ -765,6 +765,20 @@ export class ToolRunner {
     return this.sessions.allMeta();
   }
 
+  /** A live auth token from the first session that holds one, for ORCHESTRATOR-side
+   * deterministic proofs (e.g. feeding a JWT to the hs256_weak_key deriver). This is
+   * the one place the raw material is read back out — deliberately never reaches the
+   * model (no tool result carries it), only the deterministic prover in beat.ts. Null
+   * if no session has a token yet. */
+  getUsableSessionToken(): { label: string; token: string; authHeaderName: string } | null {
+    for (const m of this.sessions.allMeta()) {
+      if (!m.has_auth_material) continue;
+      const token = this.sessions.authMaterialFor(m.label);
+      if (token) return { label: m.label, token, authHeaderName: m.auth_header_name };
+    }
+    return null;
+  }
+
   /** The known-good registration envelope (non-secret) from the last token-obtaining
    * register_account call this run, or null if none succeeded. beat.ts merges it into
    * the spine so the next beat re-registers deterministically. See the field's own doc. */

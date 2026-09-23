@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, extractJwtKeyCandidates, jwtIssuanceEndpoint } from "../src/beat.js";
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
@@ -1534,4 +1534,23 @@ test("buildRunSession: every beat of the SAME run shares ONE session id (run-sta
   // An explicit override still wins.
   const forced = buildRunSession({ scope, runId, now: new Date(), override: "my-session" });
   assert.equal(forced.sessionId, "my-session");
+});
+
+test("extractJwtKeyCandidates: pulls the source-recovered signing key literal (e.g. 'unsafebank') from intel prose", () => {
+  const cands = extractJwtKeyCandidates({
+    jwt_key_source: "LoginModuleHandler::new_token line 13 hardcodes the HS256 key as the literal lowercase app-name word 'unsafebank' (readable unauthenticated)",
+    token_scheme: "HS256 JWT via jwt_helper, HARDCODED static 10-char lowercase app-name key",
+    unrelated: "some other note about /api/login",
+  } as any);
+  assert.ok(cands.includes("unsafebank"), "the quoted key literal must be a candidate");
+  assert.ok(cands.length <= 40);
+});
+
+test("jwtIssuanceEndpoint: uses the discovered login_url, else falls back to the in-scope /api/login", () => {
+  assert.equal(
+    jwtIssuanceEndpoint({ login_url: "http://10.0.0.1:3000/api/login" } as any, ["http://10.0.0.1:3000"]),
+    "http://10.0.0.1:3000/api/login");
+  assert.equal(
+    jwtIssuanceEndpoint({} as any, ["http://10.0.0.1:3000"]),
+    "http://10.0.0.1:3000/api/login");
 });
