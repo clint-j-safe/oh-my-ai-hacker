@@ -110,3 +110,17 @@ test("the composer contains no target-hostname literal of its own — every URL 
   const xml = buildHunterBrief(EMPTY_STATE);
   assert.doesNotMatch(xml, /https?:\/\//, "an empty-state brief must not contain any URL");
 });
+
+test("recovered_intel rendering is BOUNDED: a huge intel map does not bloat the brief (regression: 79KB intel stalled the hunter)", () => {
+  const bigIntel: Record<string, unknown> = {};
+  for (let i = 0; i < 300; i++) bigIntel[`noise_${i}`] = "x".repeat(400);
+  bigIntel["api_route_table"] = "/login /signup /contactUs /loan/apply";
+  bigIntel["jwt_key_source"] = "the HS256 key literal 'unsafebank'";
+  const xml = buildHunterBrief({ ...EMPTY_STATE, recoveredIntel: bigIntel as any });
+  const sect = section(xml, "recovered_intel");
+  assert.ok(sect.length < 14000, `recovered_intel must stay bounded, got ${sect.length} chars`);
+  // high-signal keys are prioritised into the shown set
+  assert.match(sect, /api_route_table/);
+  assert.match(sect, /jwt_key_source/);
+  assert.match(sect, /omitted to keep this brief lean/);
+});

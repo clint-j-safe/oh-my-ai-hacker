@@ -498,7 +498,20 @@ function renderRecoveredIntel(intel: RecoveredIntel): string {
       "  you find.",
     ].join("\n");
   }
-  return entries.map(([k, v]) => `  <${k}>${esc(String(v))}</${k}>`).join("\n");
+  // BOUND THE BRIEF. Intel accumulates every beat; dumping hundreds of entries (one
+  // run reached ~79 KB / ~20k tokens here) bloats the prompt so badly the hunter
+  // stalls with zero tool calls. Prioritise high-signal keys (routes, keys, secrets,
+  // endpoint contracts, exploit primitives), truncate long values, and cap the count.
+  const HIGH = /route|endpoint|key|secret|token|jwt|contract|primitive|param|handler|source|signup|login|auth|otp|reset|traversal|sqli|xxe|ssrf|idor|deser|crypto|config|_read|leak/i;
+  const trunc = (s: string) => (s.length > 200 ? `${s.slice(0, 200)}…` : s);
+  const sorted = [...entries].sort((a, b) => (HIGH.test(b[0]) ? 1 : 0) - (HIGH.test(a[0]) ? 1 : 0));
+  const CAP = 50;
+  const shown = sorted.slice(0, CAP);
+  const lines = shown.map(([k, v]) => `  <${k}>${esc(trunc(String(v)))}</${k}>`);
+  if (entries.length > shown.length) {
+    lines.push(`  <note>+${entries.length - shown.length} lower-signal intel entries omitted to keep this brief lean; the highest-signal ones are shown above</note>`);
+  }
+  return lines.join("\n");
 }
 
 /**
