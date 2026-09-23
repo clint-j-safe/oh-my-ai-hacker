@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, extractJwtKeyCandidates, jwtIssuanceEndpoint } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived } from "../src/beat.js";
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
@@ -1536,21 +1536,16 @@ test("buildRunSession: every beat of the SAME run shares ONE session id (run-sta
   assert.equal(forced.sessionId, "my-session");
 });
 
-test("extractJwtKeyCandidates: pulls the source-recovered signing key literal (e.g. 'unsafebank') from intel prose", () => {
-  const cands = extractJwtKeyCandidates({
-    jwt_key_source: "LoginModuleHandler::new_token line 13 hardcodes the HS256 key as the literal lowercase app-name word 'unsafebank' (readable unauthenticated)",
-    token_scheme: "HS256 JWT via jwt_helper, HARDCODED static 10-char lowercase app-name key",
-    unrelated: "some other note about /api/login",
-  } as any);
-  assert.ok(cands.includes("unsafebank"), "the quoted key literal must be a candidate");
-  assert.ok(cands.length <= 40);
-});
 
-test("jwtIssuanceEndpoint: uses the discovered login_url, else falls back to the in-scope /api/login", () => {
-  assert.equal(
-    jwtIssuanceEndpoint({ login_url: "http://10.0.0.1:3000/api/login" } as any, ["http://10.0.0.1:3000"]),
-    "http://10.0.0.1:3000/api/login");
-  assert.equal(
-    jwtIssuanceEndpoint({} as any, ["http://10.0.0.1:3000"]),
-    "http://10.0.0.1:3000/api/login");
+
+
+test("injectSessionAuthForDerived: resolves a session LABEL to its token as jwt (adaptive token-based derived proof), never exposing it to the model", () => {
+  // Minimal stub: the helper only needs sessionTokenForProof(label).
+  const runner = { sessionTokenForProof: (l: string) => (l === "A" ? "eyJhbGciOiJIUzI1NiJ9.e30.sig" : null) } as any;
+  const out = injectSessionAuthForDerived({ jwt_from_session: "A", candidates: ["unsafebank"] }, runner) as any;
+  assert.equal(out.jwt, "eyJhbGciOiJIUzI1NiJ9.e30.sig", "the session's token is injected as jwt");
+  assert.deepEqual(out.candidates, ["unsafebank"], "the model-supplied candidates are preserved");
+  // an unknown/empty label leaves the input untouched (no guess)
+  assert.deepEqual(injectSessionAuthForDerived({ candidates: ["x"] }, runner), { candidates: ["x"] });
+  assert.deepEqual(injectSessionAuthForDerived({ jwt_from_session: "Z", candidates: ["x"] }, runner), { jwt_from_session: "Z", candidates: ["x"] });
 });

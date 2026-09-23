@@ -603,44 +603,6 @@ type SignupFlowArgs = Record<(typeof SIGNUP_FLOW_INTEL_KEYS)[number], string>;
  * throws invalid_argument there anyway), so anything short of that is "not yet
  * known", not a malformed call worth attempting.
  */
-/** Candidate HS256 signing keys the hunter extracted from the target's disclosed
- * source into recovered_intel (e.g. jwt_key_source = "...the literal lowercase
- * app-name word 'unsafebank'"). Pulls quoted tokens and standalone short lowercase
- * words from any jwt/key/secret/signing-related intel value, plus a few generic
- * defaults, deduped and capped. Every candidate is TRIED with real HMAC by the
- * hs256_weak_key deriver — a wrong guess simply fails to verify, so a broad list is
- * safe. Values come from runtime source disclosure, never hardcoded target secrets. */
-export function extractJwtKeyCandidates(intel: RecoveredIntel): string[] {
-  const text = Object.entries(intel)
-    .filter(([k, v]) => typeof v === "string"
-      && /jwt|key|secret|signing|token_scheme|hs256|hmac/i.test(k))
-    .map(([, v]) => String(v))
-    .join(" ");
-  const out = new Set<string>();
-  for (const m of text.match(/['"`]([A-Za-z0-9_.\-]{3,40})['"`]/g) ?? []) {
-    out.add(m.replace(/['"`]/g, ""));
-  }
-  // standalone lowercase alnum words 4-24 chars (app-name-style keys)
-  for (const w of text.match(/\b[a-z][a-z0-9_]{3,23}\b/g) ?? []) {
-    // skip obvious prose words to keep the list tight
-    if (!/^(the|and|readable|literal|lowercase|word|unauthenticated|source|line|hardcodes|token|value|inside|held|later|beat|candidate|list|payload|signing)$/.test(w)) {
-      out.add(w);
-    }
-  }
-  for (const d of ["secret", "secretkey", "changeme", "password", "admin"]) out.add(d);
-  return [...out].slice(0, 40);
-}
-
-/** The endpoint to attribute a jwt_weak_key finding to — the login/token-issuance
- * route from intel, else the first in-scope origin's /api/login (the rubric scores
- * this class scope-level, so any in-scope endpoint qualifies). */
-export function jwtIssuanceEndpoint(intel: RecoveredIntel, scopeUrls: string[]): string {
-  const loginUrl = intel["login_url"];
-  if (typeof loginUrl === "string" && /^https?:\/\//.test(loginUrl)) return loginUrl.trim();
-  const base = (scopeUrls[0] ?? "http://target").replace(/\/+$/, "");
-  return `${base}/api/login`;
-}
-
 function discoveredSignupFlow(intel: RecoveredIntel): SignupFlowArgs | null {
   const str = (k: string): string => {
     const v = (intel as Record<string, unknown>)[k];
@@ -955,66 +917,7 @@ export async function runBeat(opts: {
           }
         }
 
-        // DETERMINISTIC KNOWN-VULN PROOF: jwt_weak_key. The hunter cannot prove this —
-        // the JWT is redacted from it by design (session.ts), so it can never supply
-        // {jwt, candidates} to the hs256_weak_key deriver. But the orchestrator holds a
-        // live token AND the hunter has already extracted the signing key literal into
-        // recovered_intel from the disclosed source. So we construct and fire the proof
-        // ourselves, exactly the way the human did (source-recovered key + a real token).
-        // Runs inside a span so obs.traceId() yields a real id for the Provenance Gate;
-        // stores only a REDACTED evidence blob (never the token or key), and banks the
-        // finding through the same recordFinding/provedEntries path as any other.
-        const runDeterministicJwtProof = async (): Promise<void> => {
-          if (provedEntries.some((p) => p.vuln_class === "jwt_weak_key")) return;
-          if (spineLoad.spine.proved.some((p) => p.vuln_class === "jwt_weak_key")) return;
-          const sess = runner.getUsableSessionToken();
-          if (!sess) return;
-          const candidates = extractJwtKeyCandidates(spineLoad.spine.recovered_intel);
-          if (candidates.length === 0) return;
-          const endpoint = jwtIssuanceEndpoint(spineLoad.spine.recovered_intel, scopeUrls);
-          await startActiveObservation("deterministic-jwt-proof", async (span) => {
-            const verdict = evaluate(
-              { statement: "HS256 signature verifies under a source-recovered key", type: "derived", expression: "hs256_weak_key" },
-              // exploit/control unused by derived; pass a benign placeholder capture.
-              { request: { method: "GET", url: endpoint, headers: {}, body: null },
-                response: { status: 200, headers: {}, body: "" }, artifact: { sha256: "", path: "", bytes: 0 }, ms: 0 },
-              null,
-              { derivedInput: { jwt: sess.token, candidates } },
-            );
-            // Never store the token or the raw key — only a redacted evidence blob.
-            const evidence = JSON.stringify({
-              deriver: "hs256_weak_key", alg: "HS256", candidate_count: candidates.length,
-              verified: verdict.status === "CONFIRMED", endpoint, utc: new Date().toISOString(),
-            });
-            const artifact = await store.put(evidence);
-            const langfuseTraceId = obs.traceId();
-            span.update({ output: { status: verdict.status } });
-            const gated = await gateProvenance(
-              { utc: new Date().toISOString(), langfuseTraceId,
-                exploitRequestHash: artifact.sha256, stdoutSha256: artifact.sha256,
-                sandboxId, exitCode: 0 },
-              verdict.status, store);
-            const row: FindingRow = {
-              engagement_id: engagement.authRef,
-              finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
-              vuln_class: "jwt_weak_key", endpoint,
-              verdict: gated.status, invariant_type: "derived",
-              langfuse_trace_id: langfuseTraceId, utc: new Date().toISOString(),
-            };
-            if (verdict.status === "CONFIRMED") {
-              provedEntries.push({ vuln_class: "jwt_weak_key", endpoint, invariant_type: "derived",
-                verdict: gated.status, finding_id: row.finding_id });
-              findings.push(row);
-              await obs.mergeFinding(row);
-              await obs.recordFinding(row);
-            }
-          });
-        };
-
         const bail = async (exitCode: number, stalled: boolean, reason: string | null): Promise<BeatResult> => {
-          try { await runDeterministicJwtProof(); } catch (e) {
-            console.error(`[det-proof] jwt proof skipped: ${(e as Error).message}`);
-          }
           await persistSpine(stalled, reason);
           return {
             exitCode, findings, stalled, reason,
@@ -1283,10 +1186,20 @@ export async function runBeat(opts: {
 
           let evidence: EvidenceBundle | undefined;
           if (invType === "derived") {
-            const derivedInput = await resolveDerivedInput(
+            let derivedInput = await resolveDerivedInput(
               claim.invariant.expression, claim.derived_input, scopeOrigins,
               opts.tlsProber ?? defaultTlsProber,
             );
+            // ADAPTIVE session-auth injection. A derived proof may need auth material
+            // the model CANNOT see — chiefly the JWT for hs256_weak_key/
+            // jwt_payload_contains. If the claim's derived_input names a session it
+            // holds (jwt_from_session / auth_from_session / session), the orchestrator
+            // injects that session's token as `jwt` here. The model supplies only what
+            // it legitimately recovered (candidate keys from the disclosed source) and
+            // the session LABEL; it never handles the token. This lets the model chain
+            // its own intel ("I extracted key K and hold session A -> prove
+            // hs256_weak_key(session:A, candidates:[K])") without a hardcoded prover.
+            derivedInput = injectSessionAuthForDerived(derivedInput, runner);
             evidence = { derivedInput };
           } else if (
             invType === "state_changed" || invType === "state_violated" || invType === "file_created_then_deleted"
@@ -1656,6 +1569,24 @@ function isInScopeHost(origin: string, scopeOrigins: readonly string[]): boolean
  * outside scope is never probed and defaults to "reachable" in the closure — the
  * conservative direction, since a false "reachable" can only push the verdict away
  * from CONFIRMED, never manufacture one. */
+/** If a derived claim's input names a session it holds (jwt_from_session /
+ * auth_from_session / session), inject that session's token as `jwt` — the model
+ * cannot see the token, so this is the only way it can prove a token-based derived
+ * finding (hs256_weak_key, jwt_payload_contains). The model still supplies the
+ * material it legitimately recovered (candidate keys); it just references the session
+ * by label. A label that does not resolve is left untouched (the deriver then reports
+ * missing input, never a guess). */
+export function injectSessionAuthForDerived(input: unknown, runner: ToolRunner): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+  const rec = input as Record<string, unknown>;
+  if (typeof rec.jwt === "string" && rec.jwt) return input;   // model supplied one already (unusual)
+  const ref = rec.jwt_from_session ?? rec.auth_from_session ?? rec.session;
+  if (typeof ref !== "string" || !ref.trim()) return input;
+  const token = runner.sessionTokenForProof(ref.trim());
+  if (!token) return input;
+  return { ...rec, jwt: token };
+}
+
 async function resolveDerivedInput(
   expression: string, derivedInput: unknown, scopeOrigins: readonly string[], prober: TlsProber,
 ): Promise<unknown> {

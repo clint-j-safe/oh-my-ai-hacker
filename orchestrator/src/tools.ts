@@ -765,18 +765,14 @@ export class ToolRunner {
     return this.sessions.allMeta();
   }
 
-  /** A live auth token from the first session that holds one, for ORCHESTRATOR-side
-   * deterministic proofs (e.g. feeding a JWT to the hs256_weak_key deriver). This is
-   * the one place the raw material is read back out — deliberately never reaches the
-   * model (no tool result carries it), only the deterministic prover in beat.ts. Null
-   * if no session has a token yet. */
-  getUsableSessionToken(): { label: string; token: string; authHeaderName: string } | null {
-    for (const m of this.sessions.allMeta()) {
-      if (!m.has_auth_material) continue;
-      const token = this.sessions.authMaterialFor(m.label);
-      if (token) return { label: m.label, token, authHeaderName: m.auth_header_name };
-    }
-    return null;
+  /** Resolve a session LABEL to its auth material for an ORCHESTRATOR-side derived
+   * proof (e.g. feeding a JWT to the hs256_weak_key deriver). This is deliberately the
+   * ONLY read-back path besides http_request's own injection: the model names a
+   * session it holds but cannot see, and the orchestrator supplies the token to the
+   * deriver — the token never reaches the model (no tool result carries it). Null when
+   * the label is unknown or has no token. Mirrors http()'s session-injection posture. */
+  sessionTokenForProof(label: string): string | null {
+    return this.sessions.authMaterialFor(label);
   }
 
   /** The known-good registration envelope (non-secret) from the last token-obtaining
