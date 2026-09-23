@@ -707,6 +707,15 @@ export class ToolRunner {
   private readonly skillTimeoutMs: number;
   private readonly spawnImpl: typeof spawn;
   private readonly sessions: SessionStore;
+  /** The (non-secret) argument envelope of the most recent register_account call that
+   * actually OBTAINED a token this run — signup/login URLs, methods, body templates,
+   * token paths, the login-id path and the auth header name. Contains no credential:
+   * every value the hunter passed is envelope SHAPE, and the credentials themselves
+   * are framework-generated (never in these args). beat.ts persists this into the
+   * spine's recovered_intel so a later beat's deterministic registration phase can
+   * replay the KNOWN-GOOD flow instantly (0 model turns) instead of the hunter
+   * re-deriving signup+login from scratch every beat. */
+  private successfulRegistrationRecipe: Record<string, string> | null = null;
 
   constructor(opts: {
     engagement: Engagement;
@@ -754,6 +763,13 @@ export class ToolRunner {
    * accounts A/B already exist without re-registering them. */
   getSessionMeta(): SessionMeta[] {
     return this.sessions.allMeta();
+  }
+
+  /** The known-good registration envelope (non-secret) from the last token-obtaining
+   * register_account call this run, or null if none succeeded. beat.ts merges it into
+   * the spine so the next beat re-registers deterministically. See the field's own doc. */
+  getSuccessfulRegistrationRecipe(): Record<string, string> | null {
+    return this.successfulRegistrationRecipe;
   }
 
   /** Computes the Tether's decision for a call WITHOUT executing it. Exists so
@@ -1074,6 +1090,24 @@ export class ToolRunner {
       // this same synchronous call, so this branch cannot actually be reached
       // in practice — mirrors the belt-and-braces posture elsewhere in this file.
       throw new SessionCapError("account cap reached while finalizing registration");
+    }
+    // Record the KNOWN-GOOD envelope (non-secret — SHAPE only) the moment a token is
+    // obtained, so beat.ts can persist it and the NEXT beat replays registration
+    // deterministically instead of re-deriving it. Keyed exactly as the spine's
+    // recovered_intel expects (SIGNUP_FLOW_INTEL_KEYS in beat.ts).
+    if (meta.has_auth_material) {
+      this.successfulRegistrationRecipe = {
+        signup_url: signupUrl,
+        signup_method: signupMethod,
+        signup_body_template: signupTemplate,
+        signup_response_token_path: signupTokenPath,
+        login_url: loginUrl,
+        login_method: loginMethod,
+        login_body_template: loginTemplate,
+        login_id_from_signup_path: loginIdPath,
+        login_response_token_path: loginTokenPath,
+        auth_header_name: authHeaderName,
+      };
     }
     return {
       label: meta.label,

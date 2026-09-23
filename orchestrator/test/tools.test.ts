@@ -671,6 +671,41 @@ test("register_account: a rejected signup surfaces the target's OWN error (envel
   assert.equal(signupCalls, 2);
 });
 
+test("register_account records the KNOWN-GOOD envelope (non-secret) only when a token is obtained — for deterministic replay next beat", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  // First: a signup that yields NO token (no login configured) -> no recipe recorded.
+  const noTokenFetch = (async () => new Response(JSON.stringify({ status: "created" }), {
+    status: 201, headers: { "content-type": "application/json" },
+  })) as unknown as typeof fetch;
+  const r1 = new ToolRunner({ engagement: E, store, fetchImpl: noTokenFetch, sessionStore: new SessionStore({ maxAccounts: 2 }) });
+  const out1 = await r1.execute("register_account", { ...registerArgsBase, signup_response_token_path: "token" });
+  assert.equal(out1.ok, true);
+  if (!out1.ok) throw new Error("unreachable");
+  assert.equal((out1.result as any).obtained_auth_material, false);
+  assert.equal(r1.getSuccessfulRegistrationRecipe(), null,
+    "a tokenless registration must NOT be persisted as a known-good recipe");
+
+  // Then: a signup that DOES yield a token -> the exact envelope is recorded, keyed
+  // as the spine's recovered_intel expects, carrying no credential.
+  const tokenFetch = (async () => new Response(JSON.stringify({ token: "tok-xyz" }), {
+    status: 201, headers: { "content-type": "application/json" },
+  })) as unknown as typeof fetch;
+  const r2 = new ToolRunner({ engagement: E, store, fetchImpl: tokenFetch, sessionStore: new SessionStore({ maxAccounts: 2 }) });
+  const out2 = await r2.execute("register_account", { ...registerArgsBase, signup_response_token_path: "token" });
+  assert.equal(out2.ok, true);
+  if (!out2.ok) throw new Error("unreachable");
+  assert.equal((out2.result as any).obtained_auth_material, true);
+  const recipe = r2.getSuccessfulRegistrationRecipe();
+  assert.ok(recipe, "a token-obtaining registration must be recorded for replay");
+  assert.equal(recipe!.signup_url, registerArgsBase.signup_url);
+  assert.equal(recipe!.signup_body_template, registerArgsBase.signup_body_template);
+  assert.equal(recipe!.auth_header_name, registerArgsBase.auth_header_name);
+  // The recipe is envelope SHAPE only — the framework-generated password/token never
+  // appear in it (creds are generated, not passed by the caller).
+  assert.ok(!JSON.stringify(recipe).includes("tok-xyz"), "no token in the persisted recipe");
+});
+
 test("register_account: a 2xx login whose token path is wrong yields a tokenless account, a hint, and the artifact sha256 — never inlines the token-bearing body", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sahw-"));
   const store = new ArtifactStore(dir);

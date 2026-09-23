@@ -855,10 +855,18 @@ export async function runBeat(opts: {
           };
           const inferred = inferRecoveredIntel(
             scopeOrigins, [...spineLoad.spine.attack_surface, ...discoveredEndpoints]);
+          // The known-good registration envelope (non-secret shape only), if a beat
+          // obtained a token. Persisting it under recovered_intel's structured keys is
+          // what lets the NEXT beat's deterministic registration phase
+          // (discoveredSignupFlow -> runRegistrationPhase) re-register instantly, so
+          // the hunter spends its whole budget on findings instead of re-deriving
+          // signup+login from scratch every beat. Placed AFTER claim intel so a fresh
+          // successful recipe always wins over any stale prose the claims carried.
+          const registrationRecipe = runner.getSuccessfulRegistrationRecipe() ?? {};
           const nextSpine = updateSpine(spineLoad.spine, {
             beat: beatRecord,
             discoveredEndpoints,
-            recoveredIntel: { ...inferred, ...recoveredIntelFromClaims },
+            recoveredIntel: { ...inferred, ...recoveredIntelFromClaims, ...registrationRecipe },
             proved: provedEntries,
             attempted: attemptedEntries,
             // Persist account LABELS + non-secret metadata (no token, no password —

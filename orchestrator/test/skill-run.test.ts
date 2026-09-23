@@ -136,17 +136,36 @@ test("a network-free skill NOT in the caller's required allowlist is denied nami
   assert.ok(!/egress/i.test(d.reason), "must not read like an egress denial");
 });
 
-test("a network-touching skill is denied naming its egress classification, even when it IS on the allowlist", () => {
-  // Isolates the egress check from the allowlist check: osv-cve-correlation is placed
-  // on the caller's allowlist explicitly here, so the ONLY thing that can deny it is
-  // its egress classification ("external").
+test("a network-touching skill ON the allowlist is now PERMITTED — egress classification alone no longer denies it", () => {
+  // Policy change: an allowlisted skill may run regardless of its egress class; the
+  // controls are the allowlist, the input-URL scope gate below, the skill's own
+  // scope-gating, and the sandbox. A "target"/"external" skill with no out-of-scope
+  // URL in its input_json is allowed.
+  assert.equal(SKILL_EGRESS["sqli-database-injection"], "target");
+  const d = gate(E, "skill_run",
+    { skill_name: "sqli-database-injection", input_json: JSON.stringify({ target_url: "http://10.0.0.1:3000/api/x", parameters: ["id"] }) },
+    ["sqli-database-injection"]);
+  assert.equal(d.allow, true, "an allowlisted target skill targeting an in-scope URL must run");
+});
+
+test("a skill whose input_json names an OUT-OF-SCOPE url is denied by the Tether before it runs (declared-egress scope gate)", () => {
+  const d = gate(E, "skill_run",
+    { skill_name: "sqli-database-injection", input_json: JSON.stringify({ target_url: "http://evil.example.com/steal", parameters: ["id"] }) },
+    ["sqli-database-injection"]);
+  assert.equal(d.allow, false, "an out-of-scope target URL in the skill input must be refused");
+  if (d.allow) throw new Error("unreachable");
+  assert.match(d.reason, /scope/i);
+});
+
+test("an ALLOWED network skill still requires the allowlist — egress permission does not bypass it", () => {
+  // osv-cve-correlation is "external" and permitted by egress now, but NOT on this
+  // caller's allowlist -> still denied, naming the allowlist.
   assert.equal(SKILL_EGRESS["osv-cve-correlation"], "external");
-  const d = gate(E, "skill_run", { skill_name: "osv-cve-correlation" }, ["osv-cve-correlation"]);
+  const d = gate(E, "skill_run", { skill_name: "osv-cve-correlation", input_json: "{}" },
+    ["adversarial-self-review", "severity-calibration"]);
   assert.equal(d.allow, false);
   if (d.allow) throw new Error("unreachable");
-  assert.match(d.reason, /egress/i);
-  assert.match(d.reason, /external/i);
-  assert.ok(!/allowlist/i.test(d.reason), "must not read like an allowlist denial");
+  assert.match(d.reason, /allowlist/i);
 });
 
 test("an unclassified (unknown) skill is denied even if named in the allowlist", () => {
@@ -210,17 +229,29 @@ test("ToolRunner.execute denies a skill not on the allowlist with kind policy", 
   assert.match(out.denied, /allowlist/i);
 });
 
-test("ToolRunner.execute denies a network-touching skill with kind policy naming its egress classification", async () => {
+test("ToolRunner.execute denies a skill whose input_json names an OUT-OF-SCOPE url (input-URL scope gate), kind policy, and never spawns a process", async () => {
+  // New egress policy: an allowlisted network skill runs, but any URL in its
+  // input_json is scope-gated exactly like http_request. An out-of-scope target URL
+  // must be refused as a policy denial BEFORE any process is spawned — never a real
+  // network call, and never the skill's own subprocess.
+  let spawned = false;
+  const spy = ((...a: Parameters<typeof realSpawn>) => {
+    spawned = true;
+    return realSpawn(...a);
+  }) as typeof realSpawn;
   const r = new ToolRunner({
     engagement: E, store: await mkStore(), skillsRoot: REPO_SKILLS_ROOT,
-    skillAllowlist: ["osv-cve-correlation"],
+    skillAllowlist: ["sqli-database-injection"], spawnImpl: spy,
   });
-  const out = await r.execute("skill_run", { skill_name: "osv-cve-correlation", input_json: "{}" });
+  const out = await r.execute("skill_run", {
+    skill_name: "sqli-database-injection",
+    input_json: JSON.stringify({ target_url: "http://evil.example.com/steal", parameters: ["id"] }),
+  });
   assert.equal(out.ok, false);
   if (out.ok) throw new Error("unreachable");
   assert.equal(out.kind, "policy");
-  assert.match(out.denied, /egress/i);
-  assert.match(out.denied, /external/i);
+  assert.match(out.denied, /scope/i);
+  assert.equal(spawned, false, "a scope-denied skill must never spawn its subprocess");
 });
 
 // --- Fixture skill: success path, Offload Law -----------------------------------

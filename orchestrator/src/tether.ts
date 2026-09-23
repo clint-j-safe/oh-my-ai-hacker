@@ -342,13 +342,22 @@ export function gate(
         `skill not on the caller's allowlist: ${JSON.stringify(skillName)} ` +
         `(allowed: ${skillAllowlist.length ? skillAllowlist.join(", ") : "none"})`);
     }
-    if (egress !== "none") {
-      return deny(
-        `skill egress not yet gated: ${JSON.stringify(skillName)} is classified "${egress}" — ` +
-        "network-touching skills are denied until the declared-egress mechanism lands " +
-        "(a skill declares its required hosts in SKILL.md; the Tether permits only those " +
-        "named hosts for that named skill — see the TODO above SKILL_EGRESS); phase 1 " +
-        "permits only \"none\" (pure computation over already-collected evidence)");
+    // Egress model (declared-egress, pragmatic form). An allowlisted skill may run
+    // regardless of its "none"/"target"/"external" classification — the controls are:
+    //   (1) the ALLOWLIST — only skills the caller explicitly enabled run at all;
+    //   (2) THIS scope check — every http(s) URL the caller puts in the skill's
+    //       input_json is that skill's DECLARED target egress and must be in scope,
+    //       gated exactly like http_request (same scan shell_exec already applies to
+    //       its command); a skill named against an out-of-scope host is denied here,
+    //       before it ever runs;
+    //   (3) each skill's own internal scope-gating (SKILL.md safety model); and
+    //   (4) the ephemeral sandbox — the real containment boundary (see the note at
+    //       the top of this file). A skill driven purely by already-collected
+    //       evidence carries no URL and passes (2) trivially.
+    const inputUrls = String(args.input_json ?? "").match(/https?:\/\/[^\s"'\\]+/g) ?? [];
+    for (const u of inputUrls) {
+      const d = inScope(e, u);
+      if (!d.allow) return d;
     }
     return ALLOW;
   }
