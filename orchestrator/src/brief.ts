@@ -490,6 +490,42 @@ function renderRecoveredIntel(intel: RecoveredIntel): string {
   return entries.map(([k, v]) => `  <${k}>${esc(String(v))}</${k}>`).join("\n");
 }
 
+/**
+ * Deterministically extract the app's CANONICAL routes from the source-mined route
+ * intel (api_route_table + any *_route/*_endpoint value) and present them as this
+ * beat's explicit target list. The LLM hunter kept drifting to sub-path variants
+ * (/contactUs/index) and scoring off-canonical; handing it the exact routes the app
+ * disclosed in its own source (a disclosure the loop already exploited — legitimate
+ * grey-box, not answer-key) fixes that. Static assets are stripped (behaviour lives
+ * on API routes, not .js/.map/etc).
+ */
+function renderCanonicalTargets(intel: RecoveredIntel): string {
+  const text = Object.entries(intel)
+    .filter(([k, v]) => typeof v === "string"
+      && (k === "api_route_table" || /route|endpoint|_path\b/i.test(k)))
+    .map(([, v]) => String(v))
+    .join(" ");
+  const paths = [...new Set((text.match(/\/[A-Za-z0-9_\-./]*(?:\?[A-Za-z0-9_=&%.\-]*)?/g) ?? [])
+    .map((s) => s.replace(/[).,;]+$/, "").trim())
+    .filter((s) => s.length > 1 && !/\.(js|css|map|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(s)))]
+    .sort();
+  if (paths.length === 0) {
+    return [
+      "  EMPTY. No route table recovered yet. Get a file-read/source-disclosure",
+      "  primitive first, then extract the app's route table from its source and",
+      "  every later probe becomes precise.",
+    ].join("\n");
+  }
+  return [
+    "  The app's OWN CANONICAL routes, recovered from its source/route table (via a",
+    "  disclosure you already hold). TARGET THESE EXACT PATHS — do NOT append",
+    "  sub-segments (/x/index, /x/aa) or invent variants; a finding is scored on the",
+    "  canonical path and the app routes variants to the same handler anyway. Test",
+    "  each relevant vuln_class against the applicable routes here:",
+    ...paths.map((p) => `    ${p}`),
+  ].join("\n");
+}
+
 function renderAlreadyProved(proved: ProvedEntry[]): string {
   if (proved.length === 0) {
     return "  EMPTY. Nothing has been proved yet against this engagement — no exclusions apply.";
@@ -655,6 +691,7 @@ export function buildHunterBrief(state: HunterBriefState): string {
     `<opening_move>\n${OPENING_MOVE}\n</opening_move>`,
     `<attack_surface>\n${renderAttackSurface(state.attackSurface)}\n</attack_surface>`,
     `<recovered_intel>\n${renderRecoveredIntel(state.recoveredIntel)}\n</recovered_intel>`,
+    `<canonical_targets>\n${renderCanonicalTargets(state.recoveredIntel)}\n</canonical_targets>`,
     `<already_proved>\n${renderAlreadyProved(state.proved)}\n</already_proved>`,
     `<coverage_goal>\n${renderCoverageGoal(state.proved)}\n</coverage_goal>`,
     `<account_objective>\n${renderAccountObjective(state.sessionsCount ?? 0, state.proved)}\n</account_objective>`,
