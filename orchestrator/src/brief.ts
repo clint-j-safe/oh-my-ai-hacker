@@ -152,6 +152,20 @@ const OPENING_MOVE = [
   "exploitable surface lives. An origin answering 404 at its root is NOT",
   "necessarily empty — it may be an API that only answers on its own defined",
   "routes; probe past the root before ruling one out.",
+  "",
+  "USE WHAT PRIOR BEATS ALREADY EXTRACTED FROM THE TARGET'S OWN SOURCE. Check",
+  "<recovered_intel> FIRST — if it holds a route table (e.g. api_route_table) or",
+  "named routes/*_route/*_endpoint entries, those are the app's OWN CANONICAL",
+  "paths, read out of its source via a disclosure you already have. Target those",
+  "EXACT paths — do NOT invent sub-segments (/x/index, /x/aa) when the table says",
+  "/x; a finding on the canonical path is the one that counts. Likewise, when",
+  "intel names WHERE a secret or exact value lives (a hardcoded key in a source",
+  "file, a param contract, an endpoint's request shape), and you hold a file-read",
+  "primitive, READ that source file and extract the LITERAL value — then use it",
+  "directly (e.g. feed the recovered signing key to the hs256_weak_key deriver, or",
+  "the exact reset-chain params to the auth_bypass steps). This is the adaptive",
+  "move: a disclosure you already landed turns every later hypothesis from a guess",
+  "into a precise, canonical-endpoint exploit.",
 ].join("\n");
 
 const THINKING_FRAMEWORK = [
