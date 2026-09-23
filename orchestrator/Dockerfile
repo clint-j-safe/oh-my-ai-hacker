@@ -8,9 +8,15 @@
 FROM node:22-alpine
 
 # python3 is REQUIRED: skill_run executes the Python skills, and the suite spawns
-# real ones. The permitted phase-1 skills are stdlib-only; a later phase enabling
-# httpx-based skills must add py3-pip and those packages here.
-RUN apk add --no-cache python3
+# real ones. Phase-2 tooling: the network-active discovery skills (tech-fingerprinting,
+# idor, sqli, ssrf, xss, auth-bypass, business-logic, crawling, ...) probe the target
+# with httpx and confirm SQLi with ghauri; they also read their shipped wordlists
+# (jwt_secrets.txt, ssrf-payloads.txt, crawl lists). Install pip + those packages so
+# the loop is a mixed adversary — scripting HTTP + real tools + wordlists — not just
+# hand HTTP. --break-system-packages is required on Alpine's externally-managed py3.
+RUN apk add --no-cache python3 py3-pip \
+ && pip install --no-cache-dir --break-system-packages httpx \
+ && python3 -c "import httpx; print('httpx', httpx.__version__)"
 
 WORKDIR /app/orchestrator
 
