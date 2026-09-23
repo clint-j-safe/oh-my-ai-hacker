@@ -33,7 +33,12 @@ export class ClickHouseWriter {
   }
 
   async recordFinding(row: FindingRow): Promise<void> {
-    await this.client.insert({ table: "sahw_findings", format: "JSONEachRow", values: [row] });
+    // ClickHouse DateTime64(3) parses "YYYY-MM-DD HH:MM:SS.sss", NOT the ISO-8601
+    // "…THH:MM:SS.sssZ" our FindingRow.utc carries — the trailing T/Z make it reject
+    // every row (CANNOT_PARSE_INPUT_ASSERTION_FAILED). Normalise at the boundary so
+    // callers keep emitting plain ISO. UTC only (the source is always Z).
+    const utc = row.utc.replace("T", " ").replace(/Z$/, "");
+    await this.client.insert({ table: "sahw_findings", format: "JSONEachRow", values: [{ ...row, utc }] });
   }
 
   async close(): Promise<void> { await this.client.close(); }

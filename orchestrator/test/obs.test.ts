@@ -31,7 +31,13 @@ test("ClickHouse writer sends JSONEachRow to the findings table", async () => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].format, "JSONEachRow");
   assert.equal(calls[0].table, "sahw_findings");
-  assert.deepEqual(calls[0].values, [ROW]);
+  // utc is normalised from ISO-8601 to ClickHouse DateTime64 format at the boundary:
+  // the real DB rejects the trailing T/Z (this stub never would, which is how the bug
+  // shipped — so assert the WIRE format explicitly, not just that a row was sent).
+  const sent = calls[0].values[0];
+  assert.equal(sent.utc, "2026-09-22 12:00:00", "ISO T/Z stripped to DateTime64 form (ms preserved when present)");
+  assert.ok(!/[TZ]/.test(sent.utc), `utc must carry no T/Z for DateTime64: got ${sent.utc}`);
+  assert.equal(sent.finding_id, ROW.finding_id);   // the rest of the row is unchanged
 });
 
 test("Neo4j writer MERGEs so repeated beats do not duplicate", async () => {
