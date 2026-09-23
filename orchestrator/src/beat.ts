@@ -6,7 +6,7 @@ import { loadEngagement } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
 import { runAgent, type MinimalClient } from "./agent.js";
-import { evaluate, type Invariant, type InvariantType } from "./axiom.js";
+import { evaluate, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
@@ -270,6 +270,18 @@ function computeDifferentialSignal(
  * already holds — never axiom.reason's prose. Order matters: a wrong invariant TYPE
  * or an implausible endpoint explain the failure more fundamentally than a
  * downstream marker/control fact, so both are checked first. */
+// The four evidence-bundle types (see axiom.ts's EvidenceBundle) prove themselves
+// from `evidence.captures` / `evidence.derivedInput`, never a control differential —
+// same posture as response_asserted. allowedInvariantTypes()'s per-vuln_class
+// buckets predate these types and (correctly, for now) name none of them, so both
+// checks below would otherwise misattribute EVERY non-CONFIRMED verdict of these
+// types as "wrong_invariant_type" / "no_control" regardless of the REAL reason
+// (e.g. too few `steps`). Exempting them here defers to axiom.reason (surfaced to
+// the hunter verbatim) rather than emitting a confidently wrong cause label.
+const EVIDENCE_BUNDLE_TYPES = new Set<InvariantType>([
+  "derived", "state_changed", "state_violated", "file_created_then_deleted",
+]);
+
 function classifyFailureCause(facts: {
   axiomStatus: string;
   vulnClass: VulnClass;
@@ -280,9 +292,11 @@ function classifyFailureCause(facts: {
   endpointIsStaticAsset: boolean;
 }): FailureCause | null {
   if (facts.axiomStatus === "CONFIRMED") return null;
-  if (!allowedInvariantTypes(facts.vulnClass).has(facts.invariantType)) return "wrong_invariant_type";
+  if (!EVIDENCE_BUNDLE_TYPES.has(facts.invariantType)
+    && !allowedInvariantTypes(facts.vulnClass).has(facts.invariantType)) return "wrong_invariant_type";
   if (facts.endpointIsStaticAsset && !DISCLOSURE_CLASSES.has(facts.vulnClass)) return "endpoint_implausible";
-  if (!facts.hasControl && facts.invariantType !== "response_asserted") return "no_control";
+  if (!facts.hasControl && facts.invariantType !== "response_asserted"
+    && !EVIDENCE_BUNDLE_TYPES.has(facts.invariantType)) return "no_control";
   if (facts.markerInExploit === false) return "marker_absent";
   if (facts.markerInExploit === true && facts.markerInControl === true) return "control_shared_marker";
   return "unknown";
@@ -524,6 +538,10 @@ export async function runBeat(opts: {
    * order (see ToolRunner's own spawnImpl in tools.ts). */
   spawnImpl?: typeof spawn;
   now?: Date;
+  /** Overrides the default (real, bounded, direct-connect) TLS-reachability prober
+   * used by a `derived`/tls_unavailable claim (see resolveDerivedInput below).
+   * Production omits it; tests inject a fake one so they never touch the network. */
+  tlsProber?: TlsProber;
 }): Promise<BeatResult> {
   const engagement = loadEngagement(opts.env, opts.now);   // throws outside the window — MUST run
                                                             // before any span opens (see below)
@@ -914,13 +932,33 @@ export async function runBeat(opts: {
             // "survives" / "downgraded" / "unavailable" all proceed to the Axiom below.
           }
 
-          // Axiom: replay the exploit AND a control, then evaluate the typed invariant.
+          // Axiom: replay the exploit, a control when the invariant type needs one,
+          // and — for the four evidence-bundle types — the claim's own `steps` /
+          // `derived_input` evidence plan, then evaluate the typed invariant.
+          const invType = claim.invariant.type as InvariantType;
           const exploit = await capture(runner, claim.endpoint);
-          const control = claim.invariant.type === "response_asserted"
-            ? null                                   // self-contained: no control exists
-            : await capture(runner, claim.control_url);
+          const control = (invType === "body_contains" || invType === "status_in")
+            ? await capture(runner, claim.control_url)
+            : null;                                  // every other type proves itself from
+                                                       // its own evidence, never a control diff
           if (exploit) discoveredEndpoints.push(toSpineEndpoint(exploit));
           if (control) discoveredEndpoints.push(toSpineEndpoint(control));
+
+          let evidence: EvidenceBundle | undefined;
+          if (invType === "derived") {
+            const derivedInput = await resolveDerivedInput(
+              claim.invariant.expression, claim.derived_input, scopeOrigins,
+              opts.tlsProber ?? defaultTlsProber,
+            );
+            evidence = { derivedInput };
+          } else if (
+            invType === "state_changed" || invType === "state_violated" || invType === "file_created_then_deleted"
+          ) {
+            const steps = parseSteps(claim.steps);
+            const captures = await runSteps(runner, steps);
+            for (const c of captures) discoveredEndpoints.push(toSpineEndpoint(c));
+            evidence = { captures };
+          }
 
           const axiom = await startActiveObservation("axiom-eval", async (axSpan) => {
             axSpan.update({
@@ -928,9 +966,11 @@ export async function runBeat(opts: {
                 invariant: claim.invariant,
                 exploitStatus: exploit?.response.status ?? null,
                 controlStatus: control?.response.status ?? null,
+                evidenceCaptures: evidence?.captures?.length ?? null,
+                hasDerivedInput: evidence ? evidence.derivedInput !== undefined : null,
               },
             });
-            const r = evaluate(claim.invariant as Invariant, exploit!, control);
+            const r = evaluate(claim.invariant as Invariant, exploit!, control, evidence);
             axSpan.update({ output: { status: r.status, reason: r.reason } });
             return r;
           });
@@ -1068,6 +1108,15 @@ function jsonCandidates(text: string): string[] {
   return out;
 }
 
+// Invariant types whose proof shape is NOT an exploit/control differential — see
+// axiom.ts's EvidenceBundle doc comment. response_asserted was already exempt from
+// requiring control_url; the four newer types are evaluated from their own evidence
+// (evidence.derivedInput / evidence.captures, assembled below from `derived_input` /
+// `steps`) and likewise never need a control_url to be a well-formed claim.
+const NO_CONTROL_INVARIANT_TYPES = new Set([
+  "response_asserted", "derived", "state_changed", "state_violated", "file_created_then_deleted",
+]);
+
 function parseClaim(messages: any[]): any | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const c = messages[i]?.content;
@@ -1079,7 +1128,7 @@ function parseClaim(messages: any[]): any | null {
       if (!o?.endpoint || !o?.invariant?.type) continue;
       // A differential type is worthless without a control; a self-contained one
       // must not have its verdict decided by an unrelated second request.
-      if (o.invariant.type === "response_asserted") return o;
+      if (NO_CONTROL_INVARIANT_TYPES.has(o.invariant.type)) return o;
       if (o.control_url) return o;
     }
   }
@@ -1089,4 +1138,154 @@ function parseClaim(messages: any[]): any | null {
 async function capture(runner: ToolRunner, url: string): Promise<HttpCapture | null> {
   const out = await runner.execute("http_request", { method: "GET", url });
   return out.ok ? (out.result as HttpCapture) : null;
+}
+
+// ---- Evidence assembly for derived / state_changed / state_violated /
+// file_created_then_deleted (Axiom's non-differential invariant types) ------------
+//
+// The hunter's claim carries its OWN evidence plan (see brief.ts <output_contract>):
+//   `steps`         an ordered list of request specs the beat executes IN ORDER,
+//                   through the SAME ToolRunner.execute("http_request", ...) path
+//                   as everything else — so the Tether gates every one, and each is
+//                   captured/hashed like any other request. This builds
+//                   evidence.captures for state_changed / state_violated /
+//                   file_created_then_deleted.
+//   `derived_input` the typed input object for a `derived` claim's deriver, passed
+//                   straight through as evidence.derivedInput (except
+//                   tls_unavailable — see resolveDerivedInput below).
+
+interface ClaimStep {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+function isRecordOfStrings(x: unknown): x is Record<string, string> {
+  return typeof x === "object" && x !== null && !Array.isArray(x)
+    && Object.values(x as Record<string, unknown>).every((v) => typeof v === "string");
+}
+
+/** Parses claim.steps into a well-shaped, ordered list. A malformed entry STOPS the
+ * sequence there rather than skipping it — order is load-bearing for every consumer
+ * (pre/post, attempt sequence, before/during/after), so silently dropping an entry
+ * would shift everything after it out of position. A short/empty result is not an
+ * error here: evaluate() itself turns "too few captures" into the authoritative
+ * NEEDS_REVIEW reason once runSteps() below executes whatever this returns. */
+function parseSteps(raw: unknown): ClaimStep[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ClaimStep[] = [];
+  for (const s of raw) {
+    if (!s || typeof s !== "object") break;
+    const method = typeof (s as any).method === "string" ? (s as any).method : null;
+    const url = typeof (s as any).url === "string" ? (s as any).url : null;
+    if (!method || !url) break;
+    const headers = isRecordOfStrings((s as any).headers) ? (s as any).headers : undefined;
+    const body = typeof (s as any).body === "string" ? (s as any).body : undefined;
+    out.push({ method, url, headers, body });
+  }
+  return out;
+}
+
+/** Executes claim.steps IN ORDER through the same gated tool path as every other
+ * request (never bypassed). Stops at the first denied/failed step rather than
+ * skipping it and continuing: a denied step must not silently vanish from the
+ * sequence, and the resulting short capture list is exactly what makes evaluate()
+ * NEEDS_REVIEW for the right, authoritative reason ("too few captures") instead of
+ * beat.ts duplicating that judgement. */
+async function runSteps(runner: ToolRunner, steps: ClaimStep[]): Promise<HttpCapture[]> {
+  const captures: HttpCapture[] = [];
+  for (const step of steps) {
+    const args: Record<string, unknown> = { method: step.method, url: step.url };
+    if (step.headers) args.headers = step.headers;
+    if (step.body !== undefined) args.body = step.body;
+    const out = await runner.execute("http_request", args);
+    if (!out.ok) break;
+    captures.push(out.result as HttpCapture);
+  }
+  return captures;
+}
+
+/** Injectable async TLS-reachability prober — see axiom.ts's tls_unavailable doc
+ * comment. Production default performs a bounded, direct TLS connect attempt (never
+ * routed through the Tether's http_request path, since it is not an HTTP exchange
+ * and produces no capturable request/response); tests inject a fake one so they
+ * never touch the network. Resolves true iff a TLS handshake completes. */
+export type TlsProber = (origin: string) => Promise<boolean>;
+
+async function defaultTlsProber(origin: string): Promise<boolean> {
+  const { connect } = await import("node:tls");
+  let host: string;
+  let port: number;
+  try {
+    const u = new URL(origin);
+    host = u.hostname;
+    port = u.port ? Number(u.port) : 443;
+  } catch {
+    return false;
+  }
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch { /* already closed */ }
+      resolve(result);
+    };
+    const socket = connect({ host, port, servername: host, timeout: 3000, rejectUnauthorized: false });
+    socket.once("secureConnect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+  });
+}
+
+/** Only origins that belong to this engagement's own scope are ever probed — the
+ * hunter's derived_input.origins is untrusted claim content, and probing an
+ * arbitrary host would be an SSRF-shaped scope violation identical in spirit to the
+ * one http_request's Tether already guards against. Matched on host (hostname+port)
+ * rather than the full origin string, since tls_unavailable asks about the HTTPS
+ * form of a scope origin that may itself be recorded as http://. */
+function isInScopeHost(origin: string, scopeOrigins: readonly string[]): boolean {
+  let host: string;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  return scopeOrigins.some((s) => {
+    try { return new URL(s).host === host; } catch { return false; }
+  });
+}
+
+/** Assembles evidence.derivedInput for a `derived` claim. tls_unavailable is the
+ * one deriver whose input (a `prober` function) cannot travel through JSON — the
+ * hunter instead supplies `derived_input: { origins: string[] }`, and THIS function
+ * performs the async reachability probe (via the injectable TlsProber) for every
+ * in-scope origin BEFORE evaluate() (synchronous) ever runs, then hands the deriver
+ * a synchronous closure that reads the already-resolved results — exactly the
+ * "resolve async, adapt into a sync closure" shape axiom.ts's doc comment
+ * prescribes. Every other deriver's input passes through unchanged; validating its
+ * shape is the deriver's own job (see axiom.ts), not duplicated here. An origin
+ * outside scope is never probed and defaults to "reachable" in the closure — the
+ * conservative direction, since a false "reachable" can only push the verdict away
+ * from CONFIRMED, never manufacture one. */
+async function resolveDerivedInput(
+  expression: string, derivedInput: unknown, scopeOrigins: readonly string[], prober: TlsProber,
+): Promise<unknown> {
+  if (expression.trim() !== "tls_unavailable") return derivedInput;
+  if (!derivedInput || typeof derivedInput !== "object" || Array.isArray(derivedInput)) return derivedInput;
+  const origins = (derivedInput as { origins?: unknown }).origins;
+  if (!Array.isArray(origins) || origins.length === 0 || !origins.every((o) => typeof o === "string")) {
+    return derivedInput;
+  }
+  const results = new Map<string, boolean>();
+  for (const origin of origins as string[]) {
+    if (!isInScopeHost(origin, scopeOrigins)) continue;
+    results.set(origin, await prober(origin));
+  }
+  return {
+    ...(derivedInput as Record<string, unknown>),
+    origins,
+    prober: (origin: string) => results.get(origin) ?? true,
+  };
 }

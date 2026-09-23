@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
 import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
@@ -679,4 +680,240 @@ test("the hunter's feedback for a non-CONFIRMED finding contains the SPECIFIC ca
       typeof m.content === "string" && m.content.includes("Cause: control_shared_marker")
       && /shared the same marker/i.test(m.content)));
   assert.ok(sawSpecificCause, "feedback must name the SPECIFIC cause and actionable reasoning, not just the verdict");
+});
+
+// ---- Multi-capture / derived evidence wiring (Axiom's four new invariant types) --
+//
+// All of these disable claim review (SAHW_CLAIM_REVIEW=off) purely to keep the test
+// deterministic and hermetic — the claim-review stage is exercised elsewhere; here
+// the point is what beat.ts assembles as evidence.captures / evidence.derivedInput
+// before calling axiom.evaluate().
+
+test("state_changed: steps producing an appeared-marker delta are assembled into captures and CONFIRMED", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "sc-marker-77";
+  const stepFetch = (async (u: string | URL) => {
+    const s = String(u);
+    return s.endsWith("/post") ? new Response(`ok ${marker}`) : new Response("ok plain");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "business_logic", endpoint: url("a"),
+      invariant: { statement: "resource mutated by the action", type: "state_changed", expression: `appeared:${marker}` },
+      steps: [
+        { method: "GET", url: url("pre") },
+        { method: "POST", url: url("action") },
+        { method: "GET", url: url("post") },
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: stepFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].vuln_class, "business_logic");
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("state_violated single_use: a marker reused across 2 steps is CONFIRMED", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "otp-777";
+  const reuseFetch = (async () => new Response(`accepted ${marker}`)) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "business_logic", endpoint: url("a"),
+      invariant: { statement: "one-time code accepted twice", type: "state_violated", expression: `single_use:${marker}` },
+      steps: [
+        { method: "POST", url: url("verify1") },
+        { method: "POST", url: url("verify2") },
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: reuseFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("state_violated single_use: only 1 step is too few and NEEDS_REVIEW, never a guess", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "otp-778";
+  const reuseFetch = (async () => new Response(`accepted ${marker}`)) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "business_logic", endpoint: url("a"),
+      invariant: { statement: "one-time code accepted twice", type: "state_violated", expression: `single_use:${marker}` },
+      steps: [{ method: "POST", url: url("verify1") }],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: reuseFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW");
+});
+
+test("file_created_then_deleted: absent->present->absent across 3 steps is CONFIRMED", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "temp-file-99";
+  const cycleFetch = (async (u: string | URL) => {
+    const s = String(u);
+    return s.endsWith("/during") ? new Response(`has ${marker}`) : new Response("clean");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "path_traversal", endpoint: url("a"),
+      invariant: { statement: "PoC file created then cleaned up", type: "file_created_then_deleted", expression: marker },
+      steps: [
+        { method: "GET", url: url("before") },
+        { method: "GET", url: url("during") },
+        { method: "GET", url: url("after") },
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: cycleFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("file_created_then_deleted: still present at the end is a FALSE_POSITIVE, not a pass", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "temp-file-100";
+  const stillThereFetch = (async (u: string | URL) => {
+    const s = String(u);
+    return s.endsWith("/before") ? new Response("clean") : new Response(`has ${marker}`);
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "path_traversal", endpoint: url("a"),
+      invariant: { statement: "PoC file created then cleaned up", type: "file_created_then_deleted", expression: marker },
+      steps: [
+        { method: "GET", url: url("before") },
+        { method: "GET", url: url("during") },
+        { method: "GET", url: url("after") },
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: stillThereFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "FALSE_POSITIVE");
+});
+
+test("derived hs256_weak_key: a candidate key that verifies the JWT is CONFIRMED", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const key = "weak-secret-123";
+  const b64url = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const signingInput = `${b64url({ alg: "HS256", typ: "JWT" })}.${b64url({ sub: "user1" })}`;
+  const sig = createHmac("sha256", key).update(signingInput).digest("base64url");
+  const jwt = `${signingInput}.${sig}`;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "jwt_weak_key", endpoint: url,
+      invariant: { statement: "HS256 token signed with a guessable key", type: "derived", expression: "hs256_weak_key" },
+      derived_input: { jwt, candidates: ["wrong-1", key, "wrong-2"] },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("derived tls_unavailable: an injected prober reporting no HTTPS is CONFIRMED, and the prober is actually consulted", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const consulted: string[] = [];
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "insecure_transport", endpoint: url,
+      invariant: { statement: "no HTTPS service reachable", type: "derived", expression: "tls_unavailable" },
+      derived_input: { origins: ["https://10.0.0.1:3000"] },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+    tlsProber: async (origin: string) => { consulted.push(origin); return false; },
+  });
+  assert.deepEqual(consulted, ["https://10.0.0.1:3000"]);
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("derived tls_unavailable: an injected prober reporting HTTPS reachable is a FALSE_POSITIVE", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const consulted: string[] = [];
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({
+      vuln_class: "insecure_transport", endpoint: url,
+      invariant: { statement: "no HTTPS service reachable", type: "derived", expression: "tls_unavailable" },
+      derived_input: { origins: ["https://10.0.0.1:3000"] },
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+    tlsProber: async (origin: string) => { consulted.push(origin); return true; },
+  });
+  assert.deepEqual(consulted, ["https://10.0.0.1:3000"]);
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "FALSE_POSITIVE");
+});
+
+test("a denied step in `steps` is refused by the Tether and never reaches fetch", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const outOfScope = "http://evil.example.com:9999/x";
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    fetchedUrls.push(String(u));
+    return new Response("ok");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("a") }),
+    say(JSON.stringify({
+      vuln_class: "business_logic", endpoint: url("a"),
+      invariant: { statement: "state changed", type: "state_changed", expression: "appeared:whatever-marker" },
+      steps: [
+        { method: "GET", url: url("pre") },
+        { method: "GET", url: outOfScope },
+        { method: "GET", url: url("post") },
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW,
+  });
+  assert.ok(!fetchedUrls.includes(outOfScope), "a denied step must never reach fetch");
+  assert.equal(out.findings.length, 1);
+  assert.notEqual(out.findings[0].verdict, "CONFIRMED");
+  assert.equal(out.findings[0].verdict, "NEEDS_REVIEW", "too few captures after the denied step stops the sequence");
 });
