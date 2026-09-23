@@ -10,9 +10,12 @@ import type { AttemptedEntry, ProvedEntry, RecoveredIntel, SpineEndpoint } from 
  * same material that lived in HUNTER_SYSTEM — carried over, not rewritten — just
  * placed in the house XML convention from docs/PROMPTS.md: lowercase snake_case
  * tags, one concern per tag. The state-derived sections (attack_surface,
- * recovered_intel, already_proved, dead_ends, budget) are rebuilt from the Spine on
- * every call — this is what lets a beat build on what an earlier beat learned
- * instead of repeating its first step forever.
+ * recovered_intel, already_proved, coverage_goal, dead_ends, budget) are rebuilt
+ * from the Spine on every call — this is what lets a beat build on what an earlier
+ * beat learned instead of repeating its first step forever. coverage_goal is
+ * derived from `proved` too (it is the VULN_CLASSES vocabulary partitioned into
+ * proved vs. open) but gets its own tag because its job is framing — pushing the
+ * hunter toward breadth — not just listing exclusions the way already_proved does.
  *
  * On beat 1 every state-derived tag is still EMITTED, just empty, and each empty
  * tag carries an explicit instruction to populate it. An absent tag would read as
@@ -146,10 +149,16 @@ const EVIDENCE_DISCIPLINE = [
   "A claim about an endpoint's BEHAVIOUR must be proved by THAT ENDPOINT'S",
   "RESPONSE. Reading a function name, a comment, a route table or a hardcoded",
   "value in a script bundle tells you where to look — it is NEVER evidence that the",
-  "behaviour exists. A claim whose endpoint is a static asset (a script, a map, a",
-  "stylesheet) is almost always wrong: a static file has no logic to violate.",
-  "Static assets support only disclosure claims, and then the claim is about the",
-  "DISCLOSURE, not about whatever the file describes.",
+  "behaviour exists. A BEHAVIOUR claim (business_logic, sqli, ssrf, auth_bypass,",
+  "idor, deserialization_rce, xxe, or any class asserting server-side logic was",
+  "violated) whose endpoint is a static asset — a URL ending .js, .css, .map, .png,",
+  ".jpg, .jpeg, .gif, .svg, .ico, .woff, .woff2, .ttf, or any other",
+  "compiled/bundled/media file — is INVALID BY CONSTRUCTION, not merely unlikely: a",
+  "static file is served as-is with no server-side logic to violate, so no request",
+  "to it can ever prove a behaviour claim. This is FORBIDDEN, full stop — do not",
+  "emit it. Static assets support only disclosure claims (info_disclosure,",
+  "crypto_disclosure), and then the claim is about the DISCLOSURE of what the file",
+  "contains, never about a behaviour the file merely describes or references.",
   "",
   "The class is determined by the MECHANISM you exploited, not by what the",
   "response happened to contain. If you reached a file outside the intended",
@@ -255,11 +264,13 @@ const BUDGET_GUIDANCE = [
   "it immediately before exploring further. Then move up the priority order; do",
   "not spend the whole beat in P5. Each finding attempt has a limited turn budget:",
   "emit a claim well before you run out. A claim you emitted beats a better one",
-  "you never stated. Do not re-report a vuln_class and endpoint you were already",
-  "given a verdict for, or one listed in <already_proved> or <dead_ends> above —",
-  "those come from earlier beats against this same engagement. If a vuln_class is",
-  "rejected, re-emit with one of the exact allowed values. When you have no",
-  "further hypothesis worth testing, say so in plain text (no JSON) and stop.",
+  "you never stated. Do not re-report ANY vuln_class listed in <already_proved> —",
+  "on that endpoint or any other — and do not repeat an attempt listed in",
+  "<dead_ends>; both come from earlier beats against this same engagement. See",
+  "<coverage_goal> for which classes remain OPEN and target those instead. If a",
+  "vuln_class is rejected, re-emit with one of the exact allowed values. When you",
+  "have no further hypothesis worth testing, say so in plain text (no JSON) and",
+  "stop.",
 ].join("\n");
 
 function renderAttackSurface(endpoints: SpineEndpoint[]): string {
@@ -296,12 +307,49 @@ function renderAlreadyProved(proved: ProvedEntry[]): string {
   if (proved.length === 0) {
     return "  EMPTY. Nothing has been proved yet against this engagement — no exclusions apply.";
   }
-  return proved
+  const rows = proved
     .map((p) => tag("proved", {
       vuln_class: p.vuln_class, endpoint: p.endpoint,
       invariant_type: p.invariant_type, finding_id: p.finding_id,
     }))
     .join("\n");
+  const rule = [
+    "",
+    "  RULE: every vuln_class listed above is PROVED for the WHOLE engagement, not",
+    "  for the single endpoint shown next to it. Do NOT re-report a proved",
+    "  vuln_class on ANY endpoint — including an endpoint different from the one",
+    "  listed above. A second endpoint of an already-proved class is NOT a new",
+    "  finding; it is a wasted beat. If the vuln_class you are about to test is",
+    "  listed here, DISCARD that hypothesis before spending a turn on it and pick a",
+    "  DIFFERENT vuln_class from <coverage_goal>'s OPEN list instead.",
+  ].join("\n");
+  return rows + "\n" + rule;
+}
+
+function renderCoverageGoal(proved: ProvedEntry[]): string {
+  const provedSet = new Set(
+    proved.map((p) => p.vuln_class).filter((v) => (VULN_CLASSES as readonly string[]).includes(v)),
+  );
+  const provedClasses = VULN_CLASSES.filter((v) => provedSet.has(v));
+  const openClasses = VULN_CLASSES.filter((v) => !provedSet.has(v));
+  return [
+    "  Your objective this beat is BREADTH: cover as many DISTINCT vuln_classes as",
+    "  possible against this engagement, not re-confirm a class you already own. A",
+    "  strong beat proves several DIFFERENT classes once each; a beat that proves",
+    "  the same class on a second or third endpoint is not progress — the class was",
+    "  already proved the first time, so every re-proof after that displaces a",
+    "  finding you could have banked in a class that is still open.",
+    "",
+    "  ANTI-PATTERN, name it and forbid it: re-probing an endpoint that already",
+    "  yielded a CONFIRMED finding of some class, in order to claim that SAME class",
+    "  again — whether on that same endpoint or a different one — is the single",
+    "  most common way a beat wastes its budget. Recognize it before you start the",
+    "  probe, not after: if the class you are about to test is already proved (see",
+    "  <already_proved>), stop and choose a different one from OPEN below.",
+    "",
+    `  PROVED — ${provedClasses.length}/${VULN_CLASSES.length}, do not re-report: ${provedClasses.length ? provedClasses.join(", ") : "none yet"}`,
+    `  OPEN — ${openClasses.length}/${VULN_CLASSES.length}, this is your target list this beat: ${openClasses.length ? openClasses.join(", ") : "none — every class is already proved"}`,
+  ].join("\n");
 }
 
 function renderDeadEnds(attempted: AttemptedEntry[]): string {
@@ -324,6 +372,7 @@ export function buildHunterBrief(state: HunterBriefState): string {
     `<attack_surface>\n${renderAttackSurface(state.attackSurface)}\n</attack_surface>`,
     `<recovered_intel>\n${renderRecoveredIntel(state.recoveredIntel)}\n</recovered_intel>`,
     `<already_proved>\n${renderAlreadyProved(state.proved)}\n</already_proved>`,
+    `<coverage_goal>\n${renderCoverageGoal(state.proved)}\n</coverage_goal>`,
     `<dead_ends>\n${renderDeadEnds(state.attempted)}\n</dead_ends>`,
     `<thinking_framework>\n${THINKING_FRAMEWORK}\n</thinking_framework>`,
     `<prioritization_rules>\n${PRIORITIZATION_RULES}\n</prioritization_rules>`,

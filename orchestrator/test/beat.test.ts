@@ -7,6 +7,7 @@ import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
 import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
+import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 
 // Registers a REAL (but export-free) OpenTelemetry tracer provider once, before any
 // test runs. OpenTelemetry's "first registered provider wins" rule means this
@@ -916,4 +917,85 @@ test("a denied step in `steps` is refused by the Tether and never reaches fetch"
   assert.equal(out.findings.length, 1);
   assert.notEqual(out.findings[0].verdict, "CONFIRMED");
   assert.equal(out.findings[0].verdict, "NEEDS_REVIEW", "too few captures after the denied step stops the sequence");
+});
+
+// ---- Brief coverage-breadth discipline (src/brief.ts) -----------------------------
+//
+// Regression coverage for a real 4-beat run: beats 3-4 spent their whole budget
+// RE-PROVING findings already in the spine's `proved` list (a different endpoint,
+// same vuln_class), because the old <already_proved> rendering was descriptive
+// ("here is what was proved") rather than imperative ("do not do this again,
+// here is what to do instead"). These tests assert on the STRENGTHENED brief text
+// directly via buildHunterBrief — not through a full runBeat/spine round trip —
+// so a regression here fails fast and names exactly which rule regressed.
+
+function briefSection(xml: string, name: string): string {
+  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(xml);
+  assert.ok(m, `expected a <${name}> section in the brief`);
+  return m![1];
+}
+
+const BRIEF_EMPTY_STATE: HunterBriefState = {
+  attackSurface: [], recoveredIntel: {}, proved: [], attempted: [],
+  turnsRemaining: 40, findingsRemaining: 12,
+};
+
+test("brief: a spine with proved classes [clickjacking, cors_misconfig] names both as PROVED and presents an OPEN class as the target, in <already_proved>/<coverage_goal>", () => {
+  const state: HunterBriefState = {
+    ...BRIEF_EMPTY_STATE,
+    proved: [
+      { vuln_class: "clickjacking", endpoint: "http://10.0.0.1:3000/a", invariant_type: "response_asserted", verdict: "CONFIRMED", finding_id: "SAHW-aaaa1111" },
+      { vuln_class: "cors_misconfig", endpoint: "http://10.0.0.1:3000/b", invariant_type: "response_asserted", verdict: "CONFIRMED", finding_id: "SAHW-bbbb2222" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+
+  const alreadyProved = briefSection(xml, "already_proved");
+  assert.match(alreadyProved, /vuln_class="clickjacking"/);
+  assert.match(alreadyProved, /vuln_class="cors_misconfig"/);
+
+  const coverageGoal = briefSection(xml, "coverage_goal");
+  const provedLine = coverageGoal.split("\n").find((l) => /^\s*PROVED/.test(l));
+  const openLine = coverageGoal.split("\n").find((l) => /^\s*OPEN/.test(l));
+  assert.ok(provedLine, "coverage_goal must contain a PROVED line");
+  assert.ok(openLine, "coverage_goal must contain an OPEN line");
+  assert.match(provedLine!, /clickjacking/);
+  assert.match(provedLine!, /cors_misconfig/);
+  // sqli was not proved in this state — it must be presented as an OPEN target,
+  // not lumped in with the proved classes.
+  assert.match(openLine!, /\bsqli\b/);
+  assert.doesNotMatch(openLine!, /clickjacking/, "a proved class must not also appear in the OPEN target list");
+  assert.doesNotMatch(openLine!, /cors_misconfig/, "a proved class must not also appear in the OPEN target list");
+  // framing: the OPEN line must read as the beat's target, not a neutral list.
+  assert.match(coverageGoal, /target list/i);
+});
+
+test("brief: <already_proved> carries the imperative 'do not re-report a proved class on any endpoint' rule", () => {
+  const state: HunterBriefState = {
+    ...BRIEF_EMPTY_STATE,
+    proved: [
+      { vuln_class: "idor", endpoint: "http://10.0.0.1:3000/api/x", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-cccc3333" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const alreadyProved = briefSection(xml, "already_proved");
+  // Must be an imperative NOT to re-report a proved class on ANY endpoint (not just
+  // the one it was first proved on) — this is the exact discipline the observed
+  // 4-beat run's beats 3-4 violated.
+  assert.match(alreadyProved, /do not re-report a proved\s+vuln_class on any endpoint/i);
+  assert.match(alreadyProved, /second endpoint of an already-proved class is not a new/i);
+});
+
+test("brief: <evidence_discipline> forbids a behaviour claim on a static asset, and <output_contract> forbids a prose/parenthetical vuln_class", () => {
+  const xml = buildHunterBrief(BRIEF_EMPTY_STATE);
+
+  const evidenceDiscipline = briefSection(xml, "evidence_discipline");
+  assert.match(evidenceDiscipline, /invalid by construction/i);
+  assert.match(evidenceDiscipline, /\.js,\s*\.css,\s*\.map,\s*\.png/, "must enumerate static-asset extensions, not just say 'a script'");
+  assert.match(evidenceDiscipline, /no server-side logic to violate/i);
+  assert.match(evidenceDiscipline, /forbidden/i);
+
+  const outputContract = briefSection(xml, "output_contract");
+  assert.match(outputContract, /vuln_class must be exactly one of these snake_case strings/i);
+  assert.match(outputContract, /no prose, no\s+parentheses/i);
 });
