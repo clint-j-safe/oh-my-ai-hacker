@@ -1276,6 +1276,10 @@ test("brief: 0 sessions + open authenticated classes -> <account_objective> impe
   assert.match(section, /register_account/);
   // Names at least the classes this module judges to require a session.
   assert.match(section, /idor/);
+  // And gives a concrete signup-discovery tactic: a login route alone is not "no signup".
+  // (Without this, the hunter finds /login and never probes for /signup — observed live.)
+  assert.match(section, /sibling/i, "must tell the hunter signup is a sibling of the login route");
+  assert.match(section, /grep_artifact/, "must point at searching the bundle for the signup route");
 });
 
 test("brief: 2 sessions already known -> <account_objective> DROPS the registration directive and pushes authenticated-class coverage instead", () => {
