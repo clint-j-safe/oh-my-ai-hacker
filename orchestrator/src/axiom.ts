@@ -511,7 +511,15 @@ function evaluateStateChanged(expression: string, evidence: EvidenceBundle | und
 // field:/from:/to: clause is inherently same-resource (it re-reads one path) and is
 // left untouched below.
 function sameObservation(a: HttpCapture, b: HttpCapture): boolean {
-  const norm = (c: HttpCapture) => `${(c.request.method || "GET").toUpperCase()} ${c.request.url}`;
+  // Same method + url + BODY. The body matters: a genuine state change re-sends the
+  // IDENTICAL request before and after the mutating action, so any difference in the
+  // response is attributable to server state changing in between. If the body differs
+  // (e.g. reading account id=A pre vs id=B post, or contactUs plain pre vs XXE payload
+  // post), that is an INPUT differential — the response differs because YOUR input
+  // differed, not because state changed — and it must be proved as body_contains
+  // against a control_url, never as state_changed.
+  const norm = (c: HttpCapture) =>
+    `${(c.request.method || "GET").toUpperCase()} ${c.request.url}\n${c.request.body ?? ""}`;
   return norm(a) === norm(b);
 }
 
