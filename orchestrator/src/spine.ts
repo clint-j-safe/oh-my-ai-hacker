@@ -94,12 +94,36 @@ export interface SpineEngagementRef {
   scope_origins: string[];
 }
 
+/**
+ * Non-secret session metadata, persisted so a LATER beat knows accounts A/B
+ * already exist and does not waste a self-registration re-creating them. This
+ * type mirrors session.ts's SessionMeta exactly and deliberately has NO field for
+ * password or auth_material — those are secrets that live only in-process for the
+ * run (see session.ts's SessionStore), never on disk. A caller building this
+ * record from anything other than SessionStore.allMeta()/ToolRunner.getSessionMeta()
+ * is responsible for the same discipline; sanitizeSessionRecord below is a
+ * backstop, not the only guard (mirrors RecoveredIntel's own doc comment).
+ */
+export interface SpineSessionRecord {
+  label: string;
+  username: string;
+  created_utc: string;
+  auth_header_name: string;
+  has_auth_material: boolean;
+}
+
 export interface Spine {
   schema_version: number;
   engagement: SpineEngagementRef;
   beats: SpineBeatRecord[];
   attack_surface: SpineEndpoint[];
   recovered_intel: RecoveredIntel;
+  /** Session LABELS and their non-secret metadata only — see SpineSessionRecord.
+   * Never the password or auth_material a label resolves to; those live only
+   * in-process for the run (session.ts's SessionStore), keyed by label, and are
+   * re-obtained (a fresh self-registration) rather than restored from the spine
+   * across a process restart. */
+  sessions: SpineSessionRecord[];
   proved: ProvedEntry[];
   attempted: AttemptedEntry[];
   counters: SpineCounters;
@@ -126,6 +150,7 @@ function freshSpine(authRef: string, scopeOrigins: string[], freshReason: string
     beats: [],
     attack_surface: [],
     recovered_intel: {},
+    sessions: [],
     proved: [],
     attempted: [],
     counters: { total_beats: 0, total_findings: 0, total_proved: 0, total_attempted: 0 },
@@ -182,6 +207,7 @@ function normalize(parsed: any, authRef: string, scopeOrigins: string[]): Spine 
     beats: asArray<SpineBeatRecord>(parsed.beats),
     attack_surface: asArray<SpineEndpoint>(parsed.attack_surface),
     recovered_intel: asObject<RecoveredIntel>(parsed.recovered_intel, {}),
+    sessions: asArray<SpineSessionRecord>(parsed.sessions),
     proved: asArray<ProvedEntry>(parsed.proved),
     attempted: asArray<AttemptedEntry>(parsed.attempted),
     counters: asObject<SpineCounters>(parsed.counters, {
@@ -273,7 +299,7 @@ export async function saveSpine(workspace: string, spine: Spine): Promise<void> 
   }
 }
 
-// ---- secret redaction (recovered_intel only — see updateSpine) -----------------
+// ---- secret redaction (recovered_intel and session records — see updateSpine) --
 
 // A JWT: three dot-separated base64url segments, each long enough that this
 // wouldn't fire on an incidental "a.b.c". Matched and redacted wherever it occurs
@@ -329,6 +355,41 @@ function mergeEndpoints(prev: SpineEndpoint[], next: SpineEndpoint[]): SpineEndp
   return [...byKey.values()];
 }
 
+// A session record's only string fields are `label`, `username` and
+// `auth_header_name` — none of which should ever legitimately contain a secret.
+// The PRIMARY guard is structural: SpineSessionRecord/SessionMeta simply have no
+// field for password or auth_material, so there is nothing secret to leak here in
+// the ordinary case. This is a narrow backstop against a caller mistake (e.g.
+// accidentally passing a raw JWT in as a "username") — deliberately narrower than
+// sanitizeIntelString's LONG_TOKEN_RE pass, which would false-positive on the
+// framework's own synthetic usernames (see generateDisposableCredentials in
+// session.ts: "sahw-test-<label>-<12 hex chars>" is itself a long hyphenated
+// alnum run, and scrubbing that would make the spine's own account records
+// useless without actually protecting a secret — the token is never IN username
+// or auth_header_name to begin with). Only the unambiguous JWT shape (three
+// dot-separated segments) is checked; plain long/hyphenated identifiers pass
+// through untouched.
+function sanitizeSessionField(v: string): string {
+  return v.replace(JWT_RE, "<redacted-secret>");
+}
+
+function sanitizeSessionRecord(s: SpineSessionRecord): SpineSessionRecord {
+  return {
+    label: sanitizeSessionField(s.label),
+    username: sanitizeSessionField(s.username),
+    created_utc: s.created_utc,
+    auth_header_name: sanitizeSessionField(s.auth_header_name),
+    has_auth_material: s.has_auth_material,
+  };
+}
+
+function mergeSessions(prev: SpineSessionRecord[], next: SpineSessionRecord[]): SpineSessionRecord[] {
+  const byLabel = new Map<string, SpineSessionRecord>();
+  for (const s of prev) byLabel.set(s.label, s);
+  for (const s of next) byLabel.set(s.label, sanitizeSessionRecord(s));
+  return [...byLabel.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
 function dedupeByPair<T extends { vuln_class: string; endpoint: string }>(items: T[]): T[] {
   const byKey = new Map<string, T>();
   for (const it of items) byKey.set(`${it.vuln_class}::${it.endpoint}`, it);
@@ -345,6 +406,9 @@ export interface SpineBeatUpdate {
   beat: SpineBeatRecord;
   discoveredEndpoints?: SpineEndpoint[];
   recoveredIntel?: RecoveredIntel;
+  /** Non-secret session metadata this beat registered or already knew about —
+   * pass ToolRunner.getSessionMeta() here. Never a password or auth_material. */
+  sessions?: SpineSessionRecord[];
   proved?: ProvedEntry[];
   attempted?: AttemptedEntry[];
 }
@@ -365,6 +429,7 @@ export function updateSpine(spine: Spine, update: SpineBeatUpdate): Spine {
     beats,
     attack_surface: mergeEndpoints(spine.attack_surface, update.discoveredEndpoints ?? []),
     recovered_intel: mergeIntel(spine.recovered_intel, update.recoveredIntel ?? {}),
+    sessions: mergeSessions(spine.sessions, update.sessions ?? []),
     proved,
     attempted,
     counters: {

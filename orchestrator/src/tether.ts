@@ -182,7 +182,7 @@ export function checkCommand(cmd: string): Decision {
 
 const KNOWN_TOOLS = new Set([
   "http_request", "read_artifact", "grep_artifact", "glob_artifact",
-  "write_file", "shell_exec", "skill_run",
+  "write_file", "shell_exec", "skill_run", "register_account",
 ]);
 
 // --- skill_run egress classification -------------------------------------------------
@@ -284,6 +284,7 @@ export function auditTarget(tool: string, args: Record<string, unknown>): string
   if (tool === "http_request") return String(args.url ?? "");
   if (tool === "shell_exec") return String(args.command ?? "");
   if (tool === "skill_run") return String(args.skill_name ?? "");
+  if (tool === "register_account") return String(args.signup_url ?? "");
   return "";
 }
 
@@ -303,6 +304,22 @@ export function gate(
   if (!KNOWN_TOOLS.has(tool)) return deny(`unknown tool: ${tool}`);
   if (tool === "http_request") {
     return inScope(e, String(args.url ?? ""));
+  }
+  if (tool === "register_account") {
+    // Self-registration is TARGET-egress and state-changing (it creates an
+    // account), so it is gated exactly like http_request — no exemption. BOTH
+    // the signup endpoint and, when present, the login endpoint must be in
+    // scope; a call naming an out-of-scope host for either is denied here,
+    // before tools.ts's registerAccount() executor ever sends a signup request.
+    const signupUrl = String(args.signup_url ?? "");
+    const signupDecision = inScope(e, signupUrl);
+    if (!signupDecision.allow) return signupDecision;
+    const loginUrl = String(args.login_url ?? "").trim();
+    if (loginUrl) {
+      const loginDecision = inScope(e, loginUrl);
+      if (!loginDecision.allow) return loginDecision;
+    }
+    return ALLOW;
   }
   if (tool === "shell_exec") {
     const cmdCheck = checkCommand(String(args.command ?? ""));

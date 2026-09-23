@@ -8,6 +8,9 @@ import { existsSync } from "node:fs";
 import type { Engagement } from "./config.js";
 import { gate, SKILL_EGRESS, type SkillEgress, type Decision } from "./tether.js";
 import { ArtifactStore, type Artifact } from "./artifacts.js";
+import {
+  SessionStore, SessionCapError, generateDisposableCredentials, type SessionMeta,
+} from "./session.js";
 
 export interface HttpCapture {
   request: { method: string; url: string; headers: Record<string, string>; body: string | null };
@@ -69,7 +72,12 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
       name: "http_request",
       description:
         "Send ONE HTTP request to an in-scope host. Returns status, headers and body, " +
-        "and stores the verbatim exchange as a hashed artifact.",
+        "and stores the verbatim exchange as a hashed artifact. Pass `session` (a " +
+        "label like \"A\" or \"B\" returned by register_account) to send this request " +
+        "AUTHENTICATED as that session — the orchestrator injects the session's real " +
+        "auth material for you; you never see or handle the token itself. Use a " +
+        "DIFFERENT session's label against a resource created under another session " +
+        "to test cross-user access (the IDOR shape).",
       parameters: {
         type: "object",
         properties: {
@@ -77,6 +85,12 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
           url: { type: "string" },
           headers: { type: "object" },
           body: { type: "string" },
+          session: {
+            type: "string",
+            description:
+              "Optional session label (e.g. \"A\") from a prior register_account call. " +
+              "When present, the request is sent authenticated as that session.",
+          },
         },
         required: ["method", "url"],
       },
@@ -126,6 +140,84 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
           },
         },
         required: ["sha256", "pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "register_account",
+      description:
+        "Self-register ONE disposable test account through a signup flow you " +
+        "discovered on the target, then (if the signup response does not itself " +
+        "carry a token) log in through a discovered login endpoint to obtain one. " +
+        "The orchestrator generates the credentials (obviously synthetic test " +
+        "data — you never choose or see them), sends the signup/login requests " +
+        "itself through the same Tether-gated path as http_request, and stores " +
+        "the resulting auth material as a new SESSION under the next free label " +
+        "(\"A\", then \"B\", ...), capped at SAHW_MAX_ACCOUNTS accounts for this " +
+        "engagement. Returns ONLY the label created and whether auth material was " +
+        "obtained — never the token. Pass the label to http_request's `session` " +
+        "argument to send an authenticated request as that account. Register a " +
+        "SECOND account to test cross-user access (IDOR-shaped findings): send a " +
+        "request with session \"B\" against a resource created under session \"A\".",
+      strict: true,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          signup_url: { type: "string", description: "The signup endpoint you discovered." },
+          signup_method: { type: "string", enum: ["POST", "PUT"] },
+          signup_body_template: {
+            type: "string",
+            description:
+              "The signup request body, JSON-encoded as a string, in EXACTLY the " +
+              "envelope shape you recovered from the target — but with the literal " +
+              "placeholder tokens {{username}}, {{email}} and {{password}} in place " +
+              "of real values, inside the JSON string's own quotes. Example: " +
+              '\'{"user":{"username":"{{username}}","email":"{{email}}",' +
+              '"password":"{{password}}"}}\'. The orchestrator substitutes ' +
+              "framework-generated disposable credentials for these placeholders " +
+              "before sending; you never see or choose the actual values.",
+          },
+          signup_response_token_path: {
+            type: "string",
+            description:
+              "Dot-path into the PARSED JSON signup response where an auth token " +
+              "lives, e.g. \"token\" or \"data.access_token\". Empty string if the " +
+              "signup response never carries a token and a separate login is " +
+              "required.",
+          },
+          login_url: {
+            type: "string",
+            description: "A discovered login endpoint. Empty string if not needed.",
+          },
+          login_method: { type: "string", enum: ["POST", "PUT"] },
+          login_body_template: {
+            type: "string",
+            description:
+              "Same templating convention as signup_body_template, for the login " +
+              "request body. Empty string if login_url is empty.",
+          },
+          login_response_token_path: {
+            type: "string",
+            description: "Same convention as signup_response_token_path, for the login response.",
+          },
+          auth_header_name: {
+            type: "string",
+            description:
+              "The header name this target expects auth material on for " +
+              "authenticated requests, as YOU observed it (e.g. \"Authorization\", " +
+              "\"X-Auth-Token\") — never assume a default. Recorded for this session " +
+              "and used automatically whenever a later http_request specifies this " +
+              "session's label.",
+          },
+        },
+        required: [
+          "signup_url", "signup_method", "signup_body_template", "signup_response_token_path",
+          "login_url", "login_method", "login_body_template", "login_response_token_path",
+          "auth_header_name",
+        ],
       },
     },
   },
@@ -525,6 +617,57 @@ function runSkillProcess(
   });
 }
 
+// --- register_account: credential templating + response token extraction ------------
+//
+// Black-box discipline: the hunter recovers the signup/login envelope SHAPE from the
+// target itself and hands it back as a template string containing the literal
+// placeholders {{username}}/{{email}}/{{password}} — nothing about a specific
+// target's field names or nesting is known to this file. fillCredentialTemplate does
+// a plain string substitution (escaping each value for safe embedding inside the
+// template's own JSON string quotes) and then requires the result to parse as JSON,
+// so a malformed template is caught here as invalid_argument rather than silently
+// sent to the target as garbage.
+function fillCredentialTemplate(
+  template: string, vars: Record<string, string>, fieldName: string,
+): string {
+  let out = template;
+  for (const [k, v] of Object.entries(vars)) {
+    // JSON.stringify(v) is `"escaped-value"`; slice off the surrounding quotes so
+    // the escaped TEXT drops into the template's own quotes rather than doubling them.
+    const escaped = JSON.stringify(v).slice(1, -1);
+    out = out.split(`{{${k}}}`).join(escaped);
+  }
+  try {
+    JSON.parse(out);
+  } catch (err) {
+    throw new InvalidToolArgumentError(
+      `${fieldName} did not produce valid JSON after substituting credentials: ` +
+      `${err instanceof Error ? err.message : String(err)}`);
+  }
+  return out;
+}
+
+// Walks a caller-supplied dot-path ("data.access_token") into a PARSED JSON response
+// body. Returns null (never throws) for an unparseable body, an empty path, a path
+// that does not resolve, or a resolved value that is not a non-empty string — every
+// one of those is "no token here", not a caller argument defect: the path itself was
+// well-formed, the target's response just did not contain what was expected at it.
+function extractTokenFromBody(bodyText: string, path: string): string | null {
+  if (!path) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  let cursor: unknown = parsed;
+  for (const key of path.split(".")) {
+    if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) return null;
+    cursor = (cursor as Record<string, unknown>)[key];
+  }
+  return typeof cursor === "string" && cursor.length > 0 ? cursor : null;
+}
+
 export class ToolRunner {
   private readonly engagement: Engagement;
   private readonly store: ArtifactStore;
@@ -534,6 +677,7 @@ export class ToolRunner {
   private readonly skillsRoot: string;
   private readonly skillTimeoutMs: number;
   private readonly spawnImpl: typeof spawn;
+  private readonly sessions: SessionStore;
 
   constructor(opts: {
     engagement: Engagement;
@@ -557,6 +701,11 @@ export class ToolRunner {
      * how `fetchImpl` above lets tests intercept http_request without a real network
      * call. Production code omits it and gets the real `spawn`. */
     spawnImpl?: typeof spawn;
+    /** The session store backing register_account/http_request's `session` argument.
+     * Defaults to a fresh SessionStore (capped by SAHW_MAX_ACCOUNTS, default 2) so
+     * self-registration works without any caller opting in explicitly. Tests pass
+     * their own instance to observe/pre-seed sessions, or to set a smaller cap. */
+    sessionStore?: SessionStore;
   }) {
     this.engagement = opts.engagement;
     this.store = opts.store;
@@ -566,6 +715,16 @@ export class ToolRunner {
     this.skillsRoot = opts.skillsRoot ?? SKILLS_ROOT;
     this.skillTimeoutMs = opts.skillTimeoutMs ?? SKILL_TIMEOUT_MS;
     this.spawnImpl = opts.spawnImpl ?? spawn;
+    this.sessions = opts.sessionStore ?? new SessionStore();
+  }
+
+  /** Non-secret metadata for every session registered so far this run — label,
+   * username, created_utc, auth_header_name, has_auth_material. NEVER includes a
+   * password or auth_material (see session.ts's SessionMeta). This is the shape a
+   * caller (beat.ts, eventually) merges into the spine so a later beat knows
+   * accounts A/B already exist without re-registering them. */
+  getSessionMeta(): SessionMeta[] {
+    return this.sessions.allMeta();
   }
 
   /** Computes the Tether's decision for a call WITHOUT executing it. Exists so
@@ -598,6 +757,7 @@ export class ToolRunner {
       if (tool === "read_artifact") return { ok: true, result: await this.readArtifact(args) };
       if (tool === "grep_artifact") return { ok: true, result: await this.grepArtifact(args) };
       if (tool === "skill_run") return { ok: true, result: await this.skillRun(args) };
+      if (tool === "register_account") return { ok: true, result: await this.registerAccount(args) };
       return { ok: false, kind: "no_executor", denied: `no executor for tool: ${tool}` };
     } catch (err) {
       // Belt-and-braces: even with the upfront hash validation below, ArtifactStore.get()
@@ -607,6 +767,14 @@ export class ToolRunner {
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof InvalidToolArgumentError) {
         return { ok: false, kind: "invalid_argument", denied: message };
+      }
+      // The SAHW_MAX_ACCOUNTS cap is a fixed run-level ceiling, not something a
+      // caller could satisfy by retrying with different arguments — same
+      // never-retry posture as a Tether policy denial, so it is reported under
+      // the same "policy" kind (see ToolFailureKind's doc above) rather than
+      // execution_error, which implies retrying MAY help.
+      if (err instanceof SessionCapError) {
+        return { ok: false, kind: "policy", denied: message };
       }
       return { ok: false, kind: "execution_error", denied: `tool execution error: ${message}` };
     }
@@ -667,8 +835,36 @@ export class ToolRunner {
   private async http(args: Record<string, unknown>): Promise<HttpCapture> {
     const method = String(args.method ?? "GET").toUpperCase();
     const url = String(args.url);
-    const headers = (args.headers as Record<string, string>) ?? {};
+    const headers = { ...((args.headers as Record<string, string>) ?? {}) };
     const body = args.body === undefined ? null : String(args.body);
+
+    // Session injection. `session` is a LABEL ("A"), never the material itself —
+    // the model can name a session but can never see or set what it resolves to.
+    // sendHeaders (used for the REAL fetch) and recordHeaders (used for the
+    // stored artifact AND the value returned to execute()/the model) diverge
+    // ONLY on the injected header's value: sendHeaders carries the real
+    // auth_material, recordHeaders carries a label-scoped placeholder. Nothing
+    // downstream of this method — the artifact store, forModel(), a span — ever
+    // sees sendHeaders, so the secret has exactly one path out of this process:
+    // the fetch call three lines below.
+    let sendHeaders = headers;
+    let recordHeaders = headers;
+    const sessionArg = args.session;
+    if (typeof sessionArg === "string" && sessionArg.trim() !== "") {
+      const label = sessionArg.trim();
+      if (!this.sessions.has(label)) {
+        throw new InvalidToolArgumentError(`unknown session label: ${JSON.stringify(label)}`);
+      }
+      const material = this.sessions.authMaterialFor(label);
+      if (material === null) {
+        throw new InvalidToolArgumentError(
+          `session ${JSON.stringify(label)} has no auth material to inject ` +
+          "(registration did not obtain a token for it)");
+      }
+      const headerName = this.sessions.authHeaderNameFor(label) ?? "Authorization";
+      sendHeaders = { ...headers, [headerName]: material };
+      recordHeaders = { ...headers, [headerName]: `<redacted:session-${label}>` };
+    }
 
     const started = Date.now();
     // redirect: "manual" is load-bearing for scope integrity. The Tether (gate()/
@@ -683,19 +879,96 @@ export class ToolRunner {
     // like any other response; the model must issue a fresh http_request for the
     // Location if it wants to follow, which sends that URL through gate() on its own
     // merits.
-    const res = await this.fetchImpl(url, { method, headers, body: body ?? undefined, redirect: "manual" });
+    const res = await this.fetchImpl(url, { method, headers: sendHeaders, body: body ?? undefined, redirect: "manual" });
     const text = await res.text();
     const ms = Date.now() - started;
 
     const respHeaders: Record<string, string> = {};
     res.headers.forEach((v, k) => { respHeaders[k] = v; });
 
+    // recordHeaders (never sendHeaders) is what gets hashed into the artifact store
+    // and returned to the caller — read_artifact/grep_artifact are model-reachable,
+    // so a real auth_material value in the stored capture would hand the secret
+    // straight back to the model through that path. See the session-injection
+    // block above for why this is safe: recordHeaders differs from sendHeaders
+    // ONLY on the injected header's value.
     const capture = {
-      request: { method, url, headers, body },
+      request: { method, url, headers: recordHeaders, body },
       response: { status: res.status, headers: respHeaders, body: text },
     };
     const artifact = await this.store.put(JSON.stringify(capture, null, 2));
     return { ...capture, artifact, ms };
+  }
+
+  /**
+   * Discovers-nothing, hardcodes-nothing: every URL, envelope shape and field
+   * mapping arrives from the caller (the hunter, having read the target's own
+   * signup form/API). This method only orchestrates — generate credentials,
+   * fill in the caller's templates, send signup (and, if needed, login) through
+   * the SAME http() path as any other request (so the exchange is captured as
+   * an artifact like any other evidence), extract a token if one comes back,
+   * and hand the result to the SessionStore. Never returns or logs the token;
+   * see registerAccount's return type below.
+   */
+  private async registerAccount(
+    args: Record<string, unknown>,
+  ): Promise<{ label: string; obtained_auth_material: boolean }> {
+    const signupUrl = String(args.signup_url ?? "").trim();
+    if (!signupUrl) throw new InvalidToolArgumentError("signup_url is required");
+    const signupMethod = String(args.signup_method ?? "POST").toUpperCase();
+    const signupTemplate = String(args.signup_body_template ?? "");
+    const signupTokenPath = String(args.signup_response_token_path ?? "").trim();
+    const loginUrl = String(args.login_url ?? "").trim();
+    const loginMethod = String(args.login_method ?? "POST").toUpperCase();
+    const loginTemplate = String(args.login_body_template ?? "");
+    const loginTokenPath = String(args.login_response_token_path ?? "").trim();
+    const authHeaderName = String(args.auth_header_name ?? "").trim();
+    if (!authHeaderName) throw new InvalidToolArgumentError("auth_header_name is required");
+
+    // Reserve the label and refuse BEFORE spending a signup request against the
+    // target: a call that would exceed SAHW_MAX_ACCOUNTS must never touch the
+    // network at all, mirroring "denied http_request writes no artifact".
+    const label = this.sessions.nextLabel();
+    if (label === null) {
+      throw new SessionCapError(
+        `account cap reached: SAHW_MAX_ACCOUNTS already has ${this.sessions.size()} ` +
+        "session(s) — no further self-registration is permitted for this engagement");
+    }
+
+    const credentials = generateDisposableCredentials(label);
+    const vars = { username: credentials.username, email: credentials.email, password: credentials.password };
+
+    const signupBody = fillCredentialTemplate(signupTemplate, vars, "signup_body_template");
+    const signup = await this.http({
+      method: signupMethod, url: signupUrl,
+      headers: { "content-type": "application/json" }, body: signupBody,
+    });
+    if (signup.response.status < 200 || signup.response.status >= 300) {
+      throw new Error(
+        `registration failed: signup to ${signupUrl} returned status ${signup.response.status}`);
+    }
+
+    let authMaterial = extractTokenFromBody(signup.response.body, signupTokenPath);
+
+    if (authMaterial === null && loginUrl) {
+      const loginBody = fillCredentialTemplate(loginTemplate, vars, "login_body_template");
+      const login = await this.http({
+        method: loginMethod, url: loginUrl,
+        headers: { "content-type": "application/json" }, body: loginBody,
+      });
+      if (login.response.status >= 200 && login.response.status < 300) {
+        authMaterial = extractTokenFromBody(login.response.body, loginTokenPath);
+      }
+    }
+
+    const meta = this.sessions.create({ credentials, authMaterial, authHeaderName });
+    if (meta === null) {
+      // Defense in depth only: nextLabel() already reserved a slot above under
+      // this same synchronous call, so this branch cannot actually be reached
+      // in practice — mirrors the belt-and-braces posture elsewhere in this file.
+      throw new SessionCapError("account cap reached while finalizing registration");
+    }
+    return { label: meta.label, obtained_auth_material: meta.has_auth_material };
   }
 
   private async skillRun(args: Record<string, unknown>): Promise<SkillRunOutcome> {

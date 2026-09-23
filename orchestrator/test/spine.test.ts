@@ -131,7 +131,7 @@ test("updateSpine merges beats/counters/proved/attempted/attack_surface across c
   const base: Spine = {
     schema_version: SPINE_SCHEMA_VERSION,
     engagement: { auth_ref: AUTH_REF, scope_origins: SCOPE },
-    beats: [], attack_surface: [], recovered_intel: {}, proved: [], attempted: [],
+    beats: [], attack_surface: [], recovered_intel: {}, sessions: [], proved: [], attempted: [],
     counters: { total_beats: 0, total_findings: 0, total_proved: 0, total_attempted: 0 },
     fresh_reason: null,
   };
@@ -174,7 +174,7 @@ test("secret redaction does not touch attack_surface URLs, which can legitimatel
   const base: Spine = {
     schema_version: SPINE_SCHEMA_VERSION,
     engagement: { auth_ref: AUTH_REF, scope_origins: SCOPE },
-    beats: [], attack_surface: [], recovered_intel: {}, proved: [], attempted: [],
+    beats: [], attack_surface: [], recovered_intel: {}, sessions: [], proved: [], attempted: [],
     counters: { total_beats: 0, total_findings: 0, total_proved: 0, total_attempted: 0 },
     fresh_reason: null,
   };
