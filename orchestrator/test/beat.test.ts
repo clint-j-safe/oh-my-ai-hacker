@@ -8,6 +8,7 @@ import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
 import { runBeat, VULN_CLASSES, isVulnClass } from "../src/beat.js";
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
+import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
 // Registers a REAL (but export-free) OpenTelemetry tracer provider once, before any
 // test runs. OpenTelemetry's "first registered provider wins" rule means this
@@ -917,6 +918,219 @@ test("a denied step in `steps` is refused by the Tether and never reaches fetch"
   assert.equal(out.findings.length, 1);
   assert.notEqual(out.findings[0].verdict, "CONFIRMED");
   assert.equal(out.findings[0].verdict, "NEEDS_REVIEW", "too few captures after the denied step stops the sequence");
+});
+
+// ---- Session threading through proof-capture (capture()/runSteps()) --------------
+//
+// register_account + http_request's `session` arg were already live for the hunter's
+// own exploration, but beat.ts's own re-request path — capture() (differential
+// exploit/control) and runSteps() (the `steps` evidence-bundle types) — did not
+// thread a claim's `session` label, so proof-capture always replayed anonymously
+// even for a claim the hunter proved authenticated during exploration. These tests
+// exercise the fix: claim.session / step.session reach http_request's own `session`
+// arg, which is the ONLY path from a label to real auth material (see
+// test/tools.test.ts for that mechanism's own coverage).
+
+test("a claim with session:\"A\" injects A's auth material into the exploit proof-capture request", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  sessions.create({
+    credentials: generateDisposableCredentials("A"), authMaterial: "TOKEN-A", authHeaderName: "Authorization",
+  });
+  let sentAuth: string | undefined;
+  const spyFetch = (async (_u: unknown, init?: RequestInit) => {
+    sentAuth = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({ ...claim("clickjacking", url), session: "A" })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW, sessionStore: sessions,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(sentAuth, "TOKEN-A", "the proof-capture request (not just exploration) must carry session A's token");
+});
+
+test("cross-user claim: a setup step under session A and an exploit step under session B each carry their OWN token (the IDOR mechanism)", async () => {
+  const url = (p: string) => `http://10.0.0.1:3000/${p}`;
+  const marker = "idor-marker-1";
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  sessions.create({
+    credentials: generateDisposableCredentials("A"), authMaterial: "TOKEN-A", authHeaderName: "Authorization",
+  });
+  sessions.create({
+    credentials: generateDisposableCredentials("B"), authMaterial: "TOKEN-B", authHeaderName: "Authorization",
+  });
+  const authByUrl: Record<string, string | undefined> = {};
+  const spyFetch = (async (u: string | URL, init?: RequestInit) => {
+    const s = String(u);
+    authByUrl[s] = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
+    return s.endsWith("/access-as-b") ? new Response(`ok ${marker}`) : new Response("ok plain");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: url("recon") }),
+    say(JSON.stringify({
+      vuln_class: "idor", endpoint: url("recon"),
+      invariant: { statement: "resource created by A is readable by B", type: "state_changed", expression: `appeared:${marker}` },
+      steps: [
+        { method: "POST", url: url("create-as-a"), session: "A" },     // setup, under A
+        { method: "GET", url: url("baseline") },                       // context, anonymous
+        { method: "GET", url: url("access-as-b"), session: "B" },      // exploit, under B
+      ],
+    })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW, sessionStore: sessions,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(authByUrl[url("create-as-a")], "TOKEN-A", "the setup step must carry A's token");
+  assert.equal(authByUrl[url("access-as-b")], "TOKEN-B", "the exploit step must carry B's token, never A's");
+  assert.notEqual(authByUrl[url("access-as-b")], "TOKEN-A");
+});
+
+test("an anonymous claim (no session label) still sends no Authorization header — regression", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  let sawAuthHeader = false;
+  const spyFetch = (async (_u: unknown, init?: RequestInit) => {
+    if ((init?.headers as Record<string, string> | undefined)?.["Authorization"]) sawAuthHeader = true;
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(sawAuthHeader, false, "a claim with no session label must never inject auth material");
+});
+
+test("a session-threaded claim's auth token never appears in the spine's persisted progress.json", async () => {
+  const env = await ENV();
+  const url = "http://10.0.0.1:3000/a";
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  sessions.create({
+    credentials: generateDisposableCredentials("A"), authMaterial: "TOP-SECRET-CAPTURE-TOKEN", authHeaderName: "Authorization",
+  });
+  const okFetch = (async () => new Response("OK")) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify({ ...claim("clickjacking", url), session: "A" })),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: okFetch, now: NOW, sessionStore: sessions,
+  });
+  assert.equal(out.findings.length, 1);
+  const raw = await readFile(join(env.SAHW_WORKSPACE!, "spine", "progress.json"), "utf8");
+  assert.ok(!raw.includes("TOP-SECRET-CAPTURE-TOKEN"), "the real auth token must never reach the spine's serialized JSON");
+});
+
+// ---- Already-proved short-circuit (Gap 2: beats re-proving already-CONFIRMED classes) --
+//
+// The coverage-brief prompt asks the hunter not to re-report a class already proved,
+// but a prompt cannot guarantee that under budget pressure. This is the deterministic
+// backstop: a claim whose vuln_class is already CONFIRMED anywhere in the engagement
+// (a prior beat's spine.proved) is never replayed against the target at all.
+
+test("a claim whose vuln_class is already proved in the spine is short-circuited before the Axiom — the target fetch is never called for it", async () => {
+  const env = await TRACED_ENV();
+  const urlA = "http://10.0.0.1:3000/a";
+  const urlRecon = "http://10.0.0.1:3000/recon";
+  const urlB = "http://10.0.0.1:3000/b";
+
+  // Beat 1: bank a real CONFIRMED clickjacking finding on /a, into the spine.
+  const script1 = [
+    call("http_request", { method: "GET", url: urlA }),
+    say(JSON.stringify(claim("clickjacking", urlA))),
+    say("Nothing else to report."),
+  ];
+  const first = await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script1), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(first.findings.length, 1);
+  assert.equal(first.findings[0].verdict, "CONFIRMED");
+
+  // Beat 2, SAME engagement/workspace: the hunter explores an unrelated recon endpoint
+  // (satisfying the beat's own minimum-activity stall rule) then — wrongly, or under
+  // budget pressure — re-claims clickjacking on a DIFFERENT endpoint (/b) it never
+  // actually probed, proving the short-circuit fires from the claim alone, before any
+  // replay of /b would ever occur.
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    fetchedUrls.push(String(u));
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const script2 = [
+    call("http_request", { method: "GET", url: urlRecon }),
+    say(JSON.stringify(claim("clickjacking", urlB))),
+    say("Nothing else to report."),
+  ];
+  const client2 = recordingScriptedClient(script2);
+  const second = await runBeat({
+    env: { ...env, SAHW_CLAIM_REVIEW: "off" },
+    client: client2, fetchImpl: spyFetch, now: NOW,
+  });
+
+  assert.equal(second.already_proved_suppressed, 1);
+  assert.equal(second.findings.length, 0, "a short-circuited claim must not be banked as a finding");
+  assert.ok(fetchedUrls.includes(urlRecon), "sanity: the unrelated recon call itself did reach fetch");
+  assert.ok(!fetchedUrls.includes(urlB), "the already-proved claim must never reach the target at all");
+
+  // Fed back as already-covered, distinct wording from the plain duplicate-in-beat path.
+  const sawFeedback = client2.seen.some((params: any) =>
+    params.messages.some((m: any) => typeof m.content === "string" && /already CONFIRMED/i.test(m.content)));
+  assert.ok(sawFeedback, "the hunter must be told this class is already covered, not silently dropped");
+});
+
+test("a claim whose vuln_class is NOT yet proved still reaches the Axiom normally", async () => {
+  const url = "http://10.0.0.1:3000/a";
+  const script = [
+    call("http_request", { method: "GET", url }),
+    say(JSON.stringify(claim("clickjacking", url))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await TRACED_ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: bareFetch, now: NOW,
+  });
+  assert.equal(out.already_proved_suppressed, 0);
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].verdict, "CONFIRMED");
+});
+
+test("a class CONFIRMED earlier in THIS SAME beat also short-circuits a later same-class claim (no second-beat round trip needed)", async () => {
+  const urlA = "http://10.0.0.1:3000/a";
+  const urlB = "http://10.0.0.1:3000/b";
+  const fetchedUrls: string[] = [];
+  const spyFetch = (async (u: string | URL) => {
+    fetchedUrls.push(String(u));
+    return new Response("OK");
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: urlA }),
+    say(JSON.stringify(claim("clickjacking", urlA))),
+    say(JSON.stringify(claim("clickjacking", urlB))),
+    say("Nothing else to report."),
+  ];
+  const out = await runBeat({
+    env: { ...(await ENV()), SAHW_CLAIM_REVIEW: "off" },
+    client: recordingScriptedClient(script), fetchImpl: spyFetch, now: NOW,
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.already_proved_suppressed, 1);
+  assert.ok(!fetchedUrls.includes(urlB), "the second, same-class claim must never reach the target this beat either");
 });
 
 // ---- Brief coverage-breadth discipline (src/brief.ts) -----------------------------

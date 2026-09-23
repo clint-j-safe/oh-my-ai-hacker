@@ -5,6 +5,7 @@ import type { spawn } from "node:child_process";
 import { loadEngagement } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
+import type { SessionStore } from "./session.js";
 import { runAgent, type MinimalClient } from "./agent.js";
 import { evaluate, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
 import { gateProvenance } from "./provenance.js";
@@ -95,6 +96,13 @@ type BeatResult = {
   stalled: boolean;
   reason: string | null;
   duplicates_suppressed: number;
+  /** Claims whose vuln_class was already CONFIRMED somewhere in this engagement
+   * (a prior beat's spine.proved, or a finding banked earlier THIS beat) and so
+   * were never replayed against the target — a deterministic backstop to the
+   * <prioritization_rules> brief guidance, which cannot itself guarantee restraint
+   * under budget pressure. The rubric scores a class once; this is what makes that
+   * true in code, not just in the prompt. */
+  already_proved_suppressed: number;
   rejected_claims: RejectedClaim[];
   /** Count of each FailureCause across every non-CONFIRMED finding this beat. Every
    * member of FailureCause is present, defaulting to 0 — never a sparse object. */
@@ -169,6 +177,18 @@ function feedbackForDuplicate(vuln_class: string, endpoint: string): string {
   return [
     `You already reported ${vuln_class} @ ${endpoint} in this beat — that is a`,
     "duplicate, so it was not re-verified. Pick a different vuln_class/endpoint pair.",
+  ].join(" ");
+}
+
+/** Distinct from feedbackForDuplicate: this is not a rejection of a wrong claim, it
+ * is a class the engagement already scored (on ANY endpoint, possibly in a prior
+ * beat) — the request was never replayed against the target at all. */
+function feedbackForAlreadyProved(vuln_class: string, endpoint: string): string {
+  return [
+    `${vuln_class} is already CONFIRMED elsewhere in this engagement — the rubric`,
+    `scores a class once, so replaying it against ${endpoint} was skipped without`,
+    "contacting the target. That is not a rejection: pick a DIFFERENT vulnerability",
+    "class you have not yet proved.",
   ].join(" ");
 }
 
@@ -328,7 +348,7 @@ function claimReviewEnabled(env: Env): boolean {
 }
 
 function buildClaimReviewInput(claim: {
-  vuln_class: string; endpoint: string; control_url?: string;
+  vuln_class: string; endpoint: string; control_url?: string; session?: string;
   invariant: { type: string; statement?: string; expression: string };
 }): string {
   const invType = claim.invariant.type;
@@ -369,7 +389,7 @@ function boundedReviewText(s: string, max = 600): string {
  */
 async function runClaimReview(
   runner: ToolRunner,
-  claim: { vuln_class: string; endpoint: string; control_url?: string;
+  claim: { vuln_class: string; endpoint: string; control_url?: string; session?: string;
     invariant: { type: string; statement?: string; expression: string } },
 ): Promise<ClaimReviewOutcome> {
   let result;
@@ -542,6 +562,11 @@ export async function runBeat(opts: {
    * used by a `derived`/tls_unavailable claim (see resolveDerivedInput below).
    * Production omits it; tests inject a fake one so they never touch the network. */
   tlsProber?: TlsProber;
+  /** Overrides ToolRunner's default fresh SessionStore. Mirrors fetchImpl/spawnImpl —
+   * production omits it; tests pass a pre-seeded store so a claim's `session` label
+   * (see capture()/runSteps() below) resolves to real, injectable auth material
+   * without going through a live register_account call first. */
+  sessionStore?: SessionStore;
 }): Promise<BeatResult> {
   const engagement = loadEngagement(opts.env, opts.now);   // throws outside the window — MUST run
                                                             // before any span opens (see below)
@@ -566,6 +591,7 @@ export async function runBeat(opts: {
     // can point at a fixture skill directory without touching global state.
     skillsRoot: opts.env.SAHW_SKILLS_ROOT?.trim() || undefined,
     skillTimeoutMs: numEnv(opts.env, "SAHW_SKILL_TIMEOUT_MS", 120_000),
+    sessionStore: opts.sessionStore,
   });
   const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(HUNTER_SKILL_ALLOWLIST)];
 
@@ -636,6 +662,7 @@ export async function runBeat(opts: {
             stalled: result.stalled,
             reason: result.reason,
             duplicatesSuppressed: result.duplicates_suppressed,
+            alreadyProvedSuppressed: result.already_proved_suppressed,
             rejectedClaims: result.rejected_claims.length,
           },
         });
@@ -655,6 +682,12 @@ export async function runBeat(opts: {
         const findings: FindingRowWithCause[] = [];
         const seen = new Set<string>();               // `${vuln_class}::${endpoint}`
         let duplicatesSuppressed = 0;
+        // Every vuln_class already CONFIRMED anywhere in this engagement — seeded from
+        // the spine's prior beats, then grown as THIS beat itself confirms classes (see
+        // the provedEntries.push() site below) — so a second CONFIRMED hit on the SAME
+        // class later in this same beat is caught too, not just across beats.
+        const provedVulnClasses = new Set(spineLoad.spine.proved.map((p) => p.vuln_class));
+        let alreadyProvedSuppressed = 0;
         const rejectedClaims: RejectedClaim[] = [];
         const failureCauses = emptyFailureCauses();
         const reviewEnabled = claimReviewEnabled(opts.env);
@@ -715,6 +748,7 @@ export async function runBeat(opts: {
           return {
             exitCode, findings, stalled, reason,
             duplicates_suppressed: duplicatesSuppressed,
+            already_proved_suppressed: alreadyProvedSuppressed,
             rejected_claims: rejectedClaims,
             failure_causes: failureCauses,
             spine_fresh: spineLoad.fresh,
@@ -875,6 +909,21 @@ export async function runBeat(opts: {
             continue;
           }
 
+          // A class already CONFIRMED anywhere in this engagement (a prior beat, or an
+          // earlier finding banked THIS beat) is never replayed — neither claim review
+          // nor the Axiom ever runs, and no request reaches the target. The rubric
+          // scores a class once, so re-proving it on a different endpoint is pure
+          // budget waste; this is a deterministic backstop to the brief's
+          // <prioritization_rules> guidance, which a prompt cannot itself guarantee
+          // under budget pressure. Distinct from a rejection — the claim is not wrong,
+          // it is redundant — so it is fed back and counted separately, never banked
+          // as a finding.
+          if (provedVulnClasses.has(claim.vuln_class)) {
+            alreadyProvedSuppressed += 1;
+            messages.push({ role: "user", content: feedbackForAlreadyProved(claim.vuln_class, claim.endpoint) });
+            continue;
+          }
+
           // Mandatory claim review (Defect 1) — runs BEFORE the Axiom replays anything.
           // Switchable via SAHW_CLAIM_REVIEW (default on); a broken/denied/timed-out
           // review must never block a verdict, so every non-"rejected" outcome
@@ -936,9 +985,16 @@ export async function runBeat(opts: {
           // and — for the four evidence-bundle types — the claim's own `steps` /
           // `derived_input` evidence plan, then evaluate the typed invariant.
           const invType = claim.invariant.type as InvariantType;
-          const exploit = await capture(runner, claim.endpoint);
+          // claim.session (a label, e.g. "A"/"B") threads through to http_request's
+          // `session` arg on BOTH the exploit and control replay — proof-capture now
+          // runs authenticated exactly as the hunter's own exploration did, through
+          // the SAME Tether-gated http_request path (secrets still redacted in
+          // spans/artifacts; see tools.ts). Undefined behaves exactly as before —
+          // an anonymous request.
+          const claimSession = typeof claim.session === "string" ? claim.session : undefined;
+          const exploit = await capture(runner, claim.endpoint, claimSession);
           const control = (invType === "body_contains" || invType === "status_in")
-            ? await capture(runner, claim.control_url)
+            ? await capture(runner, claim.control_url, claimSession)
             : null;                                  // every other type proves itself from
                                                        // its own evidence, never a control diff
           if (exploit) discoveredEndpoints.push(toSpineEndpoint(exploit));
@@ -1046,6 +1102,9 @@ export async function runBeat(opts: {
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,
               invariant_type: claim.invariant.type, verdict: gated.status, finding_id: row.finding_id,
             });
+            // Grow the same-beat set immediately — a second CONFIRMED hit on this
+            // class later in THIS beat must be short-circuited too, not just next beat.
+            provedVulnClasses.add(claim.vuln_class);
           } else {
             attemptedEntries.push({
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,
@@ -1135,8 +1194,14 @@ function parseClaim(messages: any[]): any | null {
   return null;
 }
 
-async function capture(runner: ToolRunner, url: string): Promise<HttpCapture | null> {
-  const out = await runner.execute("http_request", { method: "GET", url });
+/** `session`, when present, is the label the hunter attached to the claim (or one of
+ * its steps) — forwarded verbatim to http_request's own `session` arg, which is the
+ * ONLY path from a label to real auth material (see session.ts/tools.ts). This
+ * function never sees or handles the material itself. */
+async function capture(runner: ToolRunner, url: string, session?: string): Promise<HttpCapture | null> {
+  const args: Record<string, unknown> = { method: "GET", url };
+  if (session) args.session = session;
+  const out = await runner.execute("http_request", args);
   return out.ok ? (out.result as HttpCapture) : null;
 }
 
@@ -1159,6 +1224,13 @@ interface ClaimStep {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  /** Optional session label (e.g. "A", "B") from a prior register_account call —
+   * forwarded to http_request's own `session` arg for THIS step only. This is the
+   * cross-user/IDOR mechanism: a setup step can create a resource under session A
+   * while a later exploit step in the SAME `steps` sequence carries session B, so
+   * the resource-owner's identity and the accessing identity can legitimately
+   * differ within one claim. */
+  session?: string;
 }
 
 function isRecordOfStrings(x: unknown): x is Record<string, string> {
@@ -1182,7 +1254,8 @@ function parseSteps(raw: unknown): ClaimStep[] {
     if (!method || !url) break;
     const headers = isRecordOfStrings((s as any).headers) ? (s as any).headers : undefined;
     const body = typeof (s as any).body === "string" ? (s as any).body : undefined;
-    out.push({ method, url, headers, body });
+    const session = typeof (s as any).session === "string" ? (s as any).session : undefined;
+    out.push({ method, url, headers, body, session });
   }
   return out;
 }
@@ -1199,6 +1272,7 @@ async function runSteps(runner: ToolRunner, steps: ClaimStep[]): Promise<HttpCap
     const args: Record<string, unknown> = { method: step.method, url: step.url };
     if (step.headers) args.headers = step.headers;
     if (step.body !== undefined) args.body = step.body;
+    if (step.session) args.session = step.session;
     const out = await runner.execute("http_request", args);
     if (!out.ok) break;
     captures.push(out.result as HttpCapture);
