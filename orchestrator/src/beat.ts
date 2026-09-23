@@ -267,8 +267,13 @@ function isStaticAssetCapture(capture: HttpCapture | null): boolean {
  * serializeExchange (body + headers, unsorted) — good enough to ATTRIBUTE a cause;
  * the Axiom's own evaluate() remains the sole source of the actual verdict. */
 function computeDifferentialSignal(
-  inv: Invariant, exploit: HttpCapture, control: HttpCapture | null,
+  inv: Invariant, exploit: HttpCapture | null, control: HttpCapture | null,
 ): { markerInExploit: boolean | null; markerInControl: boolean | null } {
+  // A null exploit means the exploit request could not be captured at all (see the
+  // capture guard in runBeat). There is then no exploit side to compute a signal
+  // from — return nulls rather than deref it (this must never throw and abort the
+  // beat over one un-capturable claim).
+  if (!exploit) return { markerInExploit: null, markerInControl: null };
   if (inv.type === "body_contains") {
     const marker = inv.expression;
     const has = (c: HttpCapture) =>
@@ -1125,6 +1130,19 @@ export async function runBeat(opts: {
           if (exploit) discoveredEndpoints.push(toSpineEndpoint(exploit));
           if (control) discoveredEndpoints.push(toSpineEndpoint(control));
 
+          // The types that read the exploit response directly (body_contains,
+          // status_in, response_asserted) cannot be evaluated when the exploit
+          // request itself could not be captured — capture() returns null for a
+          // network failure, a session the endpoint refused, or an unresolvable URL.
+          // That is a per-CLAIM dead end, NOT a reason to abort the whole beat (which
+          // would discard every finding already banked this beat), and it must never
+          // reach evaluate()/computeDifferentialSignal() with a null exploit. The
+          // evidence-bundle types (derived/state_*/file_*) prove from `evidence`, so a
+          // null exploit is irrelevant to them and they are deliberately NOT gated here.
+          const exploitReadDirectly =
+            invType === "body_contains" || invType === "status_in" || invType === "response_asserted";
+          const exploitUncapturable = exploitReadDirectly && !exploit;
+
           let evidence: EvidenceBundle | undefined;
           if (invType === "derived") {
             const derivedInput = await resolveDerivedInput(
@@ -1151,7 +1169,14 @@ export async function runBeat(opts: {
                 hasDerivedInput: evidence ? evidence.derivedInput !== undefined : null,
               },
             });
-            const r = evaluate(claim.invariant as Invariant, exploit!, control, evidence);
+            const r = exploitUncapturable
+              ? {
+                  status: "NEEDS_REVIEW" as const,
+                  reason:
+                    "exploit request could not be captured (no response — network " +
+                    "failure, refused session, or unresolvable URL); cannot evaluate",
+                }
+              : evaluate(claim.invariant as Invariant, exploit!, control, evidence);
             axSpan.update({ output: { status: r.status, reason: r.reason } });
             return r;
           });
@@ -1203,7 +1228,7 @@ export async function runBeat(opts: {
           // Defect 2: classify WHY a non-CONFIRMED finding failed, from structured
           // facts only — never by reading axiom.reason's prose. Uses the RAW axiom
           // verdict (see the routing comment below for why raw, not gated).
-          const differentialSignal = computeDifferentialSignal(claim.invariant as Invariant, exploit!, control);
+          const differentialSignal = computeDifferentialSignal(claim.invariant as Invariant, exploit, control);
           const failureCause = classifyFailureCause({
             axiomStatus: axiom.status,
             vulnClass: claim.vuln_class,

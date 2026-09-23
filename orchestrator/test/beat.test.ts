@@ -237,6 +237,37 @@ test("a beat that banks one finding then fails to parse a later claim is NOT rep
   assert.equal(out.exitCode, 0);
 });
 
+test("a claim whose exploit request cannot be captured (null) is handled per-claim (NEEDS_REVIEW) and NEVER aborts the beat — a later valid claim still banks", async () => {
+  const failUrl = "http://10.0.0.1:3000/faily";   // fetch throws here -> capture() returns null
+  const goodUrl = "http://10.0.0.1:3000/ok";
+  // A fetch that THROWS for the failing endpoint (network failure) — http_request maps
+  // this to ok:false, so capture() returns null and exploit is null for that claim.
+  const throwOnFaily = (async (url: string | URL) => {
+    if (String(url).includes("faily")) throw new TypeError("terminated");
+    return new Response("OK");   // bare response -> a "!header:x-frame-options" claim holds
+  }) as unknown as typeof fetch;
+  const script = [
+    call("http_request", { method: "GET", url: goodUrl }),        // execute work (not stalled)
+    say(JSON.stringify(claim("clickjacking", failUrl))),           // response_asserted on the null-exploit endpoint
+    say(JSON.stringify(claim("clickjacking", goodUrl))),           // a valid claim AFTER the would-be crash
+    say("Nothing else to report."),
+  ];
+  // Before the guard, the null exploit hit `exploit!.response` and threw, aborting the
+  // whole beat (discarding the later valid finding). This must resolve, not reject.
+  const out = await runBeat({
+    env: await ENV(), client: recordingScriptedClient(script), fetchImpl: throwOnFaily, now: NOW,
+  });
+  assert.equal(out.stalled, false);
+  assert.equal(out.exitCode, 0);
+  const faily = out.findings.find((f) => f.endpoint === failUrl);
+  assert.ok(faily, "the un-capturable claim must still produce a recorded finding, not a crash");
+  assert.equal(faily!.verdict, "NEEDS_REVIEW", "a null exploit cannot be confirmed; it is surfaced for review");
+  assert.ok(
+    out.findings.some((f) => f.endpoint === goodUrl),
+    "the beat must CONTINUE past the un-capturable claim and bank the later valid one",
+  );
+});
+
 test("SAHW_MAX_TURNS_PER_FINDING cuts off a greedy attempt without ending the beat", async () => {
   const url = "http://10.0.0.1:3000/a";
   const script = [
