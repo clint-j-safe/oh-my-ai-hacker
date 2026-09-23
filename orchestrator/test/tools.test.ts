@@ -567,12 +567,14 @@ test("register_account creates session A, then B, then refuses at the SAHW_MAX_A
   const a = await r.execute("register_account", registerArgsBase);
   assert.equal(a.ok, true);
   if (!a.ok) throw new Error("unreachable");
-  assert.deepEqual(a.result, { label: "A", obtained_auth_material: true });
+  assert.equal((a.result as any).label, "A");
+  assert.equal((a.result as any).obtained_auth_material, true);
 
   const b = await r.execute("register_account", registerArgsBase);
   assert.equal(b.ok, true);
   if (!b.ok) throw new Error("unreachable");
-  assert.deepEqual(b.result, { label: "B", obtained_auth_material: true });
+  assert.equal((b.result as any).label, "B");
+  assert.equal((b.result as any).obtained_auth_material, true);
 
   const c = await r.execute("register_account", registerArgsBase);
   assert.equal(c.ok, false);
@@ -612,7 +614,98 @@ test("register_account follows a discovered login step when signup returns no to
   });
   assert.equal(out.ok, true);
   if (!out.ok) throw new Error("unreachable");
-  assert.deepEqual(out.result, { label: "A", obtained_auth_material: true });
+  assert.equal((out.result as any).label, "A");
+  assert.equal((out.result as any).obtained_auth_material, true);
+  // A successful (2xx) signup/login body may embed the token, so neither is ever
+  // inlined into the result — only artifact sha256s are surfaced.
+  assert.equal((out.result as any).signup_body_preview, undefined);
+  assert.equal((out.result as any).login_body_preview, undefined);
+  assert.match(String((out.result as any).signup_artifact), /^[0-9a-f]{64}$/);
+});
+
+test("register_account: a rejected signup surfaces the target's OWN error (envelope-from-error), creates no session, burns no slot, and a corrected retry succeeds", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  let signupCalls = 0;
+  const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+    signupCalls++;
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    // The target requires a field named `fname` the caller has not sent yet — it
+    // rejects with 400 and NAMES the field in its response body (the only place the
+    // caller can learn the real envelope under the black-box constraint).
+    if (!("fname" in body)) {
+      return new Response(JSON.stringify({ error: "field 'fname' is required" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ token: "tok-after-fix" }), {
+      status: 201, headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  const r = new ToolRunner({ engagement: E, store, fetchImpl, sessionStore: sessions });
+
+  // First attempt: wrong envelope -> rejected.
+  const rejected = await r.execute("register_account", registerArgsBase);
+  assert.equal(rejected.ok, true, "a target rejection is a normal outcome, not a tool failure");
+  if (!rejected.ok) throw new Error("unreachable");
+  const rej = rejected.result as any;
+  assert.equal(rej.label, null, "no session is created for a rejected signup");
+  assert.equal(rej.obtained_auth_material, false);
+  assert.equal(rej.signup_status, 400);
+  assert.match(rej.signup_body_preview, /fname/, "the caller must see the target's own field-name hint");
+  assert.equal(sessions.size(), 0, "a rejected signup must consume NO account slot");
+
+  // Second attempt: caller corrects the envelope using what the target told it.
+  const fixed = await r.execute("register_account", {
+    ...registerArgsBase,
+    signup_body_template:
+      '{"fname":"{{username}}","username":"{{username}}","email":"{{email}}","password":"{{password}}"}',
+  });
+  assert.equal(fixed.ok, true);
+  if (!fixed.ok) throw new Error("unreachable");
+  assert.equal((fixed.result as any).label, "A");
+  assert.equal((fixed.result as any).obtained_auth_material, true);
+  assert.equal(sessions.size(), 1, "the corrected retry creates exactly one usable session");
+  assert.equal(signupCalls, 2);
+});
+
+test("register_account: a 2xx login whose token path is wrong yields a tokenless account, a hint, and the artifact sha256 — never inlines the token-bearing body", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const SECRET = "super-secret-jwt-value-do-not-leak";
+  const fetchImpl = (async (url: unknown) => {
+    const u = String(url);
+    if (u.endsWith("/api/register")) {
+      return new Response(JSON.stringify({ status: "created" }), {
+        status: 201, headers: { "content-type": "application/json" },
+      });
+    }
+    // Login succeeds and DOES return a token, but under a key the caller guessed
+    // wrong ("token" vs the real "access_token"). The body carries the secret.
+    return new Response(JSON.stringify({ access_token: SECRET }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  const r = new ToolRunner({ engagement: E, store, fetchImpl, sessionStore: new SessionStore({ maxAccounts: 2 }) });
+  const out = await r.execute("register_account", {
+    ...registerArgsBase,
+    login_url: "http://10.0.0.1:3000/api/login",
+    login_body_template: '{"username":"{{username}}","password":"{{password}}"}',
+    login_response_token_path: "token",   // WRONG path — the token is at access_token
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+  const res = out.result as any;
+  assert.equal(res.obtained_auth_material, false, "wrong token path -> no material recovered");
+  assert.match(res.hint ?? "", /token path|grep_artifact/i, "the caller is pointed at the fix");
+  assert.match(String(res.login_artifact), /^[0-9a-f]{64}$/);
+  // THE SECURITY INVARIANT: a 2xx body may embed the token, so it is NEVER inlined.
+  const serialized = JSON.stringify(res);
+  assert.ok(!serialized.includes(SECRET), "a 2xx login body's token must never appear in the tool result");
+  assert.equal(res.login_body_preview, undefined, "2xx login body is surfaced by artifact id only, never inlined");
 });
 
 test("http_request with session:A injects auth material; the returned capture and stored artifact redact it", async () => {

@@ -160,7 +160,15 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
         "obtained — never the token. Pass the label to http_request's `session` " +
         "argument to send an authenticated request as that account. Register a " +
         "SECOND account to test cross-user access (IDOR-shaped findings): send a " +
-        "request with session \"B\" against a resource created under session \"A\".",
+        "request with session \"B\" against a resource created under session \"A\". " +
+        "ITERATE THE ENVELOPE: if the result has label:null with a non-2xx " +
+        "signup_status, the target REJECTED your envelope — read signup_body_preview " +
+        "for the fields it actually requires (renamed/missing/extra), fix " +
+        "signup_body_template, and call again; each rejection is the target teaching " +
+        "you its real signup shape. If a token was still not obtained after a 2xx " +
+        "signup, the result carries a hint plus the signup_/login_artifact sha256 — " +
+        "grep_artifact it to find the true token path, then set " +
+        "signup_/login_response_token_path (or add login_url/template) and retry.",
       strict: true,
       parameters: {
         type: "object",
@@ -912,7 +920,21 @@ export class ToolRunner {
    */
   private async registerAccount(
     args: Record<string, unknown>,
-  ): Promise<{ label: string; obtained_auth_material: boolean }> {
+  ): Promise<{
+    /** null when signup was rejected and no account/slot was created this call. */
+    label: string | null;
+    obtained_auth_material: boolean;
+    signup_status: number;
+    /** Inlined ONLY for a non-2xx signup (a rejection carries no token). */
+    signup_body_preview?: string;
+    signup_artifact: string;
+    login_status?: number;
+    /** Inlined ONLY for a non-2xx login (a rejection carries no token). */
+    login_body_preview?: string;
+    login_artifact?: string;
+    /** Deterministic next-step nudge when no token was obtained. */
+    hint?: string;
+  }> {
     const signupUrl = String(args.signup_url ?? "").trim();
     if (!signupUrl) throw new InvalidToolArgumentError("signup_url is required");
     const signupMethod = String(args.signup_method ?? "POST").toUpperCase();
@@ -943,21 +965,61 @@ export class ToolRunner {
       method: signupMethod, url: signupUrl,
       headers: { "content-type": "application/json" }, body: signupBody,
     });
+
+    // ENVELOPE-FROM-ERROR (black-box convergence). A non-2xx signup is NOT a
+    // framework fault to throw on — it is the target teaching the caller what its
+    // signup envelope actually requires (e.g. "field 'fname' is required", a
+    // validation list, a differently-named wrapper). Discovering the exact envelope
+    // by iterating against the server's own rejections is precisely how a human
+    // tester (and this loop) must work under the black-box constraint: the correct
+    // field names come from the TARGET's responses at runtime, never hardcoded here
+    // or read from any answer key. So: surface the rejection instead of hiding it,
+    // consume NO account slot (nextLabel() above is pure — create() is what
+    // reserves), and let the caller correct signup_body_template and call again.
+    // The body preview is safe to inline ONLY because a rejection carries no token;
+    // a SUCCESSFUL body (which may embed one) is never inlined below — see there.
     if (signup.response.status < 200 || signup.response.status >= 300) {
-      throw new Error(
-        `registration failed: signup to ${signupUrl} returned status ${signup.response.status}`);
+      return {
+        label: null,
+        obtained_auth_material: false,
+        signup_status: signup.response.status,
+        signup_body_preview: boundedForError(signup.response.body),
+        signup_artifact: signup.artifact.sha256,
+        hint:
+          `signup was REJECTED with status ${signup.response.status}. This is the ` +
+          "target telling you its required envelope — read signup_body_preview for " +
+          "the missing/renamed fields, correct signup_body_template accordingly, and " +
+          "call register_account again. No account was created and no slot was used.",
+      };
     }
 
     let authMaterial = extractTokenFromBody(signup.response.body, signupTokenPath);
 
+    // Login diagnostics are recorded only for the paths that did NOT yield a token,
+    // so nothing here can carry one. A login body IS previewed only when it is a
+    // non-2xx rejection (no token); a 2xx login whose token we could not extract at
+    // the given path is surfaced by ARTIFACT ID only (grep_artifact it for the real
+    // path) — never inlined, because a 2xx login body may embed the token.
+    let loginDiag: {
+      login_status: number; login_artifact: string; login_body_preview?: string;
+    } | null = null;
     if (authMaterial === null && loginUrl) {
       const loginBody = fillCredentialTemplate(loginTemplate, vars, "login_body_template");
       const login = await this.http({
         method: loginMethod, url: loginUrl,
         headers: { "content-type": "application/json" }, body: loginBody,
       });
-      if (login.response.status >= 200 && login.response.status < 300) {
-        authMaterial = extractTokenFromBody(login.response.body, loginTokenPath);
+      const loginOk = login.response.status >= 200 && login.response.status < 300;
+      if (loginOk) authMaterial = extractTokenFromBody(login.response.body, loginTokenPath);
+      if (authMaterial === null) {
+        loginDiag = {
+          login_status: login.response.status,
+          login_artifact: login.artifact.sha256,
+          // Rejection body (non-2xx) → safe to inline (no token). A 2xx body that
+          // simply didn't match login_response_token_path may embed a token → point
+          // at the artifact instead of inlining it.
+          ...(loginOk ? {} : { login_body_preview: boundedForError(login.response.body) }),
+        };
       }
     }
 
@@ -968,7 +1030,22 @@ export class ToolRunner {
       // in practice — mirrors the belt-and-braces posture elsewhere in this file.
       throw new SessionCapError("account cap reached while finalizing registration");
     }
-    return { label: meta.label, obtained_auth_material: meta.has_auth_material };
+    return {
+      label: meta.label,
+      obtained_auth_material: meta.has_auth_material,
+      signup_status: signup.response.status,
+      // signup succeeded (2xx); its body may embed a token, so it is never inlined —
+      // the caller does not need it, the session already holds any token found.
+      signup_artifact: signup.artifact.sha256,
+      ...(loginDiag ?? {}),
+      ...(meta.has_auth_material ? {} : {
+        hint:
+          "account was CREATED on the target but no auth token was recovered. If a " +
+          "login step is required, set login_url + login_body_template; if the token " +
+          "is present but under a different key, grep_artifact the login/signup " +
+          "artifact to find the real token path and set signup_/login_response_token_path.",
+      }),
+    };
   }
 
   private async skillRun(args: Record<string, unknown>): Promise<SkillRunOutcome> {

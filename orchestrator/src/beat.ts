@@ -622,11 +622,27 @@ function discoveredSignupFlow(intel: RecoveredIntel): SignupFlowArgs | null {
  * outcome as the hunter's own attempt failing, and must not abort the beat.
  */
 async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<void> {
-  if (spine.sessions.length >= 2) return;
+  // "Done" is measured in USABLE sessions (has_auth_material), not raw account
+  // rows: an account created on the target with NO token recovered
+  // (has_auth_material=false) is worthless for every authenticated finding, so it
+  // must not satisfy the objective nor block another attempt. A prior beat that
+  // registered a tokenless account therefore still re-enters this phase.
+  const usable = (metas: { has_auth_material: boolean }[]): number =>
+    metas.filter((m) => m.has_auth_material).length;
+  if (usable(spine.sessions) >= 2) return;
   if (openAuthenticatedClasses(spine.proved).length === 0) return;
   const flow = discoveredSignupFlow(spine.recovered_intel);
   if (!flow) return;
+  // Replay the KNOWN-GOOD flow deterministically up to the account cap. This half
+  // cannot self-correct a rejected envelope (it has no model) — envelope iteration
+  // is the hunter's job via register_account's own rejection feedback (see
+  // tools.ts). So stop as soon as SAHW_MAX_ACCOUNTS is hit OR a call throws, and
+  // stop early once we hold 2 USABLE sessions; a call that returns a tokenless
+  // account (result.ok but obtained_auth_material=false) means this flow no longer
+  // yields a token, so there is nothing to gain by repeating it — hand off to the
+  // hunter rather than burn the account cap on identical tokenless registrations.
   for (let i = 0; i < 2; i++) {
+    if (usable(runner.getSessionMeta()) >= 2) break;
     if (runner.getSessionMeta().length >= 2) break;
     let result;
     try {
@@ -635,6 +651,8 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
       break;
     }
     if (!result.ok) break;
+    const obtained = (result.result as { obtained_auth_material?: boolean })?.obtained_auth_material;
+    if (obtained !== true) break;
   }
 }
 
@@ -705,7 +723,11 @@ export async function runBeat(opts: {
   // spine's stale pre-registration account count. See runRegistrationPhase's own
   // doc comment above for the full trigger/outcome contract.
   await runRegistrationPhase(runner, spineLoad.spine);
-  const sessionsThisBeat = runner.getSessionMeta().length;
+  // USABLE sessions (token obtained), not raw account rows — a tokenless account
+  // proves no authenticated finding, so the brief must still treat registration as
+  // this beat's priority until at least one session actually carries auth material
+  // (see renderAccountObjective and runRegistrationPhase's own "usable" gate).
+  const sessionsThisBeat = runner.getSessionMeta().filter((m) => m.has_auth_material).length;
 
   // GENERATED FROM STATE, AS XML. Built once, from the spine as loaded — the
   // conversation's system message is only set on the FIRST runAgent call of the
