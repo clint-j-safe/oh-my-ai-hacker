@@ -294,7 +294,7 @@ async function runDeepSweep(opts: {
     // DEBUG-PAGE probe (F-09 shape): a valid envelope with `data` EMPTIED omits required
     // fields -> unhandled framework error leaking internals. Exploit vs the normal body
     // as control; a debug signature in the exploit but not the control is info_disclosure.
-    for (const t of targets.slice(0, 24)) {
+    for (const t of targets.slice(0, 50)) {
       if (!t.bodyTemplate || (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH")) continue;
       let emptied: string; let normal: string;
       try {
@@ -317,7 +317,7 @@ async function runDeepSweep(opts: {
     // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
     // it via the paired list/detail endpoint; the canary returned UNESCAPED there is
     // stored XSS. Two-step, bounded — reuses the same Axiom banking.
-    for (const createT of targets.slice(0, 24)) {
+    for (const createT of targets.slice(0, 50)) {
       if (!createT.bodyTemplate) continue;
       const renderEp = renderEndpointFor(createT.endpoint);
       if (!renderEp) continue;
@@ -398,7 +398,7 @@ async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sess
   const benign = `<?xml version="1.0"?><r><x>sahwbenignxml</x></r>`;
   let n = 0;
   for (const t of targets) {
-    if (n >= 24) break;  // cover all derived targets, not just the first few (contactUs sorts late)
+    if (n >= 50) break;  // cover all derived targets, not just the first few (contactUs sorts late)
     if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
     if (!t.bodyTemplate) continue;
     n++;

@@ -67,7 +67,7 @@ export function deriveTargets(
   records: CapturedArtifact[],
   inScope: (url: string) => boolean,
   canon: (url: string) => string,
-  maxTargets = 20,
+  maxTargets = 50,
 ): SweepTargetWithBody[] {
   const byKey = new Map<string, SweepTargetWithBody>();
   for (const rec of records) {
@@ -105,9 +105,25 @@ export function deriveTargets(
     } else if (!existing.bodyTemplate && bodyTemplate) {
       byKey.set(key, { endpoint: base, method, params: [...jsonParams, ...queryParams], bodyTemplate, headers: req.headers ?? {}, paramKind });
     }
-    if (byKey.size >= maxTargets) break;
+    // Collect ALL distinct endpoints, then PRIORITIZE below — do not truncate in
+    // encounter order (that dropped late-sorted but important endpoints like the create
+    // route and the canonical contactUs, leaving only debug sub-paths).
   }
-  return [...byKey.values()];
+  // Priority: create endpoints first (needed for the stored-XSS persist->render probe),
+  // then POST-with-JSON-body (fuzzable), and DEPRIORITIZE short/debug-looking trailing
+  // segments (/aa, /yoyo, /index) that shadow the canonical route. Then cap.
+  return [...byKey.values()].sort((a, b) => targetPriority(b) - targetPriority(a)).slice(0, maxTargets);
+}
+
+function targetPriority(t: SweepTargetWithBody): number {
+  let s = 0;
+  let path = "";
+  try { path = new URL(t.endpoint).pathname; } catch { return -100; }
+  if (/\/(apply|create|add|new|submit|save|store|insert)$/i.test(path)) s += 1000; // create -> stored-XSS
+  if (t.bodyTemplate) s += 100;                                                     // POST/JSON -> fuzzable
+  const last = path.split("/").filter(Boolean).pop() || "";
+  if (last.length <= 3 || /^(aa|yoyo|index|test|debug)$/i.test(last)) s -= 50;      // debug-ish sub-path shadowing canonical
+  return s;
 }
 
 /** Reads and parses request/response artifacts from the on-disk store (fanned by 2-hex).
