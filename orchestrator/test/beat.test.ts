@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor, allowlistFor, HUNTER_SKILL_ALLOWLIST } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor, allowlistFor, HUNTER_SKILL_ALLOWLIST, isInvariantUpgrade, feedbackForVerdict } from "../src/beat.js";
 import type { DeepConfig } from "../src/config.js";
 
 const OFF_DEEP: DeepConfig = { enabled: false, weaponize: false, maxSweepRequests: 500, maxEscalationDepth: 2, weaponizeAuthRef: null };
@@ -1621,3 +1621,29 @@ test("beatTagFor: each beat gets a stable, memorable, distinguishable #n-adj-nou
   assert.notEqual(beatTagFor(rid, 3), beatTagFor(rid, 4), "different beats look different");
   assert.match(beatTagFor(rid, 0), /^#\?-[a-z]+-[a-z]+$/, "unknown beat no -> #?");
 });
+
+// ---- FEEDBACK_COMPLETE: push partials to their stronger multi-step invariant ----
+
+test("isInvariantUpgrade: a class's weak partial -> its strong invariant is an upgrade; dupes/downgrades are not", () => {
+  assert.equal(isInvariantUpgrade("auth_bypass", "body_contains", "state_changed"), true);
+  assert.equal(isInvariantUpgrade("business_logic", "body_contains", "state_changed"), true);
+  assert.equal(isInvariantUpgrade("auth_bypass", "state_changed", "state_changed"), false); // already strong
+  assert.equal(isInvariantUpgrade("auth_bypass", "body_contains", "body_contains"), false); // bare dup
+  assert.equal(isInvariantUpgrade("auth_bypass", "state_changed", "body_contains"), false); // downgrade
+  assert.equal(isInvariantUpgrade("clickjacking", "response_asserted", "body_contains"), false); // no upgrade for this class
+});
+
+test("feedbackForVerdict: a CONFIRMED weak invariant on an upgradable class pushes COMPLETING the strong proof, not moving on", () => {
+  const weak = feedbackForVerdict("auth_bypass", "http://h/api/password/change", "CONFIRMED", "marker present", undefined, undefined, "body_contains");
+  assert.match(weak, /state_changed/);
+  assert.match(weak, /log in|follow-up|OBSERVES/i);
+  assert.doesNotMatch(weak, /find a DIFFERENT/i);
+  const strong = feedbackForVerdict("auth_bypass", "http://h/api/password/change", "CONFIRMED", "login succeeded", undefined, undefined, "state_changed");
+  assert.match(strong, /find a DIFFERENT/i);   // already strong -> normal move-on
+  const other = feedbackForVerdict("clickjacking", "http://h/x", "CONFIRMED", "no XFO", undefined, undefined, "response_asserted");
+  assert.match(other, /find a DIFFERENT/i);     // non-upgradable class -> normal move-on
+});
+
+// (end-to-end dedupe-upgrade is validated by the post-HTB deep run; the decision fn
+// isInvariantUpgrade and the feedback branch feedbackForVerdict are unit-tested above.)
+

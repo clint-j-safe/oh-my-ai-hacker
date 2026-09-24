@@ -436,13 +436,52 @@ function boundReason(s: string): string {
   return t.length > 500 ? `${t.slice(0, 500)}…` : t;
 }
 
-function feedbackForVerdict(
+/**
+ * A class's STRONGEST provable invariant + how to COMPLETE the multi-step proof to reach
+ * it. Security-domain judgment (like AUTHENTICATED_VULN_CLASSES), NOT the benchmark answer
+ * key: for these classes the real proof is the observed EFFECT (a login succeeds, server
+ * state moved), and a first-step `body_contains`/`status_in` only proves acceptance. When
+ * the loop banks the weaker proof, feedbackForVerdict pushes it to finish the stronger one
+ * on the SAME (class, endpoint) — and the dedupe (isInvariantUpgrade) lets it back through.
+ * No target hostname/path/value here — the guidance is generic method, not a recipe.
+ */
+const CLASS_UPGRADE: Record<string, { strong: string; complete: string }> = {
+  auth_bypass: {
+    strong: "state_changed",
+    complete: "You only proved the request was ACCEPTED — that is a PARTIAL result. Now prove the bypass TOOK EFFECT: perform the follow-up action that OBSERVES it (e.g. log in with the changed/attacker-set credential) with ORDERED `steps` ending in that observation, and re-submit the SAME class+endpoint as `state_changed`. Do this BEFORE moving to a different class.",
+  },
+  business_logic: {
+    strong: "state_changed",
+    complete: "You only proved the value was ACCEPTED — that is a PARTIAL result. Now prove server STATE MOVED: COMPLETE the operation (satisfy any remaining gate, e.g. supply a VALID one-time code — decrypt it if you recovered the key) and RE-READ the affected state (balance/quota/status) via a follow-up request, then re-submit the SAME class+endpoint as `state_changed` with those ordered `steps`. Do this BEFORE moving on.",
+  },
+  improper_session_invalidation: {
+    strong: "state_violated",
+    complete: "Prove the STRONGER invariant: replay the OLD token against an authenticated endpoint AFTER the invalidating action and show it still authenticates; re-submit as `state_violated` before moving on.",
+  },
+};
+
+/** True when `candidate` is the class's strongest invariant and `banked` was weaker — i.e.
+ * a legitimate upgrade of an already-banked partial, which the dedupe must let through. */
+export function isInvariantUpgrade(vulnClass: string, banked: string, candidate: string): boolean {
+  const u = CLASS_UPGRADE[vulnClass];
+  return !!u && candidate === u.strong && banked !== u.strong;
+}
+
+export function feedbackForVerdict(
   vuln_class: string, endpoint: string, verdict: string, reason: string,
-  cause?: FailureCause, causeDetail?: string | null,
+  cause?: FailureCause, causeDetail?: string | null, invariantType?: string,
 ): string {
   const parts = [`Verdict for ${vuln_class} @ ${endpoint}: ${verdict} (${reason}).`];
   if (cause) {
     parts.push(`Cause: ${cause} — ${(causeDetail && causeDetail.trim()) || CAUSE_GUIDANCE[cause]}`);
+  }
+  // FEEDBACK_COMPLETE: a CONFIRMED-but-WEAKER invariant on an upgradable class is only a
+  // PARTIAL for scoring — push the loop to finish the stronger multi-step proof on the
+  // same target instead of banking-and-moving-on (jev: highest-leverage loop tuning).
+  const up = verdict === "CONFIRMED" && invariantType ? CLASS_UPGRADE[vuln_class] : undefined;
+  if (up && invariantType !== up.strong) {
+    parts.push(up.complete);
+    return parts.join(" ");
   }
   parts.push("That pair is now banked — do not report it again this beat.");
   parts.push("Continue hunting: find a DIFFERENT vulnerability class or endpoint.");
@@ -1179,8 +1218,17 @@ export async function runBeat(opts: {
         // (class, endpoint) re-proof — that IS pure waste — but a proved class on a
         // NEW endpoint is now allowed through to the Axiom, which still requires a
         // genuine proof, so this can never manufacture a finding that isn't real.
-        const provedByEndpoint = new Set(
-          spineLoad.spine.proved.map((p) => `${p.vuln_class}::${p.endpoint}`));
+        // (class::endpoint) -> the STRONGEST invariant already banked for it. A Map (was a
+        // Set) so the dedupe can let a legitimate invariant UPGRADE (weak partial ->
+        // strong) back through while still suppressing a bare duplicate.
+        const provedByEndpoint = new Map<string, string>();
+        for (const p of spineLoad.spine.proved) {
+          const k = `${p.vuln_class}::${p.endpoint}`;
+          const prev = provedByEndpoint.get(k);
+          if (prev === undefined || isInvariantUpgrade(p.vuln_class, prev, p.invariant_type)) {
+            provedByEndpoint.set(k, p.invariant_type);
+          }
+        }
         let alreadyProvedSuppressed = 0;
         const rejectedClaims: RejectedClaim[] = [];
         const failureCauses = emptyFailureCauses();
@@ -1466,7 +1514,12 @@ export async function runBeat(opts: {
           // suppressed: the benchmark scores per (class, endpoint, invariant), so a
           // second finding of the same class elsewhere is real progress, and the Axiom
           // still gates it on a genuine proof.
-          if (provedByEndpoint.has(`${claim.vuln_class}::${claim.endpoint}`)) {
+          const provedKey = `${claim.vuln_class}::${claim.endpoint}`;
+          const bankedInv = provedByEndpoint.get(provedKey);
+          // Suppress a bare duplicate, BUT let a legitimate invariant UPGRADE (a banked
+          // weak partial being re-submitted as the class's strong invariant) through to
+          // the Axiom — that is how a partial gets completed into a covered finding.
+          if (bankedInv !== undefined && !isInvariantUpgrade(claim.vuln_class, bankedInv, claim.invariant.type)) {
             alreadyProvedSuppressed += 1;
             messages.push({ role: "user", content: feedbackForAlreadyProved(claim.vuln_class, claim.endpoint) });
             continue;
@@ -1759,10 +1812,16 @@ export async function runBeat(opts: {
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,
               invariant_type: effectiveInvariantType, verdict: gated.status, finding_id: row.finding_id,
             });
-            // Grow the same-beat set immediately — a second CONFIRMED hit on this
-            // (class, endpoint) later in THIS beat must be short-circuited too, not
-            // just next beat. A DIFFERENT endpoint of the same class stays allowed.
-            provedByEndpoint.add(`${claim.vuln_class}::${claim.endpoint}`);
+            // Grow the same-beat map immediately — record the STRONGEST invariant banked
+            // for this (class, endpoint) so a bare duplicate is short-circuited but a
+            // later UPGRADE to the strong invariant is still allowed through.
+            {
+              const k = `${claim.vuln_class}::${claim.endpoint}`;
+              const prev = provedByEndpoint.get(k);
+              if (prev === undefined || isInvariantUpgrade(claim.vuln_class, prev, effectiveInvariantType)) {
+                provedByEndpoint.set(k, effectiveInvariantType);
+              }
+            }
           } else {
             attemptedEntries.push({
               vuln_class: claim.vuln_class, endpoint: claim.endpoint,
@@ -1782,7 +1841,7 @@ export async function runBeat(opts: {
             role: "user",
             content: feedbackForVerdict(
               row.vuln_class, row.endpoint, row.verdict, axiom.reason,
-              failureCause ?? undefined,
+              failureCause ?? undefined, undefined, effectiveInvariantType,
             ),
           });
         }
