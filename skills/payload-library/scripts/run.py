@@ -237,7 +237,21 @@ def main() -> int:
 
     asset_payloads, sources = _augment_from_assets(vuln_class, technique, limit)
 
-    combined = built + asset_payloads
+    # Corpus KB (PayloadsAllTheThings + SecLists), when the SQLite index has been built.
+    # Curated BUILTINS stay FIRST (cheapest, highest-signal triage probes); the broad
+    # corpus augments for depth/escalation. Absent DB -> empty, graceful fallback.
+    corpus_payloads: List[Dict[str, str]] = []
+    corpus_db = os.environ.get("SAHW_PAYLOAD_DB", "").strip()
+    if corpus_db and os.path.exists(corpus_db):
+        try:
+            from corpus import search as _corpus_search  # sibling module
+            corpus_payloads = _corpus_search(corpus_db, vuln_class, limit, technique)
+            if corpus_payloads:
+                sources.append("corpus")
+        except Exception:
+            corpus_payloads = []
+
+    combined = built + asset_payloads + corpus_payloads
     # de-dup by value, preserve order (built-ins first = cheapest probes first)
     seen = set()
     deduped: List[Dict[str, str]] = []
