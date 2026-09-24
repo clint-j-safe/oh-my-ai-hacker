@@ -19,7 +19,7 @@ import {
   type SpineBeatRecord,
 } from "./spine.js";
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
-import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, type SendProbe, type SweepHit } from "./sweep.js";
+import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
@@ -258,6 +258,15 @@ async function runDeepSweep(opts: {
       return { status: cap.response.status, body: cap.response.body ?? "", ms: cap.ms };
     };
 
+    // Fire an arbitrary request through the gated path, returning the full capture.
+    const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null): Promise<HttpCapture | null> => {
+      const h = { ...headers }; delete h.Authorization; delete h.authorization;
+      const args: Record<string, unknown> = { method, url, headers: h, body };
+      if (sessionLabel) args.session = sessionLabel;
+      const r = await opts.runner.execute("http_request", args);
+      return r.ok ? (r.result as HttpCapture) : null;
+    };
+
     const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
     const targetByEndpoint = new Map(targets.map((t) => [t.endpoint, t]));
     const proved: ProvedEntry[] = [];
@@ -282,9 +291,74 @@ async function runDeepSweep(opts: {
       if (banked) proved.push(banked);
     }
 
+    // DEBUG-PAGE probe (F-09 shape): a valid envelope with `data` EMPTIED omits required
+    // fields -> unhandled framework error leaking internals. Exploit vs the normal body
+    // as control; a debug signature in the exploit but not the control is info_disclosure.
+    for (const t of targets.slice(0, 24)) {
+      if (!t.bodyTemplate || (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH")) continue;
+      let emptied: string; let normal: string;
+      try {
+        const obj = JSON.parse(t.bodyTemplate);
+        emptyDataInPlace(obj);
+        emptied = JSON.stringify(obj);
+        normal = t.bodyTemplate;
+      } catch { continue; }
+      const hdr = { "Content-Type": "application/json" };
+      const exploit = await fire(t.method, t.endpoint, hdr, emptied);
+      if (!exploit) continue;
+      const sig = detectDebugSignature(exploit.response.body ?? "");
+      if (!sig) continue;
+      const control = await fire(t.method, t.endpoint, hdr, normal);
+      if (!control || (control.response.body ?? "").includes(sig)) continue; // control also shows it -> not a differential
+      const banked = await bankIfConfirmed(opts, "info_disclosure", t.endpoint, sig, exploit, control);
+      if (banked) proved.push(banked);
+    }
+
+    // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
+    // it via the paired list/detail endpoint; the canary returned UNESCAPED there is
+    // stored XSS. Two-step, bounded — reuses the same Axiom banking.
+    for (const createT of targets.slice(0, 24)) {
+      if (!createT.bodyTemplate) continue;
+      const renderEp = renderEndpointFor(createT.endpoint);
+      if (!renderEp) continue;
+      const renderT = targetByEndpoint.get(renderEp);
+      const renderMethod = renderT?.method ?? "GET";
+      const renderBody = renderT?.bodyTemplate ?? null;
+      const renderHdr: Record<string, string> = renderBody ? { "Content-Type": "application/json" } : {};
+      const baseline = await fire(renderMethod, renderEp, renderHdr, renderBody);
+      if (!baseline) continue;
+      const jsonLeaves = createT.params.filter((p) => createT.paramKind[p] === "json").slice(0, 4);
+      for (const leaf of jsonLeaves) {
+        const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
+        let persistBody: string;
+        try { persistBody = JSON.stringify(setAtPath(JSON.parse(createT.bodyTemplate), leaf, `<script>${canary}</script>`)); }
+        catch { continue; }
+        await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
+        const rendered = await fire(renderMethod, renderEp, renderHdr, renderBody);
+        if (!rendered) continue;
+        if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
+          const banked = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
+          if (banked) { proved.push(banked); break; }
+        }
+      }
+    }
+
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
   } catch { return empty; }
+}
+
+/** Empty every object-valued key named "data" (the request envelope's field bag), so a
+ * required field is omitted -> unhandled server error. Mutates in place. */
+function emptyDataInPlace(node: unknown, depth = 0): void {
+  if (depth > 6 || !node || typeof node !== "object") return;
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k === "data" && v && typeof v === "object" && !Array.isArray(v)) {
+      (node as Record<string, unknown>).data = {};
+    } else if (v && typeof v === "object") {
+      emptyDataInPlace(v, depth + 1);
+    }
+  }
 }
 
 /** Verify a sweep hit with the SAME Axiom the LLM path uses (marker present in exploit,

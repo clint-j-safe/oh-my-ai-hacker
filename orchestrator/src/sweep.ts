@@ -152,6 +152,32 @@ export async function runSweep(opts: {
  * exactly which (endpoint, param, class) to submit_finding, with the observed proof. The
  * LLM re-fires the winning payload via http_request and submits — the Axiom then verifies
  * and canonicalizeEndpoint records it on the canonical route. */
+// A PHP/framework DEBUG page signature — an UNHANDLED error leaking internals (paths,
+// backtrace): the info_disclosure finding. Returns the matched literal (for body_contains
+// banking) or null. These strings are stable across the debug page's rendering.
+const DEBUG_SIGNATURES = [
+  "A PHP Error was encountered", "Fatal error", "Stack trace:", "Uncaught Error",
+  "Undefined index", "Call to a member function", "<b>Warning</b>", "<b>Notice</b>",
+];
+export function detectDebugSignature(body: string): string | null {
+  for (const sig of DEBUG_SIGNATURES) if (body.includes(sig)) return sig;
+  return null;
+}
+
+/** For a create/submit endpoint, the paired render/list endpoint that displays stored
+ * input back (apply->list, create->detail): strip a trailing create-verb segment. Returns
+ * null when the endpoint isn't a create-style route. Generic, no target specifics. */
+const CREATE_SUFFIX = /\/(apply|create|add|new|submit|save|store|insert)$/i;
+export function renderEndpointFor(createEndpoint: string): string | null {
+  try {
+    const u = new URL(createEndpoint);
+    if (!CREATE_SUFFIX.test(u.pathname)) return null;
+    u.pathname = u.pathname.replace(CREATE_SUFFIX, "");
+    if (!u.pathname || u.pathname === "/") return null;
+    return `${u.origin}${u.pathname}`;
+  } catch { return null; }
+}
+
 export function renderSweepLeads(hits: SweepHit[]): string {
   const strong = hits.filter((h) => h.strength === "strong");
   if (strong.length === 0) return "";

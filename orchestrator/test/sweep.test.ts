@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runSweep, renderSweepLeads, type SweepTarget, type SweepPayload, type SendProbe } from "../src/sweep.js";
+import { runSweep, renderSweepLeads, detectDebugSignature, renderEndpointFor, type SweepTarget, type SweepPayload, type SendProbe } from "../src/sweep.js";
 
 const targets: SweepTarget[] = [{ endpoint: "http://h/api/contactUs", method: "POST", params: ["name"] }];
 
@@ -70,4 +70,17 @@ test("budget is round-robined so a later endpoint still gets probed (no depth-fi
   const hits = await runSweep({ targets: many, payloadsFor: (c) => c === "xss_reflected" ? hit : [], send, budget: 20 });
   assert.ok(seen.has("http://h/api/contactUs"), "the later endpoint was still reached despite the earlier high-field one");
   assert.ok(hits.some((h) => h.endpoint === "http://h/api/contactUs" && h.strength === "strong"), "contactUs XSS hit found");
+});
+
+test("detectDebugSignature flags an unhandled framework error page, not a clean response", () => {
+  assert.ok(detectDebugSignature("<h4>A PHP Error was encountered</h4> ... /var/www/x.php"));
+  assert.ok(detectDebugSignature("Severity: Notice  Message: Undefined index: userid"));
+  assert.equal(detectDebugSignature('{"status":"Failed","status_code":"ERR001"}'), null);
+});
+
+test("renderEndpointFor pairs a create endpoint with its render/list route", () => {
+  assert.equal(renderEndpointFor("http://h/api/loan/apply"), "http://h/api/loan");
+  assert.equal(renderEndpointFor("http://h/api/post/create"), "http://h/api/post");
+  assert.equal(renderEndpointFor("http://h/api/loan"), null);        // not a create route
+  assert.equal(renderEndpointFor("http://h/apply"), null);           // would leave empty path
 });
