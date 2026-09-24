@@ -570,22 +570,25 @@ async function sweepBrokenPasswordChange(
   if (!act) { dbg("change request failed to capture — abort"); return proved; }
   dbg(`change resp: ${(act.response.body ?? "").slice(0, 80)}`);
 
-  // Log out JWT1 first: this app refuses a second concurrent login ("already logged in" —
-  // LGN005) while a session is active, which masks the delta. Reconstruct a valid logout
-  // envelope from the signup body with `data` emptied (a bare body is rejected), POST it
-  // authenticated as JWT1. Generic, best-effort.
-  if (logoutUrl) {
-    let logoutBody: string;
-    try { const env = JSON.parse(signupBody); emptyDataInPlace(env); logoutBody = JSON.stringify(env); }
-    catch { logoutBody = "{}"; }
-    const lo = await fire("POST", logoutUrl, jsonHdr, graftDevice(logoutBody, goodDevice), null, jwt1);
-    dbg(`logout resp: ${(lo?.response.body ?? "").slice(0, 60)}`);
+  // This app refuses a second concurrent login ("already logged in" — LGN005) while a
+  // session is active, which masks the delta; a logout clears it. Reconstruct a valid
+  // logout envelope from the signup body with `data` emptied (a bare body is rejected).
+  // The target can return an anomalous response under rapid sequential calls, so retry the
+  // logout→post-login a few times: any attempt where the P2 login issues a JWT proves the
+  // change committed. Generic, bounded.
+  let logoutBody = "{}";
+  try { const env = JSON.parse(signupBody); emptyDataInPlace(env); logoutBody = JSON.stringify(env); } catch { /* keep */ }
+  let c2: HttpCapture | null = null; let jwt2: string | null = null;
+  for (let attempt = 0; attempt < 3 && !jwt2; attempt++) {
+    if (logoutUrl) {
+      const lo = await fire("POST", logoutUrl, jsonHdr, graftDevice(logoutBody, goodDevice), null, jwt1);
+      dbg(`logout attempt ${attempt} resp: ${(lo?.response.body ?? "").slice(0, 50)}`);
+    }
+    c2 = await fire("POST", loginUrl, jsonHdr, loginBody(P2), null);
+    jwt2 = extractJwt(c2?.response.body);
+    if (!jwt2) dbg(`post-login attempt ${attempt}: ${(c2?.response.body ?? "").slice(0, 60)}`);
   }
-
-  // post: login with P2 -> succeeds (JWT issued) IFF the change committed despite wrong old.
-  const c2 = await fire("POST", loginUrl, jsonHdr, loginBody(P2), null);
-  const jwt2 = extractJwt(c2?.response.body);
-  if (!c2 || !jwt2) { dbg(`post-login with P2 returned no JWT (change correctly rejected, or logout needed): ${(c2?.response.body ?? "").slice(0, 80)}`); return proved; }
+  if (!c2 || !jwt2) { dbg("post-login with P2 never issued a JWT (change rejected or session not cleared)"); return proved; }
   dbg("post-login with P2 SUCCEEDED — banking state_changed");
 
   const banked = await bankStateChanged(
