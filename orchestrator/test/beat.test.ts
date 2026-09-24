@@ -357,7 +357,7 @@ test("a second beat against the SAME engagement/scope inherits the first beat's 
   const system = client2.seen[0].messages.find((m: any) => m.role === "system");
   assert.match(system.content, /vuln_class="clickjacking"/);
   // URLs render relative to the target base now; single origin -> primary -> "/a"
-  assert.match(system.content, /endpoint="\/a"/);
+  assert.match(system.content, /endpoints="\/a"/);
   // and the <target> block carries the base legend once
   assert.match(system.content, /BASE \(primary\) = http:\/\/10\.0\.0\.1:3000/);
 });

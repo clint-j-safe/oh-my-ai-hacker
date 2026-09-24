@@ -80,7 +80,7 @@ test("a populated spine emits its endpoints, proved list and dead ends into the 
 
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="idor"/);
-  assert.match(alreadyProved, /endpoint="\/api\/users\/2"/);
+  assert.match(alreadyProved, /endpoints="\/api\/users\/2"/);
 
   const deadEnds = section(xml, "dead_ends");
   assert.match(deadEnds, /vuln_class="sqli"/);
@@ -102,7 +102,7 @@ test("a proved (vuln_class, endpoint) appears in <already_proved>, AND the vuln_
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="path_traversal"/);
   // single origin -> primary base -> relative
-  assert.match(alreadyProved, /endpoint="\/download"/);
+  assert.match(alreadyProved, /endpoints="\/download"/);
 
   const outputContract = section(xml, "output_contract");
   for (const v of VULN_CLASSES) {
@@ -130,6 +130,26 @@ test("recovered_intel rendering is BOUNDED: a huge intel map does not bloat the 
   assert.match(sect, /api_route_table/);
   assert.match(sect, /jwt_key_source/);
   assert.match(sect, /omitted to keep this brief lean/);
+});
+
+test("already_proved rendering is BOUNDED: an accumulated spine groups by class and caps endpoints (regression: 27KB per-finding rows bloated every turn)", () => {
+  // 250 banked findings across a few recurring classes — the shape a long-running,
+  // accumulated engagement produces. The old per-finding format made this ~27 KB.
+  const proved = [] as HunterBriefState["proved"];
+  for (let i = 0; i < 250; i++) {
+    const cls = ["rate_limit_absence", "clickjacking", "info_disclosure"][i % 3];
+    proved.push({ vuln_class: cls, endpoint: `http://10.0.0.1:3000/route/${i}`, invariant_type: "response_asserted", verdict: "CONFIRMED", finding_id: `SAHW-${i}` });
+  }
+  const xml = buildHunterBrief({ ...EMPTY_STATE, proved });
+  const sect = section(xml, "already_proved");
+  assert.ok(sect.length < 8000, `already_proved must stay bounded, got ${sect.length} chars`);
+  // one grouped row per class, not 250 rows
+  assert.equal((sect.match(/<proved\b/g) ?? []).length, 3, "one grouped row per vuln_class");
+  // endpoints origin-stripped to paths and capped per class with a "+N more" marker
+  assert.match(sect, /endpoints="\/route\//);
+  assert.match(sect, /\+\d+ more/);
+  assert.doesNotMatch(sect, /http:\/\//, "endpoints are origin-stripped");
+  assert.doesNotMatch(sect, /finding_id/, "per-finding provenance the rule never uses is dropped");
 });
 
 test("<remaining_targets> renders the human-method probe for OPEN classes as PRIORITY, and widen-probes for recurring proved classes", () => {

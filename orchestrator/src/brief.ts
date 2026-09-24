@@ -648,21 +648,42 @@ function renderCanonicalTargets(intel: RecoveredIntel, proved: ProvedEntry[] = [
   ].join("\n");
 }
 
+// Cap the endpoints listed per class so a heavily-accumulated spine (this section is
+// rebuilt from ALL findings ever banked for the engagement) cannot bloat the brief.
+const PROVED_ENDPOINTS_PER_CLASS = 30;
+
 function renderAlreadyProved(proved: ProvedEntry[]): string {
   if (proved.length === 0) {
     return "  EMPTY. Nothing has been proved yet against this engagement — no exclusions apply.";
   }
-  const rows = proved
-    .map((p) => tag("proved", {
-      vuln_class: p.vuln_class, endpoint: p.endpoint,
-      invariant_type: p.invariant_type, finding_id: p.finding_id,
-    }))
+  // GROUP by vuln_class. The rule below only needs the (class, endpoint) exclusion set,
+  // so emitting one verbose row per finding — with finding_id and invariant_type the
+  // rule never uses — is pure prompt weight. On an accumulated engagement that reached
+  // ~27 KB (one row per ~250 banked findings), re-sent on EVERY turn of every beat.
+  // Grouping to one line per class with a bounded, origin-stripped endpoint list keeps
+  // the exact-pair semantics while cutting the section ~80%. Endpoints are stripped to
+  // their path for compactness (display only — the exclusion list still reads clearly)
+  // and any degenerate repeated-char run is collapsed defensively.
+  const byClass = new Map<string, string[]>();
+  for (const p of proved) {
+    const path = collapseRepeatedRuns(String(p.endpoint)).replace(/^https?:\/\/[^/]+/, "") || "/";
+    const list = byClass.get(p.vuln_class) ?? [];
+    if (!list.includes(path)) list.push(path);
+    byClass.set(p.vuln_class, list);
+  }
+  const rows = [...byClass.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([cls, eps]) => {
+      const shown = eps.slice(0, PROVED_ENDPOINTS_PER_CLASS);
+      const extra = eps.length > shown.length ? ` +${eps.length - shown.length} more` : "";
+      return tag("proved", { vuln_class: cls, count: eps.length, endpoints: shown.join(", ") + extra });
+    })
     .join("\n");
   const rule = [
     "",
-    "  RULE: each row above is a finding ALREADY BANKED for its exact",
-    "  (vuln_class, endpoint) pair. Do NOT re-report the SAME class on the SAME",
-    "  endpoint — that exact pair is done and re-proving it is wasted budget. But",
+    "  RULE: each row above is a vuln_class and the endpoints ALREADY BANKED for it.",
+    "  Every (class, endpoint) pair listed is done. Do NOT re-report the SAME class on",
+    "  the SAME endpoint — that exact pair is done and re-proving it is wasted budget. But",
     "  the SAME class on a DIFFERENT endpoint IS a new, separate finding worth",
     "  banking: findings are scored per (class, endpoint), and many classes recur",
     "  across the app (missing rate limiting, broken access control, injection, and",
