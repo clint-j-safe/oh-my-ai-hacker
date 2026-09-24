@@ -1,4 +1,5 @@
 import { VULN_CLASSES, type VulnClass } from "./vuln-classes.js";
+import { collapseRepeatedRuns } from "./spine.js";
 import type { AttemptedEntry, ProvedEntry, RecoveredIntel, SpineEndpoint } from "./spine.js";
 
 /**
@@ -504,6 +505,14 @@ const BUDGET_GUIDANCE = [
   "stop.",
 ].join("\n");
 
+// Display bounds for the attack surface. These are DISPLAY-only — they shape the
+// rendered brief, never what the Spine stores or what gets replayed — so they are safe
+// to set generously. The Spine already clips degenerate repeated-char runs on write
+// (collapseRepeatedRuns), applied again here defensively so a spine loaded before that
+// fix shipped still renders lean this beat.
+const ATTACK_SURFACE_CAP = 80;      // endpoints shown; the rest summarised in a note
+const ATTACK_SURFACE_URL_CAP = 2000; // per-URL char cap, far above any legitimate URL
+
 function renderAttackSurface(endpoints: SpineEndpoint[]): string {
   if (endpoints.length === 0) {
     return [
@@ -513,12 +522,19 @@ function renderAttackSurface(endpoints: SpineEndpoint[]): string {
       "  from what you find — before probing anything.",
     ].join("\n");
   }
-  return endpoints
-    .map((e) => tag("endpoint", {
-      url: e.url, method: e.method, status: e.status ?? undefined,
-      content_type: e.content_type ?? undefined, semantic_role: e.semantic_role,
-    }, e.notes))
-    .join("\n");
+  const shown = endpoints.slice(0, ATTACK_SURFACE_CAP);
+  const boundUrl = (u: string) => {
+    const c = collapseRepeatedRuns(u);
+    return c.length > ATTACK_SURFACE_URL_CAP ? `${c.slice(0, ATTACK_SURFACE_URL_CAP)}…` : c;
+  };
+  const lines = shown.map((e) => tag("endpoint", {
+    url: boundUrl(e.url), method: e.method, status: e.status ?? undefined,
+    content_type: e.content_type ?? undefined, semantic_role: e.semantic_role,
+  }, e.notes));
+  if (endpoints.length > shown.length) {
+    lines.push(`  <note>+${endpoints.length - shown.length} more mapped endpoints omitted to keep this brief lean; recover any you need with grep_artifact</note>`);
+  }
+  return lines.join("\n");
 }
 
 function renderRecoveredIntel(intel: RecoveredIntel): string {
@@ -632,21 +648,42 @@ function renderCanonicalTargets(intel: RecoveredIntel, proved: ProvedEntry[] = [
   ].join("\n");
 }
 
+// Cap the endpoints listed per class so a heavily-accumulated spine (this section is
+// rebuilt from ALL findings ever banked for the engagement) cannot bloat the brief.
+const PROVED_ENDPOINTS_PER_CLASS = 30;
+
 function renderAlreadyProved(proved: ProvedEntry[]): string {
   if (proved.length === 0) {
     return "  EMPTY. Nothing has been proved yet against this engagement — no exclusions apply.";
   }
-  const rows = proved
-    .map((p) => tag("proved", {
-      vuln_class: p.vuln_class, endpoint: p.endpoint,
-      invariant_type: p.invariant_type, finding_id: p.finding_id,
-    }))
+  // GROUP by vuln_class. The rule below only needs the (class, endpoint) exclusion set,
+  // so emitting one verbose row per finding — with finding_id and invariant_type the
+  // rule never uses — is pure prompt weight. On an accumulated engagement that reached
+  // ~27 KB (one row per ~250 banked findings), re-sent on EVERY turn of every beat.
+  // Grouping to one line per class with a bounded, origin-stripped endpoint list keeps
+  // the exact-pair semantics while cutting the section ~80%. Endpoints are stripped to
+  // their path for compactness (display only — the exclusion list still reads clearly)
+  // and any degenerate repeated-char run is collapsed defensively.
+  const byClass = new Map<string, string[]>();
+  for (const p of proved) {
+    const path = collapseRepeatedRuns(String(p.endpoint)).replace(/^https?:\/\/[^/]+/, "") || "/";
+    const list = byClass.get(p.vuln_class) ?? [];
+    if (!list.includes(path)) list.push(path);
+    byClass.set(p.vuln_class, list);
+  }
+  const rows = [...byClass.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([cls, eps]) => {
+      const shown = eps.slice(0, PROVED_ENDPOINTS_PER_CLASS);
+      const extra = eps.length > shown.length ? ` +${eps.length - shown.length} more` : "";
+      return tag("proved", { vuln_class: cls, count: eps.length, endpoints: shown.join(", ") + extra });
+    })
     .join("\n");
   const rule = [
     "",
-    "  RULE: each row above is a finding ALREADY BANKED for its exact",
-    "  (vuln_class, endpoint) pair. Do NOT re-report the SAME class on the SAME",
-    "  endpoint — that exact pair is done and re-proving it is wasted budget. But",
+    "  RULE: each row above is a vuln_class and the endpoints ALREADY BANKED for it.",
+    "  Every (class, endpoint) pair listed is done. Do NOT re-report the SAME class on",
+    "  the SAME endpoint — that exact pair is done and re-proving it is wasted budget. But",
     "  the SAME class on a DIFFERENT endpoint IS a new, separate finding worth",
     "  banking: findings are scored per (class, endpoint), and many classes recur",
     "  across the app (missing rate limiting, broken access control, injection, and",
@@ -731,15 +768,19 @@ const HUMAN_PROBES: Partial<Record<VulnClass, string>> = {
   ssrf:
     "submit a server-fetched URL (a field like avatar/image/callback) pointing once at a reachable host and once at an unreachable one; a consistent reachable-vs-unreachable response difference is a blind boolean-oracle SSRF (`body_contains` the distinguishing code) — do NOT require an out-of-band callback.",
   auth_bypass:
-    "attack multi-step and credential-change flows for a MISSING check. Two distinct findings, each proved with ORDERED `steps` that END IN A LOGIN that observes the change: (a) a password CHANGE accepted with a WRONG current/old password — steps: [change with wrong old + new pw], [login with the NEW pw] → `state_changed`, expression appeared:<login-success-code>; NOT body_contains of the change response alone (that only scores PARTIAL). (b) a password-RESET chain (forgot → verify → reset) that never demands a secondary factor (email/OTP/DOB/security-question) before letting you set a new password — steps culminating in [login with the attacker-set pw]. If the chain issues/accepts the reset with NO identity factor beyond a guessable/enumerable one, that ABSENCE is itself the finding; capture the full chain's requests as `steps` and state the missing-factor invariant.",
+    "attack multi-step and credential-change flows for a MISSING check. Two distinct findings, each proved with ORDERED `steps` that END IN A LOGIN that observes the change: (a) a password CHANGE accepted with a WRONG current/old password — steps: [change with wrong old + new pw], [login with the NEW pw] → `state_changed`, expression appeared:<login-success-code>; NOT body_contains of the change response alone (that only scores PARTIAL). CRITICAL: keep EVERY OTHER field VALID — especially format-constrained ones like the NEW password (make it policy-conformant) — so the request is NOT rejected on an unrelated validation error (a format/length rejection) BEFORE the missing-check path executes; if you see a format/validation rejection, fix that field and retry, because the wrong-old-password acceptance only shows once the request is otherwise well-formed. (b) a password-RESET chain (forgot → verify → reset) that never demands a secondary factor (email/OTP/DOB/security-question) before letting you set a new password — steps culminating in [login with the attacker-set pw]. If the chain issues/accepts the reset with NO identity factor beyond a guessable/enumerable one, that ABSENCE is itself the finding; capture the full chain's requests as `steps` and state the missing-factor invariant. (c) SEPARATELY, at the recovery-initiation / OTP-issuance step itself: if the server issues a reset OTP or reset token after you present ONLY a username/userid — with NO email, mobile, DOB, or security-question challenge demanded first — bank that as its own finding, `body_contains` the OTP/token issuance success in response to a userid-only request. Proving the takeover and proving the missing-factor-at-issuance are TWO separate bankable findings on the same chain; submit both.",
   business_logic:
-    "submit out-of-range / negative / wrong-type / boundary values wherever a validation or authorization check SHOULD reject; if the request is accepted that's `body_contains` the acceptance, and if the value moves server-side state in your favour (a balance, a quota, a status) that's `state_changed`. Let the target's own parameter contracts tell you which fields to abuse.",
+    "submit out-of-range / negative / wrong-type / boundary values wherever a validation or authorization check SHOULD reject; if the request is accepted that's `body_contains` the acceptance, and if the value moves server-side state in your favour (a balance, a quota, a status) that's `state_changed`. Let the target's own parameter contracts tell you which fields to abuse. To EARN `state_changed` (not just PARTIAL acceptance), you must COMPLETE the operation: satisfy the OTHER gates it enforces — e.g. supply a VALID one-time code (decrypt it first if you have recovered the key/algorithm, rather than sending a filler value that fails the OTP/precondition check) — so the action actually COMMITS, then OBSERVE the resulting state with a follow-up read (re-fetch the balance/quota/status before and after). Stopping at a precondition rejection (invalid-OTP/precondition error) only proves acceptance = PARTIAL; the committed state delta is what scores `state_changed`.",
   rate_limit_absence:
     "repeat an authentication or verification action past whatever attempt limit the target itself documents or implies; a lockout counter that should trip but keeps accepting — or resets when the challenge is re-issued — is the finding (`status_in` the still-accepted responses, or `state_violated` if you can show the counter itself is defeated).",
   info_disclosure:
-    "send malformed or missing-parameter requests to API routes; a framework debug/stack-trace page with absolute paths or a backtrace is the finding (`body_contains` the leaked internals).",
+    "to surface a framework debug/stack-trace page, send a STRUCTURALLY-VALID request (correct envelope, right Content-Type) that OMITS a REQUIRED data field or gives one the WRONG type — so the server reaches code that dereferences the missing value and throws an UNHANDLED error with absolute file paths / a backtrace. A bodyless request or syntactically-broken body usually only yields a HANDLED error (a clean JSON status code), which is NOT the finding. The finding is `body_contains` the leaked internals (file paths, line numbers, backtrace).",
   forced_browsing:
     "request undocumented/debug routes and shipped source maps (e.g. a `.map` under the SPA's static dir, an admin/debug path); a 200 on an unlinked resource is the finding (`status_in`).",
+  xss_reflected:
+    "find a parameter whose value is echoed back in the response; submit an unencoded `<script>`/HTML payload — try the JSON BODY fields (e.g. a name/message/comment field), not only query strings — and check whether it returns VERBATIM (unescaped) with an HTML content-type. `body_contains` the exact unescaped payload in the response is the finding; if it comes back HTML-encoded it is NOT vulnerable, move on.",
+  xxe:
+    "if an endpoint accepts XML (set `Content-Type: application/xml` and/or `Accept: application/xml`, then send an XML body), submit a payload that DECLARES an external entity referencing a local file and expands it in an element; if the file's contents appear in the response, that's `body_contains` the entity content. Try this on endpoints that also accept JSON — many parse both.",
 };
 
 function renderRemainingTargets(proved: ProvedEntry[]): string {
@@ -872,6 +913,81 @@ function renderDeadEnds(attempted: AttemptedEntry[]): string {
     .join("\n");
 }
 
+/** Collect the distinct scheme://host[:port] origins that appear anywhere in the
+ * brief's state (attack surface, proved, attempted, recovered intel), most-frequent
+ * first. The most frequent is the PRIMARY (API) base; the rest get short aliases. This
+ * is how the brief avoids re-sending the full origin on every one of ~40-60 URLs each
+ * beat — it states the base(s) ONCE and renders everything relative. */
+export function deriveOrigins(state: HunterBriefState): string[] {
+  const blob = [
+    ...state.attackSurface.map((e) => e.url),
+    ...state.proved.map((p) => p.endpoint),
+    ...state.attempted.map((a) => a.endpoint),
+    ...Object.values(state.recoveredIntel).map((v) => (typeof v === "string" ? v : "")),
+  ].join(" ");
+  const counts = new Map<string, number>();
+  for (const m of blob.matchAll(/https?:\/\/[^/\s"'<>]+/g)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+  // most frequent first; ties broken by longest (so a :port origin isn't shadowed)
+  return [...counts.keys()].sort((a, b) => (counts.get(b)! - counts.get(a)!) || (b.length - a.length));
+}
+
+/** A short alias for a non-primary origin — its port if it has one (`[:3000]`), else
+ * `[o2]`, `[o3]`… Used both when rendering (origin -> alias) and resolving (alias ->
+ * origin) so the round-trip is lossless. */
+function originAlias(origin: string, index: number): string {
+  const port = origin.match(/:(\d+)$/);
+  return port ? `[:${port[1]}]` : `[o${index + 1}]`;
+}
+
+/** INVERSE of relativization: turn an endpoint the model emitted relative to the
+ * target base back into an absolute in-scope URL, using the SAME origin list + alias
+ * scheme the brief showed it. Absolute URLs pass through unchanged. Unresolvable input
+ * is returned as-is (the Tether/Axiom then reject it, never a scope bypass). Callers
+ * pass the SAME origins the brief was built from (deriveOrigins(state)) so the mapping
+ * is consistent per beat. */
+export function resolveRelativeEndpoint(raw: string, origins: string[]): string {
+  if (typeof raw !== "string") return raw;
+  const s = raw.trim();
+  if (/^https?:\/\//i.test(s)) return s;                  // already absolute
+  if (origins.length === 0) return s;                     // no base known yet
+  // alias-prefixed: [:PORT]/path or [oN]/path
+  const aliased = s.match(/^(\[:\d+\]|\[o\d+\])(\/.*|$)/);
+  if (aliased) {
+    const alias = aliased[1];
+    for (let i = 1; i < origins.length; i++) {
+      if (originAlias(origins[i], i) === alias) return origins[i] + (aliased[2] || "/");
+    }
+    return s;                                             // unknown alias -> leave (rejected downstream)
+  }
+  if (s.startsWith("/")) return origins[0] + s;           // bare path -> primary base
+  return s;
+}
+
+function renderTarget(origins: string[]): string {
+  if (origins.length === 0) {
+    return "  EMPTY. No target origin recovered yet — banner the in-scope host(s) first (see <opening_move>).";
+  }
+  const lines = [
+    "  URLs below are RELATIVE to the target base to keep this brief lean. Resolve them:",
+    `    BASE (primary) = ${origins[0]}   — a leading '/path' means ${origins[0]}/path`,
+  ];
+  origins.slice(1).forEach((o, i) => lines.push(`    ${originAlias(o, i + 1)} = ${o}   — a leading '${originAlias(o, i + 1)}/path' means ${o}/path`));
+  lines.push("  In your claims you MAY emit endpoints relative (they resolve against these) OR absolute — both work.");
+  return lines.join("\n");
+}
+
+/** Rewrite every absolute in-scope URL in the assembled brief to its relative form:
+ * the primary origin drops to '', each other origin to its alias. Longest origins are
+ * replaced first so a `:port` origin is not clobbered by its base as a prefix. */
+function relativizeBrief(xml: string, origins: string[]): string {
+  let out = xml;
+  const ordered = origins
+    .map((o, i) => ({ o, rep: i === 0 ? "" : originAlias(o, i) }))
+    .sort((a, b) => b.o.length - a.o.length); // longest first
+  for (const { o, rep } of ordered) out = out.split(o).join(rep);
+  return out;
+}
+
 export function buildHunterBrief(state: HunterBriefState): string {
   const sections = [
     `<system_identity>\n${SYSTEM_IDENTITY}\n</system_identity>`,
@@ -879,6 +995,7 @@ export function buildHunterBrief(state: HunterBriefState): string {
     `<opening_move>\n${OPENING_MOVE}\n</opening_move>`,
     `<attack_surface>\n${renderAttackSurface(state.attackSurface)}\n</attack_surface>`,
     `<recovered_intel>\n${renderRecoveredIntel(state.recoveredIntel)}\n</recovered_intel>`,
+    `<target>\n${renderTarget(deriveOrigins(state))}\n</target>`,
     `<canonical_targets>\n${renderCanonicalTargets(state.recoveredIntel, state.proved)}\n</canonical_targets>`,
     `<already_proved>\n${renderAlreadyProved(state.proved)}\n</already_proved>`,
     `<coverage_goal>\n${renderCoverageGoal(state.proved)}\n</coverage_goal>`,
@@ -899,5 +1016,18 @@ export function buildHunterBrief(state: HunterBriefState): string {
       "</budget>",
     ].join("\n"),
   ];
-  return `<safe_ai_hacker_hunter>\n${sections.join("\n")}\n</safe_ai_hacker_hunter>`;
+  // Render everything, THEN collapse the target origin(s) to relative form. The
+  // <target> block (added above) states the base once; relativizeBrief strips it from
+  // every URL so the origin isn't re-sent ~40-60 times per beat. The primary origin is
+  // kept intact inside <target> itself (it must survive as the resolution key), so
+  // relativize the other sections and re-inject the target block verbatim.
+  const origins = deriveOrigins(state);
+  const assembled = `<safe_ai_hacker_hunter>\n${sections.join("\n")}\n</safe_ai_hacker_hunter>`;
+  if (origins.length === 0) return assembled;             // beat 1: nothing to relativize
+  const targetBlock = `<target>\n${renderTarget(origins)}\n</target>`;
+  // Relativize the whole doc, then restore the <target> block (which must keep the
+  // literal origins as the legend). Split on the block so the legend is untouched.
+  const relativized = relativizeBrief(assembled, origins);
+  const relTargetBlock = relativizeBrief(targetBlock, origins);
+  return relativized.replace(relTargetBlock, targetBlock);
 }

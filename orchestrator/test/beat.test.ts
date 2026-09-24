@@ -6,7 +6,23 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor, allowlistFor, HUNTER_SKILL_ALLOWLIST, isInvariantUpgrade, feedbackForVerdict } from "../src/beat.js";
+import type { DeepConfig } from "../src/config.js";
+
+const OFF_DEEP: DeepConfig = { enabled: false, weaponize: false, maxSweepRequests: 500, maxEscalationDepth: 2, weaponizeAuthRef: null };
+
+test("allowlistFor returns exactly the base 3 skills when deep mode is off", () => {
+  assert.deepEqual([...allowlistFor(OFF_DEEP)], [...HUNTER_SKILL_ALLOWLIST]);
+});
+
+test("deep mode (the single boolean) widens to the attack/discovery + chaining skills; weaponize adds deserialization-rce", () => {
+  const on = allowlistFor({ ...OFF_DEEP, enabled: true, weaponize: false });
+  assert.ok(on.includes("sqli-database-injection") && on.includes("xss-dom-sinks"));
+  assert.ok(on.includes("chain-construction") && on.includes("technique-combinator"), "deep is all-on incl. chaining");
+  assert.ok(!on.includes("deserialization-rce"), "weaponize off -> no deserialization-rce");
+  const wep = allowlistFor({ ...OFF_DEEP, enabled: true, weaponize: true, weaponizeAuthRef: "ENG-1" });
+  assert.ok(wep.includes("deserialization-rce"));
+});
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
@@ -356,7 +372,10 @@ test("a second beat against the SAME engagement/scope inherits the first beat's 
   await runBeat({ env, client: client2, fetchImpl: bareFetch, now: NOW });
   const system = client2.seen[0].messages.find((m: any) => m.role === "system");
   assert.match(system.content, /vuln_class="clickjacking"/);
-  assert.match(system.content, new RegExp(`endpoint="${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
+  // URLs render relative to the target base now; single origin -> primary -> "/a"
+  assert.match(system.content, /endpoints="\/a"/);
+  // and the <target> block carries the base legend once
+  assert.match(system.content, /BASE \(primary\) = http:\/\/10\.0\.0\.1:3000/);
 });
 
 test("every VULN_CLASSES value is accepted by isVulnClass, and a prose value is rejected", () => {
@@ -1602,3 +1621,29 @@ test("beatTagFor: each beat gets a stable, memorable, distinguishable #n-adj-nou
   assert.notEqual(beatTagFor(rid, 3), beatTagFor(rid, 4), "different beats look different");
   assert.match(beatTagFor(rid, 0), /^#\?-[a-z]+-[a-z]+$/, "unknown beat no -> #?");
 });
+
+// ---- FEEDBACK_COMPLETE: push partials to their stronger multi-step invariant ----
+
+test("isInvariantUpgrade: a class's weak partial -> its strong invariant is an upgrade; dupes/downgrades are not", () => {
+  assert.equal(isInvariantUpgrade("auth_bypass", "body_contains", "state_changed"), true);
+  assert.equal(isInvariantUpgrade("business_logic", "body_contains", "state_changed"), true);
+  assert.equal(isInvariantUpgrade("auth_bypass", "state_changed", "state_changed"), false); // already strong
+  assert.equal(isInvariantUpgrade("auth_bypass", "body_contains", "body_contains"), false); // bare dup
+  assert.equal(isInvariantUpgrade("auth_bypass", "state_changed", "body_contains"), false); // downgrade
+  assert.equal(isInvariantUpgrade("clickjacking", "response_asserted", "body_contains"), false); // no upgrade for this class
+});
+
+test("feedbackForVerdict: a CONFIRMED weak invariant on an upgradable class pushes COMPLETING the strong proof, not moving on", () => {
+  const weak = feedbackForVerdict("auth_bypass", "http://h/api/password/change", "CONFIRMED", "marker present", undefined, undefined, "body_contains");
+  assert.match(weak, /state_changed/);
+  assert.match(weak, /log in|follow-up|OBSERVES/i);
+  assert.doesNotMatch(weak, /find a DIFFERENT/i);
+  const strong = feedbackForVerdict("auth_bypass", "http://h/api/password/change", "CONFIRMED", "login succeeded", undefined, undefined, "state_changed");
+  assert.match(strong, /find a DIFFERENT/i);   // already strong -> normal move-on
+  const other = feedbackForVerdict("clickjacking", "http://h/x", "CONFIRMED", "no XFO", undefined, undefined, "response_asserted");
+  assert.match(other, /find a DIFFERENT/i);     // non-upgradable class -> normal move-on
+});
+
+// (end-to-end dedupe-upgrade is validated by the post-HTB deep run; the decision fn
+// isInvariantUpgrade and the feedback branch feedbackForVerdict are unit-tested above.)
+

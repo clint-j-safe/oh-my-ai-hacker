@@ -342,10 +342,56 @@ function mergeIntel(prev: RecoveredIntel, next: RecoveredIntel): RecoveredIntel 
   return merged;
 }
 
+/**
+ * Collapse a degenerate run of one repeated character in a URL to a compact marker.
+ *
+ * A fuzzed or reflected request — e.g. `GET /?unix=AAAA…` with a 200 KB payload — is
+ * recorded verbatim into the attack surface, and since the Spine is re-rendered into
+ * EVERY subsequent beat's brief, that one junk URL then rides in every prompt forever
+ * (one observed run: a single 219,608-byte `A`-run = ~43% of a 514 KB prompt). This
+ * clips it at the source, on write, so it can never accumulate.
+ *
+ * SAFETY — this must not touch a legitimate URL:
+ *  - It fires ONLY on a run of >= RUN_THRESHOLD (24) IDENTICAL consecutive characters.
+ *    Real URL content is high-entropy — JWTs, base64, UUIDs, hashes, signed tokens,
+ *    session ids, paths — and never contains 24 of the same character in a row. A
+ *    24x repeat is a padding/fuzz artifact by construction.
+ *  - It keeps the base URL, the parameter names, and the first few chars of the run,
+ *    so the endpoint's shape stays legible; only the repeat itself becomes `…⟨×N⟩`.
+ *  - These stored URLs are never REPLAYED (the Axiom replays claim.request /
+ *    evidence.captures, never attack_surface[].url) and their only other consumer,
+ *    origin derivation, reads scheme+host — everything before the '?'. So even an
+ *    over-aggressive collapse could at worst shorten a display string, never corrupt
+ *    a request or a proof.
+ *
+ * Note: there is deliberately NO blunt length cap here — a legitimate URL can exceed
+ * any fixed length (a large JWT in a query param), and truncating it on write would
+ * lose real information. Display-side bounding (count + a generous per-URL cap well
+ * above any real URL) lives in the brief renderer, where it cannot affect storage.
+ */
+const RUN_THRESHOLD = 24;
+const REPEAT_RUN = /(.)\1{23,}/gs; // >= 24 identical consecutive chars (\1 back-ref = same char)
+export function collapseRepeatedRuns(url: string): string {
+  if (typeof url !== "string" || url.length < RUN_THRESHOLD) return url;
+  return url.replace(REPEAT_RUN, (run, ch: string) => `${ch.repeat(8)}…⟨×${run.length}⟩`);
+}
+
+function normalizeEndpointUrl(e: SpineEndpoint): SpineEndpoint {
+  const url = collapseRepeatedRuns(e.url);
+  return url === e.url ? e : { ...e, url };
+}
+
 function mergeEndpoints(prev: SpineEndpoint[], next: SpineEndpoint[]): SpineEndpoint[] {
   const byKey = new Map<string, SpineEndpoint>();
-  for (const e of prev) byKey.set(`${e.method} ${e.url}`, e);
-  for (const e of next) {
+  // Normalize on BOTH sides: `next` clips anything recorded this beat, and `prev`
+  // retroactively cleans an already-bloated spine the first time it is merged after
+  // this fix ships.
+  for (const raw of prev) {
+    const e = normalizeEndpointUrl(raw);
+    byKey.set(`${e.method} ${e.url}`, e);
+  }
+  for (const raw of next) {
+    const e = normalizeEndpointUrl(raw);
     const key = `${e.method} ${e.url}`;
     const existing = byKey.get(key);
     // Later observations win on scalar fields; a newly-empty optional field does

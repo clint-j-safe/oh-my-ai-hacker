@@ -498,3 +498,30 @@ test("a tether span is emitted for an ALLOW as well as a DENY (via runAgent's to
   assert.equal(result.toolCalls.length, 1);
   assert.equal(result.toolCalls[0].ok, false, "osv-cve-correlation must still be denied end to end (external egress)");
 });
+
+// --- declared per-host egress narrowing (additive; injected resolver) -------------
+
+test("declared egress-hosts narrows an allowlisted skill to its declared hosts (in addition to scope)", () => {
+  const inScopeButUndeclared = "http://10.0.0.1:3000/api/x"; // in scope, but the skill declares a different host
+  const declared = (skill: string) => skill === "sqli-database-injection" ? ["10.0.0.1"] : null;
+  // 10.0.0.1 matches the declared host -> allowed
+  const ok = gate(E, "skill_run",
+    { skill_name: "sqli-database-injection", input_json: JSON.stringify({ target_url: inScopeButUndeclared }) },
+    ["sqli-database-injection"], SKILL_EGRESS, declared);
+  assert.equal(ok.allow, true);
+  // A DIFFERENT in-scope host that is NOT in the declared set -> denied by the narrowing
+  const declaredOther = (skill: string) => skill === "sqli-database-injection" ? ["only-this-host.internal"] : null;
+  const denied = gate(E, "skill_run",
+    { skill_name: "sqli-database-injection", input_json: JSON.stringify({ target_url: inScopeButUndeclared }) },
+    ["sqli-database-injection"], SKILL_EGRESS, declaredOther);
+  assert.equal(denied.allow, false);
+  if (denied.allow) throw new Error("unreachable");
+  assert.match(denied.reason, /declared hosts/i);
+});
+
+test("a skill that declares NO egress-hosts (resolver returns null) is unaffected by the narrowing", () => {
+  const d = gate(E, "skill_run",
+    { skill_name: "sqli-database-injection", input_json: JSON.stringify({ target_url: "http://10.0.0.1:3000/api/x" }) },
+    ["sqli-database-injection"], SKILL_EGRESS, () => null);
+  assert.equal(d.allow, true);
+});

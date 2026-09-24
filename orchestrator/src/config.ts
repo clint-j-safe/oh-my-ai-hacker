@@ -1,5 +1,29 @@
 export class ConfigError extends Error {}
 
+/**
+ * OPT-IN "deep mode" — thorough exploitation for an enterprise authorized engagement.
+ *
+ * DELIBERATELY A SINGLE BOOLEAN, not a graded level: `enabled` is the one switch. OFF is
+ * the breadth-first default (one probe per turn, bank-and-move-on, attack skills gated
+ * out); ON turns on ALL the depth behaviours together — the systematic input×payload
+ * sweep, the fuzzer, escalation/chaining, and the widened attack-skill allowlist. Two
+ * extremes, no half-states to reason about. Independent of `profile` (a prod engagement
+ * may run shallow; a test one deep), so it is its own object, not the trace-tag profile.
+ *
+ * `weaponize` is a SEPARATE safety gate (also boolean), NOT folded into `enabled`: it is
+ * the destructive tier (controlled, reversible RCE/shell/priv-esc impact) and must never
+ * arm on a single flag. It requires deep mode ON *and* an authorization DOUBLE-CONFIRM
+ * (SAHW_DEEP_WEAPONIZE_AUTH_REF must equal SAHW_AUTH_REF); otherwise loadDeepConfig
+ * throws. Off by default even when deep mode is on.
+ */
+export interface DeepConfig {
+  enabled: boolean;
+  weaponize: boolean;
+  maxSweepRequests: number;
+  maxEscalationDepth: number;
+  weaponizeAuthRef: string | null;
+}
+
 export interface Engagement {
   scope: URL[];
   outOfScope: URL[];
@@ -14,6 +38,7 @@ export interface Engagement {
   phaseTimeoutMs: number;
   maxRetries: number;
   profile: "test" | "prod";
+  deep: DeepConfig;
 }
 
 type Env = Record<string, string | undefined>;
@@ -32,6 +57,43 @@ function numOrNull(env: Env, key: string): number | null {
   const n = Number(raw);
   if (!Number.isFinite(n)) throw new ConfigError(`${key} is not a number: ${raw}`);
   return n;
+}
+
+function boolEnv(env: Env, key: string, fallback: boolean): boolean {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  throw new ConfigError(`${key} is not a boolean: ${raw}`);
+}
+
+/**
+ * The deep-mode capability object. Off by default and fail-closed: an unset SAHW_DEEP_MODE
+ * yields a fully-disabled config, and `enabled=false` forces every sub-flag off no matter
+ * what the individual vars say. The weaponize double-confirm throws unless the same signed
+ * authorization reference is named twice AND deep mode is on.
+ */
+export function loadDeepConfig(env: Env, authRef: string): DeepConfig {
+  const enabled = boolEnv(env, "SAHW_DEEP_MODE", false);
+  const maxSweepRequests = num(env, "SAHW_DEEP_SWEEP_BUDGET", 500);
+  const maxEscalationDepth = num(env, "SAHW_DEEP_ESCALATION_DEPTH", 2);
+  // Fail-closed: deep mode off forces weaponize off regardless of any SAHW_DEEP_WEAPONIZE.
+  if (!enabled) {
+    return { enabled: false, weaponize: false, maxSweepRequests, maxEscalationDepth, weaponizeAuthRef: null };
+  }
+
+  const weaponize = boolEnv(env, "SAHW_DEEP_WEAPONIZE", false);
+  const weaponizeAuthRef = env.SAHW_DEEP_WEAPONIZE_AUTH_REF?.trim() || null;
+  // DOUBLE-CONFIRM: weaponization requires deep mode on AND the same signed authorization
+  // reference named a second time. This makes it impossible to arm with one stray var.
+  if (weaponize && !(weaponizeAuthRef && weaponizeAuthRef === authRef)) {
+    throw new ConfigError(
+      "SAHW_DEEP_WEAPONIZE requires SAHW_DEEP_WEAPONIZE_AUTH_REF to exactly match SAHW_AUTH_REF " +
+      "(a deliberate double-confirm of the client's signed authorization); weaponization stays off");
+  }
+
+  return { enabled: true, weaponize, maxSweepRequests, maxEscalationDepth, weaponizeAuthRef };
 }
 
 function urls(raw: string | undefined, key: string): URL[] {
@@ -96,5 +158,6 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
     phaseTimeoutMs,
     maxRetries: num(env, "SAHW_MAX_RETRIES", 0),
     profile: profileRaw,
+    deep: loadDeepConfig(env, authRef),
   };
 }
