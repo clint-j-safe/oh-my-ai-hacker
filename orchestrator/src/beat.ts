@@ -403,14 +403,22 @@ async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sess
     if (!t.bodyTemplate) continue;
     n++;
     const hdr = { "Content-Type": "application/xml", Accept: "application/xml" };
-    const mk = (body: string): Record<string, unknown> => sessionLabel
-      ? { method: t.method, url: t.endpoint, headers: hdr, body, session: sessionLabel }
-      : { method: t.method, url: t.endpoint, headers: hdr, body };
-    const er = await runner.execute("http_request", mk(xml));
-    if (!er.ok) continue;
-    const exploit = er.result as HttpCapture;
-    if (!(exploit.response.body ?? "").includes("root:x:0:0")) continue;
-    const cr = await runner.execute("http_request", mk(benign));
+    const mk = (url: string, body: string): Record<string, unknown> => sessionLabel
+      ? { method: t.method, url, headers: hdr, body, session: sessionLabel }
+      : { method: t.method, url, headers: hdr, body };
+    // Try the canonical route AND its /index variant. A CodeIgniter app often parses
+    // XML only on the default-method /index path; a hit there records under the
+    // canonical endpoint (canonicalizeEndpoint strips /index), covering the finding.
+    const urlVariants = [t.endpoint, `${t.endpoint.replace(/\/$/, "")}/index`];
+    let exploit: HttpCapture | undefined; let hitUrl = t.endpoint;
+    for (const u of urlVariants) {
+      const er = await runner.execute("http_request", mk(u, xml));
+      if (!er.ok) continue;
+      const cap = er.result as HttpCapture;
+      if ((cap.response.body ?? "").includes("root:x:0:0")) { exploit = cap; hitUrl = u; break; }
+    }
+    if (!exploit) continue;
+    const cr = await runner.execute("http_request", mk(hitUrl, benign));
     const control = cr.ok ? (cr.result as HttpCapture) : undefined;
     hits.push({
       vuln_class: "xxe", endpoint: t.endpoint, param: "(xml body)", payload: xml, strength: "strong",
