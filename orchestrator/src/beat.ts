@@ -68,8 +68,9 @@ export function allowlistFor(deep: DeepConfig): readonly string[] {
     "ssrf-internal-pivot", "file-upload-path-traversal", "oob-blind-vuln-correlation",
     "privilege-matrix-mapping", "account-role-acquisition", "poc-hardening-self-verification",
   );
-  if (deep.escalate) list.push("chain-construction", "technique-combinator");
-  if (deep.weaponize !== "off") list.push("deserialization-rce");
+  // Deep mode is all-on: escalation/chaining planners come with it.
+  list.push("chain-construction", "technique-combinator");
+  if (deep.weaponize) list.push("deserialization-rce");
   return list;
 }
 
@@ -925,7 +926,7 @@ export async function runBeat(opts: {
   // the Axiom still decides, and canonicalizeEndpoint records the win on the canonical
   // route. Fails soft — any error yields no leads and the normal loop proceeds.
   let sweepLeads = "";
-  if (engagement.deep.sweep) {
+  if (engagement.deep.enabled) {
     sweepLeads = await runDeepSweep({
       runner, workspace, scopeOrigins, canon: canonicalizeEndpoint,
       budget: engagement.deep.maxSweepRequests,

@@ -89,47 +89,38 @@ test("treats a whitespace-only numeric field as unset instead of silently coerci
 
 // ---- deep mode -----------------------------------------------------------------
 
-test("deep mode is OFF by default and every sub-flag is disabled", () => {
+test("deep mode is a single boolean, OFF by default, with weaponize off", () => {
   const e = loadEngagement(base, NOW);
   assert.equal(e.deep.enabled, false);
-  assert.equal(e.deep.sweep, false);
-  assert.equal(e.deep.fuzz, false);
-  assert.equal(e.deep.escalate, false);
-  assert.equal(e.deep.weaponize, "off");
+  assert.equal(e.deep.weaponize, false);
   assert.equal(e.deep.weaponizeAuthRef, null);
 });
 
-test("enabling deep mode turns on sweep/fuzz/escalate by default, weaponize stays off", () => {
+test("enabling deep mode is the one switch for full depth; weaponize stays off", () => {
   const e = loadEngagement({ ...base, SAHW_DEEP_MODE: "true" }, NOW);
   assert.equal(e.deep.enabled, true);
-  assert.equal(e.deep.sweep, true);
-  assert.equal(e.deep.fuzz, true);
-  assert.equal(e.deep.escalate, true);
-  assert.equal(e.deep.weaponize, "off");
+  assert.equal(e.deep.weaponize, false);
 });
 
-test("a sub-flag set WITHOUT deep mode enabled is forced off (fail-closed)", () => {
-  const e = loadEngagement({ ...base, SAHW_DEEP_SWEEP: "true", SAHW_DEEP_WEAPONIZE: "impact" }, NOW);
+test("SAHW_DEEP_WEAPONIZE without deep mode enabled is forced off (fail-closed)", () => {
+  const e = loadEngagement({ ...base, SAHW_DEEP_WEAPONIZE: "true" }, NOW);
   assert.equal(e.deep.enabled, false);
-  assert.equal(e.deep.sweep, false);
-  assert.equal(e.deep.weaponize, "off");
+  assert.equal(e.deep.weaponize, false);
 });
 
 test("weaponize is REFUSED unless the signed auth ref is named a second time (double-confirm)", () => {
-  // deep on + weaponize impact but no matching auth ref -> ConfigError
   assert.throws(
-    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact" }, NOW),
+    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "true" }, NOW),
     ConfigError);
-  // wrong auth ref -> still refused
   assert.throws(
-    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact", SAHW_DEEP_WEAPONIZE_AUTH_REF: "WRONG" }, NOW),
+    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "true", SAHW_DEEP_WEAPONIZE_AUTH_REF: "WRONG" }, NOW),
     ConfigError);
 });
 
 test("weaponize is permitted only when SAHW_DEEP_WEAPONIZE_AUTH_REF exactly matches SAHW_AUTH_REF", () => {
   const e = loadEngagement(
-    { ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact", SAHW_DEEP_WEAPONIZE_AUTH_REF: "ENG-1" }, NOW);
-  assert.equal(e.deep.weaponize, "impact");
+    { ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "true", SAHW_DEEP_WEAPONIZE_AUTH_REF: "ENG-1" }, NOW);
+  assert.equal(e.deep.weaponize, true);
   assert.equal(e.deep.weaponizeAuthRef, "ENG-1");
 });
 

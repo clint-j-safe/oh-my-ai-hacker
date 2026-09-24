@@ -3,26 +3,22 @@ export class ConfigError extends Error {}
 /**
  * OPT-IN "deep mode" — thorough exploitation for an enterprise authorized engagement.
  *
- * Fail-safe OFF: when `enabled` is false, every sub-capability is forced off and
- * `weaponize` is "off", regardless of the individual SAHW_DEEP_* env vars — a partial
- * config can never half-arm depth. Deep mode is INDEPENDENT of `profile` (a prod
- * engagement may run shallow; a test engagement may run deep), so it gets its own object
- * rather than overloading the trace-tag profile.
+ * DELIBERATELY A SINGLE BOOLEAN, not a graded level: `enabled` is the one switch. OFF is
+ * the breadth-first default (one probe per turn, bank-and-move-on, attack skills gated
+ * out); ON turns on ALL the depth behaviours together — the systematic input×payload
+ * sweep, the fuzzer, escalation/chaining, and the widened attack-skill allowlist. Two
+ * extremes, no half-states to reason about. Independent of `profile` (a prod engagement
+ * may run shallow; a test one deep), so it is its own object, not the trace-tag profile.
  *
- * `weaponize` tiers:
- *   "off"    — detection/read-only proof only (the framework's historical safety model).
- *   "benign" — non-destructive impact demonstration (nonce round-trips, self-cleaning markers).
- *   "impact" — full controlled impact (RCE/shell/priv-esc), always reversible + audited.
- * Any tier other than "off" is gated behind an authorization DOUBLE-CONFIRM (see
- * loadDeepConfig): the caller must name the same signed SAHW_AUTH_REF a second time via
- * SAHW_DEEP_WEAPONIZE_AUTH_REF, so no single stray env var can arm weaponization.
+ * `weaponize` is a SEPARATE safety gate (also boolean), NOT folded into `enabled`: it is
+ * the destructive tier (controlled, reversible RCE/shell/priv-esc impact) and must never
+ * arm on a single flag. It requires deep mode ON *and* an authorization DOUBLE-CONFIRM
+ * (SAHW_DEEP_WEAPONIZE_AUTH_REF must equal SAHW_AUTH_REF); otherwise loadDeepConfig
+ * throws. Off by default even when deep mode is on.
  */
 export interface DeepConfig {
   enabled: boolean;
-  sweep: boolean;
-  fuzz: boolean;
-  escalate: boolean;
-  weaponize: "off" | "benign" | "impact";
+  weaponize: boolean;
   maxSweepRequests: number;
   maxEscalationDepth: number;
   weaponizeAuthRef: string | null;
@@ -80,40 +76,24 @@ function boolEnv(env: Env, key: string, fallback: boolean): boolean {
  */
 export function loadDeepConfig(env: Env, authRef: string): DeepConfig {
   const enabled = boolEnv(env, "SAHW_DEEP_MODE", false);
-  const disabled: DeepConfig = {
-    enabled: false, sweep: false, fuzz: false, escalate: false,
-    weaponize: "off",
-    maxSweepRequests: num(env, "SAHW_DEEP_SWEEP_BUDGET", 500),
-    maxEscalationDepth: num(env, "SAHW_DEEP_ESCALATION_DEPTH", 2),
-    weaponizeAuthRef: null,
-  };
-  if (!enabled) return disabled;
-
-  const wRaw = (env.SAHW_DEEP_WEAPONIZE ?? "off").trim().toLowerCase();
-  if (wRaw !== "off" && wRaw !== "benign" && wRaw !== "impact") {
-    throw new ConfigError(`SAHW_DEEP_WEAPONIZE must be "off", "benign" or "impact", got ${wRaw}`);
+  const maxSweepRequests = num(env, "SAHW_DEEP_SWEEP_BUDGET", 500);
+  const maxEscalationDepth = num(env, "SAHW_DEEP_ESCALATION_DEPTH", 2);
+  // Fail-closed: deep mode off forces weaponize off regardless of any SAHW_DEEP_WEAPONIZE.
+  if (!enabled) {
+    return { enabled: false, weaponize: false, maxSweepRequests, maxEscalationDepth, weaponizeAuthRef: null };
   }
-  const weaponize = wRaw as DeepConfig["weaponize"];
-  const weaponizeAuthRef = env.SAHW_DEEP_WEAPONIZE_AUTH_REF?.trim() || null;
 
+  const weaponize = boolEnv(env, "SAHW_DEEP_WEAPONIZE", false);
+  const weaponizeAuthRef = env.SAHW_DEEP_WEAPONIZE_AUTH_REF?.trim() || null;
   // DOUBLE-CONFIRM: weaponization requires deep mode on AND the same signed authorization
   // reference named a second time. This makes it impossible to arm with one stray var.
-  if (weaponize !== "off" && !(weaponizeAuthRef && weaponizeAuthRef === authRef)) {
+  if (weaponize && !(weaponizeAuthRef && weaponizeAuthRef === authRef)) {
     throw new ConfigError(
       "SAHW_DEEP_WEAPONIZE requires SAHW_DEEP_WEAPONIZE_AUTH_REF to exactly match SAHW_AUTH_REF " +
       "(a deliberate double-confirm of the client's signed authorization); weaponization stays off");
   }
 
-  return {
-    enabled: true,
-    sweep: boolEnv(env, "SAHW_DEEP_SWEEP", true),
-    fuzz: boolEnv(env, "SAHW_DEEP_FUZZ", true),
-    escalate: boolEnv(env, "SAHW_DEEP_ESCALATE", true),
-    weaponize,
-    maxSweepRequests: num(env, "SAHW_DEEP_SWEEP_BUDGET", 500),
-    maxEscalationDepth: num(env, "SAHW_DEEP_ESCALATION_DEPTH", 2),
-    weaponizeAuthRef,
-  };
+  return { enabled: true, weaponize, maxSweepRequests, maxEscalationDepth, weaponizeAuthRef };
 }
 
 function urls(raw: string | undefined, key: string): URL[] {
