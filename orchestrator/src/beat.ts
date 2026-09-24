@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import type { spawn } from "node:child_process";
-import { loadEngagement } from "./config.js";
+import { loadEngagement, type DeepConfig } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
 import type { SessionStore } from "./session.js";
@@ -45,6 +45,20 @@ export const HUNTER_SKILL_ALLOWLIST = [
   // fires them via http_request — cheap-probe-first, escalate-on-signal.
   "payload-library",
 ] as const;
+
+/**
+ * The skills a beat's hunter may invoke. Breadth-first (the default) is exactly
+ * HUNTER_SKILL_ALLOWLIST above. Deep mode widens it — but only in later phases, and only
+ * for skills that carry a declared metadata.egress-hosts the Tether can enforce (gate()
+ * denies an undeclared target skill regardless of this list). Phase A returns the base
+ * list unconditionally, so enabling deep mode changes nothing until the egress mechanism
+ * (Phase B) lands.
+ */
+export function allowlistFor(deep: DeepConfig): readonly string[] {
+  if (!deep.enabled) return HUNTER_SKILL_ALLOWLIST;
+  // Phase B will append discovery/attack skills here, gated by deep.sweep/escalate/weaponize.
+  return HUNTER_SKILL_ALLOWLIST;
+}
 
 export interface RejectedClaim {
   raw: unknown;
@@ -749,9 +763,10 @@ export async function runBeat(opts: {
 
   const workspace = opts.env.SAHW_WORKSPACE ?? ".";
   const store = new ArtifactStore(join(workspace, "artifacts"));
+  const skillAllowlist = allowlistFor(engagement.deep);
   const runner = new ToolRunner({
     engagement, store, fetchImpl: opts.fetchImpl, spawnImpl: opts.spawnImpl,
-    skillAllowlist: HUNTER_SKILL_ALLOWLIST,
+    skillAllowlist,
     // Both fall back to ToolRunner's own defaults (the repo's skills/ dir, 120s) when
     // unset — this only lets an env override reach the runner the same way
     // SAHW_SKILLS_ROOT / SAHW_SKILL_TIMEOUT_MS already do at the module level in
@@ -761,7 +776,7 @@ export async function runBeat(opts: {
     skillTimeoutMs: numEnv(opts.env, "SAHW_SKILL_TIMEOUT_MS", 120_000),
     sessionStore: opts.sessionStore,
   });
-  const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(HUNTER_SKILL_ALLOWLIST)];
+  const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(skillAllowlist)];
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), engagement.phaseTimeoutMs);

@@ -86,3 +86,62 @@ test("treats a whitespace-only numeric field as unset instead of silently coerci
   const e = loadEngagement({ ...base, SAHW_MAX_TURNS: "  " }, NOW);
   assert.equal(e.maxTurns, 40, "must fall back to the default, not Number(\" \") === 0");
 });
+
+// ---- deep mode -----------------------------------------------------------------
+
+test("deep mode is OFF by default and every sub-flag is disabled", () => {
+  const e = loadEngagement(base, NOW);
+  assert.equal(e.deep.enabled, false);
+  assert.equal(e.deep.sweep, false);
+  assert.equal(e.deep.fuzz, false);
+  assert.equal(e.deep.escalate, false);
+  assert.equal(e.deep.weaponize, "off");
+  assert.equal(e.deep.weaponizeAuthRef, null);
+});
+
+test("enabling deep mode turns on sweep/fuzz/escalate by default, weaponize stays off", () => {
+  const e = loadEngagement({ ...base, SAHW_DEEP_MODE: "true" }, NOW);
+  assert.equal(e.deep.enabled, true);
+  assert.equal(e.deep.sweep, true);
+  assert.equal(e.deep.fuzz, true);
+  assert.equal(e.deep.escalate, true);
+  assert.equal(e.deep.weaponize, "off");
+});
+
+test("a sub-flag set WITHOUT deep mode enabled is forced off (fail-closed)", () => {
+  const e = loadEngagement({ ...base, SAHW_DEEP_SWEEP: "true", SAHW_DEEP_WEAPONIZE: "impact" }, NOW);
+  assert.equal(e.deep.enabled, false);
+  assert.equal(e.deep.sweep, false);
+  assert.equal(e.deep.weaponize, "off");
+});
+
+test("weaponize is REFUSED unless the signed auth ref is named a second time (double-confirm)", () => {
+  // deep on + weaponize impact but no matching auth ref -> ConfigError
+  assert.throws(
+    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact" }, NOW),
+    ConfigError);
+  // wrong auth ref -> still refused
+  assert.throws(
+    () => loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact", SAHW_DEEP_WEAPONIZE_AUTH_REF: "WRONG" }, NOW),
+    ConfigError);
+});
+
+test("weaponize is permitted only when SAHW_DEEP_WEAPONIZE_AUTH_REF exactly matches SAHW_AUTH_REF", () => {
+  const e = loadEngagement(
+    { ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_WEAPONIZE: "impact", SAHW_DEEP_WEAPONIZE_AUTH_REF: "ENG-1" }, NOW);
+  assert.equal(e.deep.weaponize, "impact");
+  assert.equal(e.deep.weaponizeAuthRef, "ENG-1");
+});
+
+test("deep caps default sensibly and accept overrides", () => {
+  const d = loadEngagement({ ...base, SAHW_DEEP_MODE: "1" }, NOW).deep;
+  assert.equal(d.maxSweepRequests, 500);
+  assert.equal(d.maxEscalationDepth, 2);
+  const o = loadEngagement({ ...base, SAHW_DEEP_MODE: "1", SAHW_DEEP_SWEEP_BUDGET: "1200", SAHW_DEEP_ESCALATION_DEPTH: "4" }, NOW).deep;
+  assert.equal(o.maxSweepRequests, 1200);
+  assert.equal(o.maxEscalationDepth, 4);
+});
+
+test("a malformed deep boolean throws rather than silently defaulting", () => {
+  assert.throws(() => loadEngagement({ ...base, SAHW_DEEP_MODE: "maybe" }, NOW), ConfigError);
+});
