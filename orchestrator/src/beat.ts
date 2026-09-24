@@ -56,8 +56,19 @@ export const HUNTER_SKILL_ALLOWLIST = [
  */
 export function allowlistFor(deep: DeepConfig): readonly string[] {
   if (!deep.enabled) return HUNTER_SKILL_ALLOWLIST;
-  // Phase B will append discovery/attack skills here, gated by deep.sweep/escalate/weaponize.
-  return HUNTER_SKILL_ALLOWLIST;
+  const list: string[] = [...HUNTER_SKILL_ALLOWLIST];
+  // Discovery + attack skills unlocked in deep mode. Each is still gated at run time by
+  // the Tether (allowlist + in-scope-URL check + declared-egress narrowing + sandbox),
+  // so listing one here only makes it REACHABLE, never unconditionally permitted.
+  list.push(
+    "intelligent-crawling", "tech-fingerprinting", "payload-mutator", "waf-evasion-mastery",
+    "xss-dom-sinks", "sqli-database-injection", "injection-battery-xxe-ssti-nosql",
+    "ssrf-internal-pivot", "file-upload-path-traversal", "oob-blind-vuln-correlation",
+    "privilege-matrix-mapping", "account-role-acquisition", "poc-hardening-self-verification",
+  );
+  if (deep.escalate) list.push("chain-construction", "technique-combinator");
+  if (deep.weaponize !== "off") list.push("deserialization-rce");
+  return list;
 }
 
 export interface RejectedClaim {

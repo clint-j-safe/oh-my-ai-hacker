@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import type { Engagement } from "./config.js";
 import { gate, SKILL_EGRESS, type SkillEgress, type Decision } from "./tether.js";
+import { readSkillEgressHosts } from "./skill-meta.js";
 import { ArtifactStore, type Artifact } from "./artifacts.js";
 import {
   SessionStore, SessionCapError, generateDisposableCredentials, type SessionMeta,
@@ -831,8 +832,14 @@ export class ToolRunner {
    * are deterministic and pure, so there is no risk of the audit record and the real
    * enforcement decision diverging. */
   checkGate(tool: string, args: Record<string, unknown>): Decision {
-    return gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress);
+    return gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress, this.egressHostsFor);
   }
+
+  /** Resolves a skill's declared egress-hosts from its SKILL.md (fail-closed to null),
+   * bound to this runner's skillsRoot. Passed to gate() so declared-egress narrowing is
+   * enforced without gate() doing any file I/O of its own. */
+  private readonly egressHostsFor = (skill: string): readonly string[] | null =>
+    readSkillEgressHosts(this.skillsRoot, skill);
 
   async execute(tool: string, args: Record<string, unknown>): Promise<ToolResult> {
     if (tool === "skill_run") {
@@ -845,7 +852,7 @@ export class ToolRunner {
       if (!shape.ok) return { ok: false, kind: "invalid_argument", denied: shape.reason };
     }
 
-    const decision = gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress);
+    const decision = gate(this.engagement, tool, args, this.skillAllowlist, this.skillEgress, this.egressHostsFor);
     if (!decision.allow) return { ok: false, kind: "policy", denied: decision.reason };
 
     try {

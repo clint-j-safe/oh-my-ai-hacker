@@ -306,6 +306,12 @@ export function gate(
   // overridable so tests can register a fixture skill's classification without
   // mutating the production registry.
   skillEgress: Readonly<Record<string, SkillEgress>> = SKILL_EGRESS,
+  // DECLARED per-host egress resolver (see skill-meta.ts). Returns a skill's declared
+  // egress-hosts, or null when it declares none. Default resolves to null for every
+  // skill → the historical in-scope-only gate is unchanged. When a skill DOES declare
+  // hosts, every URL the caller hands it must resolve to one of them (defence in depth
+  // on top of the in-scope check). This is additive: an undeclared skill is NOT denied.
+  egressHosts: (skill: string) => readonly string[] | null = () => null,
 ): Decision {
   if (!KNOWN_TOOLS.has(tool)) return deny(`unknown tool: ${tool}`);
   if (tool === "http_request") {
@@ -364,6 +370,24 @@ export function gate(
     for (const u of inputUrls) {
       const d = inScope(e, u);
       if (!d.allow) return d;
+    }
+    // Additive DECLARED-egress narrowing: if the skill declares egress-hosts, every URL
+    // it is handed must resolve to one of them (they must ALSO be in scope, enforced
+    // above). A skill that declares nothing is unaffected — the in-scope gate stands alone.
+    const declared = egressHosts(skillName);
+    if (declared && declared.length) {
+      const allowedHosts = new Set(declared.map((h) => h.trim().toLowerCase()).filter(Boolean));
+      for (const u of inputUrls) {
+        let parsed: URL;
+        try { parsed = new URL(u); } catch { return deny(`not a URL in skill input: ${u}`); }
+        const host = parsed.hostname.toLowerCase();
+        const hostPortTok = `${host}:${parsed.port || (parsed.protocol === "https:" ? "443" : "80")}`;
+        if (!allowedHosts.has(host) && !allowedHosts.has(hostPortTok) && !allowedHosts.has(parsed.host.toLowerCase())) {
+          return deny(
+            `skill ${JSON.stringify(skillName)} may only egress to its declared hosts ` +
+            `(${declared.join(", ")}); refusing ${host}`);
+        }
+      }
     }
     return ALLOW;
   }

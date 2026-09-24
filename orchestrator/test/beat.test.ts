@@ -6,7 +6,25 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor, allowlistFor, HUNTER_SKILL_ALLOWLIST } from "../src/beat.js";
+import type { DeepConfig } from "../src/config.js";
+
+const OFF_DEEP: DeepConfig = { enabled: false, sweep: false, fuzz: false, escalate: false, weaponize: "off", maxSweepRequests: 500, maxEscalationDepth: 2, weaponizeAuthRef: null };
+
+test("allowlistFor returns exactly the base 3 skills when deep mode is off", () => {
+  assert.deepEqual([...allowlistFor(OFF_DEEP)], [...HUNTER_SKILL_ALLOWLIST]);
+});
+
+test("allowlistFor widens to the attack/discovery skills in deep mode, gated by sub-flags", () => {
+  const base = allowlistFor({ ...OFF_DEEP, enabled: true, escalate: false, weaponize: "off" });
+  assert.ok(base.includes("sqli-database-injection") && base.includes("xss-dom-sinks"));
+  assert.ok(!base.includes("chain-construction"), "escalate off -> no chain skills");
+  assert.ok(!base.includes("deserialization-rce"), "weaponize off -> no deserialization-rce");
+  const esc = allowlistFor({ ...OFF_DEEP, enabled: true, escalate: true, weaponize: "off" });
+  assert.ok(esc.includes("chain-construction") && esc.includes("technique-combinator"));
+  const wep = allowlistFor({ ...OFF_DEEP, enabled: true, escalate: true, weaponize: "impact", weaponizeAuthRef: "ENG-1" });
+  assert.ok(wep.includes("deserialization-rce"));
+});
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
