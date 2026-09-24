@@ -1,4 +1,5 @@
 import { VULN_CLASSES, type VulnClass } from "./vuln-classes.js";
+import { collapseRepeatedRuns } from "./spine.js";
 import type { AttemptedEntry, ProvedEntry, RecoveredIntel, SpineEndpoint } from "./spine.js";
 
 /**
@@ -295,6 +296,14 @@ const EVIDENCE_DISCIPLINE = [
   "  info_disclosure      -> response_asserted when the leak is a server/version",
   "                         BANNER or header (Server, X-Powered-By); body_contains",
   "                         when it is leaked CONTENT/source/an error page.",
+  "                         ANTI-SPAM: a banner/header that is present PLATFORM-WIDE",
+  "                         is ONE finding, not one per route — do NOT bank the same",
+  "                         header assertion on many endpoints (it wastes the beat and",
+  "                         scores nothing extra). The info_disclosure worth chasing is",
+  "                         CONTENT you have not already leaked: a framework",
+  "                         DEBUG/STACK-TRACE page from a malformed or missing-param",
+  "                         request (body_contains the backtrace/absolute paths) — a",
+  "                         different, higher-value leak than a header.",
   "  disposable_email_accepted / weak_password_policy -> body_contains on the",
   "                         signup/change response's success code for the",
   "                         disallowed value.",
@@ -349,8 +358,14 @@ const TOOL_GUIDANCE = [
 ].join("\n");
 
 const OUTPUT_CONTRACT = [
-  "When you can state a concrete violated invariant, end your turn with a JSON",
-  'object: {"vuln_class","endpoint","control_url","invariant":{"statement","type","expression"}}',
+  "When you can state a concrete violated invariant, BANK IT BY CALLING THE",
+  "`submit_finding` TOOL — do not merely describe the finding in prose, and do not",
+  "keep exploring once you have the evidence. The tool call IS the claim; the",
+  "verifier replays it and rules on it, then asks you for the NEXT, different",
+  "finding. Its arguments are exactly the claim fields below:",
+  '{"vuln_class","endpoint","control_url"?,"invariant":{"statement","type","expression"}}',
+  "(a JSON object in your message content is still accepted as a fallback, but the",
+  "tool call is the reliable path — prefer it).",
   "",
   "Optionally, on ANY claim (whatever its eventual verdict), attach durable recon",
   'facts you have recovered as a plain "intel" object of string/boolean values,',
@@ -368,6 +383,16 @@ const OUTPUT_CONTRACT = [
   "resulting responses become the evidence your invariant is proved or",
   'disproved from. A "derived" claim instead carries "derived_input": the typed',
   "input object the SELECTED deriver needs (see invariant.type below).",
+  "",
+  "For a body_contains or status_in proof whose trigger lives in a NON-GET request",
+  "(a signup/login/reset/transfer POST — e.g. a 1-character password, a disposable",
+  "email, a negative amount, a missing-parameter body), the verifier replays your",
+  "endpoint as a bare GET UNLESS you attach the exact request. Provide it as",
+  '"request":{"method":"POST","headers":{...}?,"body":"..."} for the exploit, and',
+  '"control_request":{"method":"POST","body":"..."} for the control_url (the benign',
+  "variant). Without these, a POST-only finding CANNOT be reproduced and your claim",
+  "will be rejected even though the behaviour is real. Match the client's real",
+  "envelope (method, content-type, body shape) recovered from the app's own source.",
   "",
   "endpoint, control_url and each entry in `steps` may also carry an optional",
   '"session" label (e.g. "B") from a prior register_account call, so the PROOF',
@@ -418,6 +443,15 @@ const OUTPUT_CONTRACT = [
   "                      field:<a.b.c>;from:<x>;to:<y>; mutations needing undo",
   "                      require restoration evidence or the verdict stays",
   "                      NEEDS_REVIEW.",
+  "                      COMPLETENESS: the success MESSAGE alone is body_contains, NOT",
+  "                      state_changed. To prove a real state change your `steps` MUST",
+  "                      include a FOLLOW-UP request that OBSERVES the new state: after a",
+  "                      password change/reset, a LOGIN with the NEW password (success =",
+  "                      the change took effect); after a transfer, a re-read of the",
+  "                      BALANCE (delta = it moved); after a stored write, a fetch of the",
+  "                      endpoint that renders it. A claim you want scored as the stronger",
+  "                      state_changed but proven only by the first response is only",
+  "                      PARTIAL — add the observation step.",
   '  "state_violated"    provide ordered `steps`; expression single_use:<marker>',
   "                      (>=2 steps) or lockout_absent:<status> (>=5 steps).",
   '  "file_created_then_deleted" provide exactly 3 ordered `steps`',
@@ -471,6 +505,14 @@ const BUDGET_GUIDANCE = [
   "stop.",
 ].join("\n");
 
+// Display bounds for the attack surface. These are DISPLAY-only — they shape the
+// rendered brief, never what the Spine stores or what gets replayed — so they are safe
+// to set generously. The Spine already clips degenerate repeated-char runs on write
+// (collapseRepeatedRuns), applied again here defensively so a spine loaded before that
+// fix shipped still renders lean this beat.
+const ATTACK_SURFACE_CAP = 80;      // endpoints shown; the rest summarised in a note
+const ATTACK_SURFACE_URL_CAP = 2000; // per-URL char cap, far above any legitimate URL
+
 function renderAttackSurface(endpoints: SpineEndpoint[]): string {
   if (endpoints.length === 0) {
     return [
@@ -480,12 +522,19 @@ function renderAttackSurface(endpoints: SpineEndpoint[]): string {
       "  from what you find — before probing anything.",
     ].join("\n");
   }
-  return endpoints
-    .map((e) => tag("endpoint", {
-      url: e.url, method: e.method, status: e.status ?? undefined,
-      content_type: e.content_type ?? undefined, semantic_role: e.semantic_role,
-    }, e.notes))
-    .join("\n");
+  const shown = endpoints.slice(0, ATTACK_SURFACE_CAP);
+  const boundUrl = (u: string) => {
+    const c = collapseRepeatedRuns(u);
+    return c.length > ATTACK_SURFACE_URL_CAP ? `${c.slice(0, ATTACK_SURFACE_URL_CAP)}…` : c;
+  };
+  const lines = shown.map((e) => tag("endpoint", {
+    url: boundUrl(e.url), method: e.method, status: e.status ?? undefined,
+    content_type: e.content_type ?? undefined, semantic_role: e.semantic_role,
+  }, e.notes));
+  if (endpoints.length > shown.length) {
+    lines.push(`  <note>+${endpoints.length - shown.length} more mapped endpoints omitted to keep this brief lean; recover any you need with grep_artifact</note>`);
+  }
+  return lines.join("\n");
 }
 
 function renderRecoveredIntel(intel: RecoveredIntel): string {
@@ -523,7 +572,7 @@ function renderRecoveredIntel(intel: RecoveredIntel): string {
  * grey-box, not answer-key) fixes that. Static assets are stripped (behaviour lives
  * on API routes, not .js/.map/etc).
  */
-function renderCanonicalTargets(intel: RecoveredIntel): string {
+function renderCanonicalTargets(intel: RecoveredIntel, proved: ProvedEntry[] = []): string {
   const text = Object.entries(intel)
     .filter(([k, v]) => typeof v === "string"
       && (k === "api_route_table" || /_route$|_routes$|route_table/i.test(k)))
@@ -548,13 +597,54 @@ function renderCanonicalTargets(intel: RecoveredIntel): string {
       "  every later probe becomes precise.",
     ].join("\n");
   }
+  // Cross-reference each recovered route against endpoints already proved (spine),
+  // so the hunter can SEE which of the app's own routes it has never landed a finding
+  // on. A route counts as tested if any proved finding's path equals it or nests under
+  // it. This is derived only from the app's own route table + what you have proved —
+  // it names no vulnerability and no expected result, it just stops you re-hitting the
+  // one route you already cracked while whole routes sit untouched.
+  // Map each recovered route to the SET of vuln_classes already proved on it, so the
+  // hunter sees not just "has a finding" but WHICH classes are done there — a route
+  // with an RCE may still hide business_logic, stored-xss, an auth flaw, etc. under a
+  // DIFFERENT class. Recon (route table) + spine (proved) only; no answer key.
+  const classesByPath = new Map<string, Set<string>>();
+  for (const p of proved) {
+    let path = "";
+    try { path = new URL(p.endpoint).pathname.replace(/\/index(?:\.php)?\/?$/i, "").replace(/\/$/, ""); } catch { continue; }
+    if (!path) continue;
+    (classesByPath.get(path) ?? classesByPath.set(path, new Set()).get(path)!).add(p.vuln_class);
+  }
+  const provedClassesFor = (route: string): string[] => {
+    const r = route.split("?")[0].replace(/\/$/, "");
+    const acc = new Set<string>();
+    for (const [pp, cs] of classesByPath) {
+      if (pp === r || pp.startsWith(r + "/") || r.startsWith(pp + "/")) for (const c of cs) acc.add(c);
+    }
+    return [...acc].sort();
+  };
+  const untestedRoutes = paths.filter((p) => provedClassesFor(p).length === 0);
   return [
     "  The app's OWN CANONICAL routes, recovered from its source/route table (via a",
     "  disclosure you already hold). TARGET THESE EXACT PATHS — do NOT append",
     "  sub-segments (/x/index, /x/aa) or invent variants; a finding is scored on the",
-    "  canonical path and the app routes variants to the same handler anyway. Test",
-    "  each relevant vuln_class against the applicable routes here:",
-    ...paths.map((p) => `    ${p}`),
+    "  canonical path and the app routes variants to the same handler anyway.",
+    "",
+    "  COVERAGE is per (route × vuln_class), NOT per route. Each line shows the",
+    "  class(es) ALREADY proved on that route; EVERY OTHER class is still open there.",
+    "  A route that already has one finding very often hides MORE under a different",
+    "  class — the SAME loan/transfer/upload handler that took an RCE or an injection",
+    "  can also have business_logic (out-of-range/negative/wrong-type accepted),",
+    "  stored xss (a persisted field rendered back), or an auth/validation flaw. So do",
+    "  NOT skip a route because it shows a class — ask 'what OTHER class could this",
+    "  handler exhibit?' and probe that. [none] = no finding yet; start there, but do",
+    "  not stop there.",
+    ...paths.map((p) => {
+      const cs = provedClassesFor(p);
+      return `    ${p}  — proved: ${cs.length ? cs.join(", ") : "[none]"}`;
+    }),
+    untestedRoutes.length
+      ? `  → ${untestedRoutes.length} route(s) with NO finding yet: ${untestedRoutes.join(", ")}`
+      : "  → every route has ≥1 finding; now hunt OTHER classes on each (per-class coverage).",
   ].join("\n");
 }
 
@@ -597,7 +687,28 @@ function renderCoverageGoal(proved: ProvedEntry[]): string {
   return [
     "  Your objective is COVERAGE of distinct FINDINGS, scored per",
     "  (vuln_class, endpoint): every vuln_class that is present, on every distinct",
-    "  endpoint where it manifests. Prioritise in this order:",
+    "  endpoint where it manifests.",
+    "",
+    "  SOURCE LOCATES, HTTP PROVES. If you hold a shell or file-read primitive, use it to",
+    "  FIND a weakness (a missing check, a reachable route, a mishandled parameter) — then",
+    "  immediately PROVE it by sending the actual exploit REQUEST with http_request and",
+    "  calling submit_finding. Reading source is NOT a proof and scores nothing: every",
+    "  invariant is evaluated against the app's own HTTP RESPONSE (body_contains,",
+    "  status_in, state_changed, ...). The instant the source shows you a route/param is",
+    "  vulnerable, STOP reading and send the request that demonstrates it. Do not spend a",
+    "  beat grepping code without banking a finding.",
+    "",
+    "  CHEAP WINS FIRST — DO NOT TUNNEL. A confirmed finding counts the same whether it",
+    "  took one request or ten. Before investing a long multi-step setup (decoding",
+    "  sessions, reading source, mapping accounts) into ONE hard proof, first BANK every",
+    "  finding you can prove with little setup — a single malformed/wrong-type/negative",
+    "  POST that is wrongly accepted, a GET of an unlinked route or shipped .map file, a",
+    "  debug/stack-trace page from a bad request. submit_finding each of those NOW, then",
+    "  spend the rest of the beat on the expensive chains. A beat that ends with zero",
+    "  banked because you spent all of it setting up one auth_bypass proof is the",
+    "  failure to avoid: commit the cheap ones, THEN grind.",
+    "",
+    "  Prioritise in this order:",
     "    1. OPEN classes below — a class not yet proved ANYWHERE is the highest",
     "       value; prove each at least once.",
     "    2. A proved class on a NEW endpoint — many classes recur across the app",
@@ -614,6 +725,67 @@ function renderCoverageGoal(proved: ProvedEntry[]): string {
     `  OPEN classes — ${openClasses.length}/${VULN_CLASSES.length}, prove each at least once: ${openClasses.length ? openClasses.join(", ") : "none — now widen every proved class to its OTHER endpoints"}`,
     `  ALREADY BANKED (class @ endpoint) — do not repeat these exact pairs, but DO pursue the same classes on other endpoints: ${provedPairs.length ? provedPairs.join("; ") : "none yet"}`,
   ].join("\n");
+}
+
+/** How a human tester ACTUALLY elicits each class black-box — a generic
+ * methodology keyed by vuln_class, NOT an app-specific path or a canned exploit.
+ * The concrete route to test always comes from <attack_surface>/<canonical_targets>;
+ * this only says what BEHAVIOUR to provoke and which invariant proves it. Rendered
+ * for the classes still worth pursuing so an open class never stalls for want of a
+ * method. */
+const HUMAN_PROBES: Partial<Record<VulnClass, string>> = {
+  insecure_transport:
+    "attempt a TLS handshake on the target's port 443; if it refuses/times out while every in-scope URL is plaintext HTTP, that IS the finding — emit a `derived` claim, expression `tls_unavailable` (no request body needed).",
+  weak_password_policy:
+    "register a NEW account with a 1-character password; if signup is accepted AND that account then authenticates, bank it (`body_contains` the success/login code).",
+  disposable_email_accepted:
+    "register with a disposable-domain address (e.g. someone@mailinator.com); if signup succeeds, bank it (`body_contains` the signup-success code).",
+  xss_stored:
+    "PROVE IT THROUGH THE APP, NOT YOUR SHELL. Find a create/submit endpoint that PERSISTS user input and its paired list/view endpoint that DISPLAYS that input back (an apply→list, post→thread, create→detail, profile-edit→profile-view pair — the route table names both). Steps: [authenticated POST to the create endpoint with a `<script>`/HTML payload in a stored field — try the serialized/nested fields too, not just obvious text], then [GET/POST the view endpoint]; `body_contains` the UNESCAPED payload in that view response. ABSOLUTELY DO NOT prove this by writing a file with your RCE/shell and reading it via a file-read primitive (e.g. /api/show?file=…): that proves file-write, is a non-canonical dead end, and scores NOTHING. The finding is the APPLICATION echoing your stored payload unescaped from its own data store.",
+  improper_session_invalidation:
+    "obtain a valid token, change that account's password via its change endpoint, then replay the OLD token against an authenticated endpoint; if it still authenticates, that's `state_violated` (old token should have been revoked).",
+  ssrf:
+    "submit a server-fetched URL (a field like avatar/image/callback) pointing once at a reachable host and once at an unreachable one; a consistent reachable-vs-unreachable response difference is a blind boolean-oracle SSRF (`body_contains` the distinguishing code) — do NOT require an out-of-band callback.",
+  auth_bypass:
+    "attack multi-step and credential-change flows for a MISSING check. Two distinct findings, each proved with ORDERED `steps` that END IN A LOGIN that observes the change: (a) a password CHANGE accepted with a WRONG current/old password — steps: [change with wrong old + new pw], [login with the NEW pw] → `state_changed`, expression appeared:<login-success-code>; NOT body_contains of the change response alone (that only scores PARTIAL). (b) a password-RESET chain (forgot → verify → reset) that never demands a secondary factor (email/OTP/DOB/security-question) before letting you set a new password — steps culminating in [login with the attacker-set pw]. If the chain issues/accepts the reset with NO identity factor beyond a guessable/enumerable one, that ABSENCE is itself the finding; capture the full chain's requests as `steps` and state the missing-factor invariant.",
+  business_logic:
+    "submit out-of-range / negative / wrong-type / boundary values wherever a validation or authorization check SHOULD reject; if the request is accepted that's `body_contains` the acceptance, and if the value moves server-side state in your favour (a balance, a quota, a status) that's `state_changed`. Let the target's own parameter contracts tell you which fields to abuse.",
+  rate_limit_absence:
+    "repeat an authentication or verification action past whatever attempt limit the target itself documents or implies; a lockout counter that should trip but keeps accepting — or resets when the challenge is re-issued — is the finding (`status_in` the still-accepted responses, or `state_violated` if you can show the counter itself is defeated).",
+  info_disclosure:
+    "send malformed or missing-parameter requests to API routes; a framework debug/stack-trace page with absolute paths or a backtrace is the finding (`body_contains` the leaked internals).",
+  forced_browsing:
+    "request undocumented/debug routes and shipped source maps (e.g. a `.map` under the SPA's static dir, an admin/debug path); a 200 on an unlinked resource is the finding (`status_in`).",
+};
+
+function renderRemainingTargets(proved: ProvedEntry[]): string {
+  const provedSet = new Set(
+    proved.map((p) => p.vuln_class).filter((v) => (VULN_CLASSES as readonly string[]).includes(v)),
+  );
+  const open = VULN_CLASSES.filter((v) => !provedSet.has(v) && HUMAN_PROBES[v as VulnClass]);
+  // Recurring classes that commonly hide MORE findings on other endpoints/invariants
+  // even after one proof — keep their method in view for the widen phase.
+  const recurring: VulnClass[] = (["info_disclosure", "forced_browsing", "business_logic", "rate_limit_absence", "auth_bypass"] as VulnClass[])
+    .filter((v) => provedSet.has(v));
+  const lines: string[] = [
+    "  HOW A HUMAN FINDS WHAT'S LEFT — the exact behaviour to provoke per class.",
+    "  The ROUTE to test comes from <attack_surface>/<canonical_targets>; this is the",
+    "  method, not a path. Work the PRIORITY list first.",
+    "",
+  ];
+  if (open.length) {
+    lines.push("  PRIORITY (open classes — not yet proved anywhere):");
+    for (const c of open) lines.push(`    - ${c}: ${HUMAN_PROBES[c as VulnClass]}`);
+  } else {
+    lines.push("  No open classes remain — every method below is for WIDENING a proved");
+    lines.push("  class to a NEW endpoint/invariant it also manifests on.");
+  }
+  if (recurring.length) {
+    lines.push("");
+    lines.push("  WIDEN (already proved once, but recurs — hunt these on OTHER endpoints):");
+    for (const c of recurring) lines.push(`    - ${c}: ${HUMAN_PROBES[c as VulnClass]}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -716,6 +888,81 @@ function renderDeadEnds(attempted: AttemptedEntry[]): string {
     .join("\n");
 }
 
+/** Collect the distinct scheme://host[:port] origins that appear anywhere in the
+ * brief's state (attack surface, proved, attempted, recovered intel), most-frequent
+ * first. The most frequent is the PRIMARY (API) base; the rest get short aliases. This
+ * is how the brief avoids re-sending the full origin on every one of ~40-60 URLs each
+ * beat — it states the base(s) ONCE and renders everything relative. */
+export function deriveOrigins(state: HunterBriefState): string[] {
+  const blob = [
+    ...state.attackSurface.map((e) => e.url),
+    ...state.proved.map((p) => p.endpoint),
+    ...state.attempted.map((a) => a.endpoint),
+    ...Object.values(state.recoveredIntel).map((v) => (typeof v === "string" ? v : "")),
+  ].join(" ");
+  const counts = new Map<string, number>();
+  for (const m of blob.matchAll(/https?:\/\/[^/\s"'<>]+/g)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+  // most frequent first; ties broken by longest (so a :port origin isn't shadowed)
+  return [...counts.keys()].sort((a, b) => (counts.get(b)! - counts.get(a)!) || (b.length - a.length));
+}
+
+/** A short alias for a non-primary origin — its port if it has one (`[:3000]`), else
+ * `[o2]`, `[o3]`… Used both when rendering (origin -> alias) and resolving (alias ->
+ * origin) so the round-trip is lossless. */
+function originAlias(origin: string, index: number): string {
+  const port = origin.match(/:(\d+)$/);
+  return port ? `[:${port[1]}]` : `[o${index + 1}]`;
+}
+
+/** INVERSE of relativization: turn an endpoint the model emitted relative to the
+ * target base back into an absolute in-scope URL, using the SAME origin list + alias
+ * scheme the brief showed it. Absolute URLs pass through unchanged. Unresolvable input
+ * is returned as-is (the Tether/Axiom then reject it, never a scope bypass). Callers
+ * pass the SAME origins the brief was built from (deriveOrigins(state)) so the mapping
+ * is consistent per beat. */
+export function resolveRelativeEndpoint(raw: string, origins: string[]): string {
+  if (typeof raw !== "string") return raw;
+  const s = raw.trim();
+  if (/^https?:\/\//i.test(s)) return s;                  // already absolute
+  if (origins.length === 0) return s;                     // no base known yet
+  // alias-prefixed: [:PORT]/path or [oN]/path
+  const aliased = s.match(/^(\[:\d+\]|\[o\d+\])(\/.*|$)/);
+  if (aliased) {
+    const alias = aliased[1];
+    for (let i = 1; i < origins.length; i++) {
+      if (originAlias(origins[i], i) === alias) return origins[i] + (aliased[2] || "/");
+    }
+    return s;                                             // unknown alias -> leave (rejected downstream)
+  }
+  if (s.startsWith("/")) return origins[0] + s;           // bare path -> primary base
+  return s;
+}
+
+function renderTarget(origins: string[]): string {
+  if (origins.length === 0) {
+    return "  EMPTY. No target origin recovered yet — banner the in-scope host(s) first (see <opening_move>).";
+  }
+  const lines = [
+    "  URLs below are RELATIVE to the target base to keep this brief lean. Resolve them:",
+    `    BASE (primary) = ${origins[0]}   — a leading '/path' means ${origins[0]}/path`,
+  ];
+  origins.slice(1).forEach((o, i) => lines.push(`    ${originAlias(o, i + 1)} = ${o}   — a leading '${originAlias(o, i + 1)}/path' means ${o}/path`));
+  lines.push("  In your claims you MAY emit endpoints relative (they resolve against these) OR absolute — both work.");
+  return lines.join("\n");
+}
+
+/** Rewrite every absolute in-scope URL in the assembled brief to its relative form:
+ * the primary origin drops to '', each other origin to its alias. Longest origins are
+ * replaced first so a `:port` origin is not clobbered by its base as a prefix. */
+function relativizeBrief(xml: string, origins: string[]): string {
+  let out = xml;
+  const ordered = origins
+    .map((o, i) => ({ o, rep: i === 0 ? "" : originAlias(o, i) }))
+    .sort((a, b) => b.o.length - a.o.length); // longest first
+  for (const { o, rep } of ordered) out = out.split(o).join(rep);
+  return out;
+}
+
 export function buildHunterBrief(state: HunterBriefState): string {
   const sections = [
     `<system_identity>\n${SYSTEM_IDENTITY}\n</system_identity>`,
@@ -723,9 +970,11 @@ export function buildHunterBrief(state: HunterBriefState): string {
     `<opening_move>\n${OPENING_MOVE}\n</opening_move>`,
     `<attack_surface>\n${renderAttackSurface(state.attackSurface)}\n</attack_surface>`,
     `<recovered_intel>\n${renderRecoveredIntel(state.recoveredIntel)}\n</recovered_intel>`,
-    `<canonical_targets>\n${renderCanonicalTargets(state.recoveredIntel)}\n</canonical_targets>`,
+    `<target>\n${renderTarget(deriveOrigins(state))}\n</target>`,
+    `<canonical_targets>\n${renderCanonicalTargets(state.recoveredIntel, state.proved)}\n</canonical_targets>`,
     `<already_proved>\n${renderAlreadyProved(state.proved)}\n</already_proved>`,
     `<coverage_goal>\n${renderCoverageGoal(state.proved)}\n</coverage_goal>`,
+    `<remaining_targets>\n${renderRemainingTargets(state.proved)}\n</remaining_targets>`,
     `<account_objective>\n${renderAccountObjective(state.sessionsCount ?? 0, state.proved)}\n</account_objective>`,
     `<dead_ends>\n${renderDeadEnds(state.attempted)}\n</dead_ends>`,
     `<thinking_framework>\n${THINKING_FRAMEWORK}\n</thinking_framework>`,
@@ -742,5 +991,18 @@ export function buildHunterBrief(state: HunterBriefState): string {
       "</budget>",
     ].join("\n"),
   ];
-  return `<safe_ai_hacker_hunter>\n${sections.join("\n")}\n</safe_ai_hacker_hunter>`;
+  // Render everything, THEN collapse the target origin(s) to relative form. The
+  // <target> block (added above) states the base once; relativizeBrief strips it from
+  // every URL so the origin isn't re-sent ~40-60 times per beat. The primary origin is
+  // kept intact inside <target> itself (it must survive as the resolution key), so
+  // relativize the other sections and re-inject the target block verbatim.
+  const origins = deriveOrigins(state);
+  const assembled = `<safe_ai_hacker_hunter>\n${sections.join("\n")}\n</safe_ai_hacker_hunter>`;
+  if (origins.length === 0) return assembled;             // beat 1: nothing to relativize
+  const targetBlock = `<target>\n${renderTarget(origins)}\n</target>`;
+  // Relativize the whole doc, then restore the <target> block (which must keep the
+  // literal origins as the legend). Split on the block so the legend is untouched.
+  const relativized = relativizeBrief(assembled, origins);
+  const relTargetBlock = relativizeBrief(targetBlock, origins);
+  return relativized.replace(relTargetBlock, targetBlock);
 }

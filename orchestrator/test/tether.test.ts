@@ -203,3 +203,11 @@ test("denies a semicolon-chained IFS dd glued to a URL with no space", () => {
     false,
   );
 });
+
+test("submit_finding is a known, unconditionally-allowed control-plane tool (no network gating)", () => {
+  assert.equal(gate(E, "submit_finding", { vuln_class: "sqli", endpoint: "http://10.0.0.1:3000/x", invariant: { type: "body_contains" } }).allow, true);
+  // even with an out-of-scope-looking string in a field, it is not a network action → allowed
+  assert.equal(gate(E, "submit_finding", { endpoint: "http://10.0.0.99/x" }).allow, true);
+  // an unknown tool is still denied
+  assert.equal(gate(E, "totally_unknown_tool", {}).allow, false);
+});

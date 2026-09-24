@@ -259,6 +259,14 @@ export async function runAgent(opts: {
   runner: ToolRunner;
   maxTurns: number;
   budgetTokens: number;
+  /**
+   * Anti-tunnelling forcing nudge. If the model burns this many turns in one attempt
+   * WITHOUT calling submit_finding, inject a single user message ordering it to commit
+   * its best-supported claim now (reasoning models over-explore — reading source,
+   * driving a shell — and never reach a proof). 0/undefined disables it. Generic: it
+   * keys only on "no submit_finding yet after N turns", nothing target-specific.
+   */
+  nudgeAfterTurns?: number;
   signal?: AbortSignal;
   /**
    * Continue an existing conversation (e.g. across multiple findings in one beat)
@@ -278,6 +286,7 @@ export async function runAgent(opts: {
   let turns = 0;
   let tokens = 0;
   let artifacts = 0;
+  let nudged = false;
 
   while (true) {
     if (opts.signal?.aborted) {
@@ -387,6 +396,41 @@ export async function runAgent(opts: {
         content: JSON.stringify(
           out.ok ? forModel(out.result) : { denied: out.denied, kind: (out as any).kind }),
       });
+    }
+
+    // A submit_finding call IS the claim. Reasoning models reliably CALL tools every
+    // turn but do not reliably end a turn with a free-text JSON object — so leaving
+    // claim emission to prose left complex, multi-step findings unclaimed (the hunter
+    // explored until turns ran out, "no parseable claim"). Ending the attempt the
+    // moment the model submits gives clean one-claim-per-attempt semantics: the beat
+    // parses the claim from this call's arguments (see parseClaim) and verifies it now,
+    // then the next attempt starts fresh.
+    if (calls.some((c: any) => c.function?.name === "submit_finding")) {
+      return { messages, turns, tokens, toolCalls, artifacts, httpCalls, stopReason: "done" };
+    }
+
+    // Anti-tunnelling: the model has spent nudgeAfterTurns turns exploring and has NOT
+    // submitted a finding. Inject ONE forcing message so an over-long recon session
+    // (source-grepping, shell-driving) converts into an actual proof attempt instead
+    // of running the whole budget out with nothing banked.
+    if (
+      !nudged && opts.nudgeAfterTurns && opts.nudgeAfterTurns > 0 &&
+      turns >= opts.nudgeAfterTurns
+    ) {
+      nudged = true;
+      messages.push({
+        role: "user",
+        content:
+          `You have used ${turns} turns this attempt and have NOT called submit_finding. ` +
+          "STOP exploring, reading source, or driving a shell. Recon is not a finding — " +
+          "every invariant is judged on the APP's own HTTP response. Pick the single " +
+          "weakness you have the most evidence for, SEND the one exploit request that " +
+          "demonstrates it via http_request (with the exact method/body — use `request`/" +
+          "`steps` in your claim so the verifier reproduces it), and CALL submit_finding " +
+          "now. If you genuinely have no evidence for any unproved finding, say so plainly " +
+          "and stop.",
+      });
+      continue;
     }
 
     if (tokens >= opts.budgetTokens) {

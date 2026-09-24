@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { spawn as realSpawn } from "node:child_process";
 import { NodeSDK, tracing as otelTracing } from "@opentelemetry/sdk-node";
-import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived } from "../src/beat.js";
+import { runBeat, VULN_CLASSES, isVulnClass, buildRunSession, injectSessionAuthForDerived, canonicalizeEndpoint, claimCaptureRequest, beatTagFor } from "../src/beat.js";
 import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
 import { SessionStore, generateDisposableCredentials } from "../src/session.js";
 
@@ -356,7 +356,10 @@ test("a second beat against the SAME engagement/scope inherits the first beat's 
   await runBeat({ env, client: client2, fetchImpl: bareFetch, now: NOW });
   const system = client2.seen[0].messages.find((m: any) => m.role === "system");
   assert.match(system.content, /vuln_class="clickjacking"/);
-  assert.match(system.content, new RegExp(`endpoint="${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
+  // URLs render relative to the target base now; single origin -> primary -> "/a"
+  assert.match(system.content, /endpoint="\/a"/);
+  // and the <target> block carries the base legend once
+  assert.match(system.content, /BASE \(primary\) = http:\/\/10\.0\.0\.1:3000/);
 });
 
 test("every VULN_CLASSES value is accepted by isVulnClass, and a prose value is rejected", () => {
@@ -1536,6 +1539,18 @@ test("buildRunSession: every beat of the SAME run shares ONE session id (run-sta
   assert.equal(forced.sessionId, "my-session");
 });
 
+test("buildRunSession: the session id is SELF-DESCRIBING — target, UTC stamp, run TYPE, short id", () => {
+  const scope = [new URL("http://10.129.96.71")];
+  const scan = buildRunSession({ scope, runId: "authcont-1790212030", now: new Date() });
+  // sahw-<host>-<YYYYMMDD-HHMMSSZ>-<type>-<id4>
+  assert.match(scan.sessionId, /^sahw-10\.129\.96\.71-\d{8}-\d{6}Z-scan-[0-9a-f]{4}$/, scan.sessionId);
+  assert.match(scan.codename, /^scan-[0-9a-f]{4}$/);
+  // run type is read from the run id: accum keeps its round number; unknown prefixes pass through
+  assert.match(buildRunSession({ scope, runId: "accum-1790212030-r2", now: new Date() }).sessionId, /-accum-r2-[0-9a-f]{4}$/);
+  assert.match(buildRunSession({ scope, runId: "smoke-1790212030", now: new Date() }).sessionId, /-smoke-[0-9a-f]{4}$/);
+  assert.match(buildRunSession({ scope, runId: "htb-1790212030", now: new Date() }).sessionId, /-htb-[0-9a-f]{4}$/);
+});
+
 
 
 
@@ -1548,4 +1563,45 @@ test("injectSessionAuthForDerived: resolves a session LABEL to its token as jwt 
   // an unknown/empty label leaves the input untouched (no guess)
   assert.deepEqual(injectSessionAuthForDerived({ candidates: ["x"] }, runner), { candidates: ["x"] });
   assert.deepEqual(injectSessionAuthForDerived({ jwt_from_session: "Z", candidates: ["x"] }, runner), { jwt_from_session: "Z", candidates: ["x"] });
+});
+
+test("canonicalizeEndpoint strips CodeIgniter's /index default-method suffix but not a doc-root index", () => {
+  // default-method suffix on a real route → bare route
+  assert.equal(canonicalizeEndpoint("http://h/api/contactUs/index"), "http://h/api/contactUs");
+  assert.equal(canonicalizeEndpoint("http://h/api/contactUs/index.php"), "http://h/api/contactUs");
+  // query string preserved
+  assert.equal(canonicalizeEndpoint("http://h/api/show/index?file=x"), "http://h/api/show?file=x");
+  // non-/index routes untouched
+  assert.equal(canonicalizeEndpoint("http://h/api/account/details"), "http://h/api/account/details");
+  assert.equal(canonicalizeEndpoint("http://h/info.php"), "http://h/info.php");
+  // bare doc-root index is a literal file, not a default-method route → untouched
+  assert.equal(canonicalizeEndpoint("http://h/index"), "http://h/index");
+});
+
+test("claimCaptureRequest parses a POST exploit/control request spec, ignores malformed, defaults absent to undefined (GET)", () => {
+  const claim = {
+    endpoint: "http://h/api/signup",
+    request: { method: "POST", headers: { "content-type": "application/json" }, body: '{"passwd":"1"}' },
+    control_request: { method: "POST", body: '{"passwd":""}' },
+  };
+  const ex = claimCaptureRequest(claim, "request");
+  assert.equal(ex?.method, "POST");
+  assert.equal(ex?.body, '{"passwd":"1"}');
+  assert.deepEqual(ex?.headers, { "content-type": "application/json" });
+  const ctl = claimCaptureRequest(claim, "control_request");
+  assert.equal(ctl?.method, "POST");
+  assert.equal(ctl?.body, '{"passwd":""}');
+  // absent → undefined (capture() then defaults to GET)
+  assert.equal(claimCaptureRequest({ endpoint: "http://h/x" }, "request"), undefined);
+  // malformed (array / non-string fields) → dropped, not thrown
+  assert.equal(claimCaptureRequest({ request: [1, 2] }, "request"), undefined);
+  assert.deepEqual(claimCaptureRequest({ request: { method: 5, body: {} } }, "request"), {});
+});
+
+test("beatTagFor: each beat gets a stable, memorable, distinguishable #n-adj-noun tag", () => {
+  const rid = "htb-1790212030";
+  assert.match(beatTagFor(rid, 3), /^#3-[a-z]+-[a-z]+$/);
+  assert.equal(beatTagFor(rid, 3), beatTagFor(rid, 3), "stable for same (run, beat)");
+  assert.notEqual(beatTagFor(rid, 3), beatTagFor(rid, 4), "different beats look different");
+  assert.match(beatTagFor(rid, 0), /^#\?-[a-z]+-[a-z]+$/, "unknown beat no -> #?");
 });

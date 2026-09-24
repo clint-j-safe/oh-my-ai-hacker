@@ -8,6 +8,7 @@ import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type Ski
 import type { SessionStore } from "./session.js";
 import { runAgent, type MinimalClient } from "./agent.js";
 import { evaluate, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
+import { judgeClaim } from "./judge.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
@@ -17,7 +18,7 @@ import {
   type Spine, type SpineEndpoint, type ProvedEntry, type AttemptedEntry, type RecoveredIntel,
   type SpineBeatRecord,
 } from "./spine.js";
-import { buildHunterBrief, openAuthenticatedClasses } from "./brief.js";
+import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -447,33 +448,60 @@ async function runClaimReview(
  * collapsed into ONE Langfuse session and runs could not be compared. A session
  * should be "this run", which may contain several beats.
  *
- * Shape: sahw-<host>-<YYYYMMDD-HHMMSSZ>-<codename>
- *   e.g. sahw-10.0.0.1-20260922-080715Z-quiet-ledger
+ * Shape: sahw-<host>-<YYYYMMDD-HHMMSSZ>-<runtype>-<id4>
+ *   e.g. sahw-10.129.96.71-20260924-071500Z-scan-3f9a
  *
- * The codename is deterministic from the run id, so the same run always yields the
- * same memorable label — greppable in logs, and easy to say out loud when two runs
- * are being compared. The engagement is preserved as a tag and in metadata, so
- * filtering by engagement still works.
+ * The name is SELF-DESCRIBING: which target, when (UTC), what KIND of run, and a
+ * short stable id for uniqueness — instead of an opaque random codename. The run
+ * type is read from the run id (authloop→"scan", accum→"accum-rN", smoke→"smoke",
+ * htb→"htb", …). The engagement is preserved as a tag and in metadata, so filtering
+ * by engagement still works.
  */
-const CODENAME_LEFT = [
+const RUN_TYPE_ALIASES: Readonly<Record<string, string>> = {
+  authcont: "scan", authloop: "scan", cont: "scan", accum: "accum",
+  smoke: "smoke", htb: "htb", test: "test",
+};
+
+/** A human run-type label from the run id, e.g. "authcont-1790212030" → "scan",
+ * "accum-1790-r2" → "accum-r2". Falls back to the id's leading word, or "run". */
+function runLabelFor(runId: string): string {
+  const kind = (runId.match(/^([a-z]+)/i)?.[1] ?? "run").toLowerCase();
+  const label = RUN_TYPE_ALIASES[kind] ?? kind;
+  const round = runId.match(/-r(\d+)\b/i);
+  return round ? `${label}-r${round[1]}` : label;
+}
+
+/** FNV-1a over any string. Well-spread, dependency-free, not secure. */
+function fnv1a(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+
+/** A short, stable id (FNV-1a hex) for uniqueness across runs of the same type. */
+function shortIdFor(runId: string): string {
+  return fnv1a(runId).toString(16).padStart(8, "0").slice(0, 4);
+}
+
+// Memorable per-BEAT codename word-pairs — so each beat (a Langfuse trace) is easy to
+// name, grep, and say out loud when comparing beats within one run.
+const BEAT_ADJ = [
   "quiet", "amber", "hollow", "narrow", "brittle", "candid", "crimson", "still",
   "patient", "sudden", "civil", "blunt", "clear", "gilded", "sparse", "wary",
 ] as const;
-const CODENAME_RIGHT = [
+const BEAT_NOUN = [
   "ledger", "vault", "teller", "transit", "mandate", "escrow", "cipher", "tally",
   "custody", "clearing", "docket", "remit", "bourse", "warrant", "assay", "drawer",
 ] as const;
 
-function codenameFor(runId: string): string {
-  // FNV-1a: tiny, stable, and dependency-free. Only needs to be well-spread, not secure.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < runId.length; i++) {
-    h ^= runId.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  const left = CODENAME_LEFT[h % CODENAME_LEFT.length];
-  const right = CODENAME_RIGHT[(h >>> 8) % CODENAME_RIGHT.length];
-  return `${left}-${right}`;
+/** A meaningful, human per-beat tag: "#<n>-<adj>-<noun>", e.g. "#3-amber-vault".
+ * The word-pair is deterministic from (runId, beatNo) so a given beat always gets the
+ * same memorable label. beatNo comes from the launcher (SAHW_BEAT_NO); 0 when unknown
+ * (a bare single-beat CLI call), which just yields "#?-…". */
+export function beatTagFor(runId: string, beatNo: number): string {
+  const h = fnv1a(`${runId}#${beatNo}`);
+  const tag = `${BEAT_ADJ[h % BEAT_ADJ.length]}-${BEAT_NOUN[(h >>> 8) % BEAT_NOUN.length]}`;
+  return `#${beatNo > 0 ? beatNo : "?"}-${tag}`;
 }
 
 export function buildRunSession(opts: {
@@ -493,13 +521,13 @@ export function buildRunSession(opts: {
   const t = runStart.toISOString();                       // 2026-09-22T08:07:15.123Z (RUN start)
   const stamp = `${t.slice(0, 10).replace(/-/g, "")}-${t.slice(11, 19).replace(/:/g, "")}Z`;
   const host = opts.scope[0]?.hostname ?? "unknown-target";
-  const codename = codenameFor(opts.runId);
-  // A 4-char tail from the run id keeps sessions unique even when two runs start
-  // in the same second and their codenames collide (the wordlists give 256 pairs,
-  // so collisions are ordinary birthday behaviour and purely cosmetic).
-  const tail = opts.runId.replace(/[^a-z0-9]/gi, "").slice(0, 4).toLowerCase() || "0000";
+  // Meaningful, self-describing label: the run TYPE (scan/accum/smoke/htb/…) read
+  // from the run id, plus a short stable id for uniqueness — replaces the old opaque
+  // random codename. `codename` is kept as the field name for downstream callers
+  // (traceName/metadata), but now carries the readable "<type>-<id4>" label.
+  const codename = `${runLabelFor(opts.runId)}-${shortIdFor(opts.runId)}`;
   return {
-    sessionId: opts.override?.trim() || `sahw-${host}-${stamp}-${codename}-${tail}`,
+    sessionId: opts.override?.trim() || `sahw-${host}-${stamp}-${codename}`,
     runId: opts.runId,
     codename,
     // The BEAT's own start time (per-beat), used for the beat record — distinct from
@@ -766,7 +794,7 @@ export async function runBeat(opts: {
   // beat (see agent.ts: system/user are ignored once `messages` is supplied), so
   // regenerating it mid-beat would never reach the model anyway. What THIS beat
   // itself discovers is folded into the spine at the end, for the NEXT beat.
-  const hunterBrief = buildHunterBrief({
+  const briefState = {
     attackSurface: spineLoad.spine.attack_surface,
     recoveredIntel: spineLoad.spine.recovered_intel,
     proved: spineLoad.spine.proved,
@@ -774,7 +802,12 @@ export async function runBeat(opts: {
     turnsRemaining: engagement.maxTurns,
     findingsRemaining: maxFindings,
     sessionsCount: sessionsThisBeat,
-  });
+  };
+  const hunterBrief = buildHunterBrief(briefState);
+  // The SAME origins the brief relativized against, so a relative endpoint the model
+  // emits (because the brief showed it URLs relative to <target>) resolves back to the
+  // exact absolute in-scope URL. Computed from the identical state → consistent per beat.
+  const briefOrigins = deriveOrigins(briefState);
 
   try {
     // One Langfuse trace per beat; one SESSION per run, so runs are comparable.
@@ -787,17 +820,24 @@ export async function runBeat(opts: {
       now: opts.now ?? new Date(),
       override: opts.env.SAHW_SESSION_ID,
     });
+    // Per-beat identifier so each trace in a run is distinguishable at a glance:
+    // "#<n>-<adj>-<noun>" (beat number from the launcher's SAHW_BEAT_NO). The trace
+    // name becomes e.g. "sahw-beat #3-amber-vault · htb-3f9a".
+    const beatNo = Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 0)));
+    const beatTag = beatTagFor(session.runId, beatNo);
     return await startActiveObservation("beat", async (span) => {
       return await propagateAttributes({
-        traceName: `sahw-beat · ${session.codename}`,
+        traceName: `sahw-beat ${beatTag} · ${session.codename}`,
         sessionId: session.sessionId,
         userId: opts.env.LANGFUSE_USER_ID ?? "sahw",
-        tags: [engagement.profile, "m0", `engagement:${engagement.authRef}`],
+        tags: [engagement.profile, "m0", `engagement:${engagement.authRef}`, `beat:${beatTag}`],
         metadata: {
           scope: scopeUrls.join(","),
           sandboxId,
           engagement: engagement.authRef,
           run_codename: session.codename,
+          beat_no: beatNo > 0 ? String(beatNo) : "unknown",
+          beat_tag: beatTag,
           run_started_utc: session.startedUtc,
           spine_fresh: String(spineLoad.fresh),
         },
@@ -973,6 +1013,11 @@ export async function runBeat(opts: {
             runner,
             maxTurns: perCallMaxTurns,
             budgetTokens: remainingTokens,
+            // Force a commit if the model burns most of an attempt exploring without
+            // submitting. Default: ~60% of this attempt's turn budget (min 4), tunable
+            // via SAHW_NUDGE_TURNS. This is what converts over-long recon (shell/source
+            // grepping) into an actual proof attempt.
+            nudgeAfterTurns: Math.max(4, numEnv(opts.env, "SAHW_NUDGE_TURNS", Math.ceil(perCallMaxTurns * 0.6))),
             signal: controller.signal,
             messages,
           });
@@ -1030,6 +1075,25 @@ export async function runBeat(opts: {
           // banked claim as if it were new.
           const newMessages = run.messages.slice(priorLen);
           const claim = parseClaim(newMessages);
+          // Report the canonical route, not the app's internal fully-qualified form:
+          // `/api/contactUs/index` and `/api/contactUs` are the same handler, and the
+          // bare route is what a report (and the live re-capture below) resolves to.
+          // First resolve any endpoint the model emitted RELATIVE to the target base
+          // (the brief renders URLs relative to <target> to save tokens) back to an
+          // absolute in-scope URL, THEN canonicalize. Applies to the endpoint, the
+          // control_url, and every step url — so the Tether/Axiom always see absolute
+          // in-scope URLs regardless of whether the model wrote relative or absolute.
+          if (claim && typeof claim.endpoint === "string") {
+            claim.endpoint = canonicalizeEndpoint(resolveRelativeEndpoint(claim.endpoint, briefOrigins));
+          }
+          if (claim && typeof claim.control_url === "string") {
+            claim.control_url = resolveRelativeEndpoint(claim.control_url, briefOrigins);
+          }
+          if (claim && Array.isArray(claim.steps)) {
+            for (const st of claim.steps) {
+              if (st && typeof st.url === "string") st.url = resolveRelativeEndpoint(st.url, briefOrigins);
+            }
+          }
           if (!claim) {
             if (run.stopReason === "max_turns") {
               // SAHW_MAX_TURNS_PER_FINDING cut this attempt off mid-hypothesis — it did
@@ -1074,6 +1138,25 @@ export async function runBeat(opts: {
             });
             messages.push({ role: "user", content: feedbackForInvalidVulnClass(claim.vuln_class) });
             continue;
+          }
+
+          // STORED-XSS must be proven through the APP rendering persisted data, NOT by
+          // reading back a file the exploit wrote via a file-read/LFI primitive (that
+          // proves file-write, scores nothing, and is a non-canonical dead end). Reject
+          // a stored_xss claim whose render endpoint is a file read (a file/path/page
+          // query param, or a /show-style reader) and steer it to the persist→display
+          // pair. Generic: keys on the request shape, not a target path.
+          if (claim.vuln_class === "xss_stored") {
+            const renderUrls = [claim.endpoint, ...(Array.isArray(claim.steps) ? claim.steps.map((s: any) => s?.url) : [])]
+              .filter((u): u is string => typeof u === "string");
+            const isFileRead = (u: string) =>
+              /[?&](file|path|filepath|f|template|page|doc|view|include)=/i.test(u) || /\/show(\b|\/|\?)/i.test(u);
+            if (renderUrls.some(isFileRead)) {
+              rejectedClaims.push({ raw: `${claim.vuln_class}::${claim.endpoint}`, reason: "stored_xss proven via a file-read primitive — non-canonical" });
+              messages.push({ role: "user", content:
+                "REJECTED: a stored_xss whose render step reads a FILE (a file=/path=/page= param or a /show-style reader) proves file-write, not stored XSS, and scores nothing. Prove it through the APP: POST your `<script>` payload to a persist endpoint (e.g. an apply/create/post route, including its serialized/nested fields), then GET/POST the paired LIST/VIEW endpoint the app renders it back on, and body_contains the unescaped payload in THAT response. Do not read a file you planted." });
+              continue;
+            }
           }
 
           const dedupeKey = `${claim.vuln_class}::${claim.endpoint}`;
@@ -1163,9 +1246,18 @@ export async function runBeat(opts: {
           // spans/artifacts; see tools.ts). Undefined behaves exactly as before —
           // an anonymous request.
           const claimSession = typeof claim.session === "string" ? claim.session : undefined;
-          const exploit = await capture(runner, claim.endpoint, claimSession);
+          // Replay the EXACT request the finding needs — a claim may carry `request`
+          // (method/headers/body) so a POST-based proof (signup policy, transfer,
+          // reset) is reproduced, not flattened to a GET. `control_request` does the
+          // same for the control leg; both default to GET when absent (back-compat).
+          const exploitReq = claimCaptureRequest(claim, "request");
+          const exploit = await capture(runner, claim.endpoint, claimSession, exploitReq);
           const control = (invType === "body_contains" || invType === "status_in")
-            ? await capture(runner, claim.control_url, claimSession)
+            ? await capture(runner, claim.control_url, claimSession,
+                claimCaptureRequest(claim, "control_request")
+                // if only the exploit method was given, mirror it for the control so a
+                // POST exploit is compared against a POST control, not a GET.
+                ?? (exploitReq?.method ? { method: exploitReq.method } : undefined))
             : null;                                  // every other type proves itself from
                                                        // its own evidence, never a control diff
           if (exploit) discoveredEndpoints.push(toSpineEndpoint(exploit));
@@ -1289,12 +1381,45 @@ export async function runBeat(opts: {
             }
           }
 
+          // PRE-GATE LLM JUDGE (advisory) — scores this claim 0-100 against the SAME
+          // strict deterministic rubric the Axiom applied. It NEVER overrides a
+          // deterministic CONFIRMED/FALSE_POSITIVE; its only verdict effect is that a
+          // HIGH score on a NEEDS_REVIEW may promote it to the DISTINCT
+          // CONFIRMED_BY_ADJUDICATION tier. Opt-in via SAHW_JUDGE_MODEL; fails OPEN
+          // (disabled/unavailable => verdict unchanged), so the deterministic gate
+          // remains sole authority. Secret derived VALUES (jwt/key/iv) are never sent
+          // to the judge — only field-shape.
+          const judgeModel = opts.env.SAHW_JUDGE_MODEL?.trim();
+          const promoteThreshold = numEnv(opts.env, "SAHW_AXIOM_JUDGE_THRESHOLD", 85);
+          const safeDerivedSummary = (() => {
+            const di = evidence?.derivedInput as Record<string, unknown> | undefined;
+            if (!di || typeof di !== "object") return undefined;
+            return Object.entries(di).map(([k, v]) =>
+              `${k}:${typeof v === "string" ? `str(${(v as string).length})` : Array.isArray(v) ? `arr(${(v as unknown[]).length})` : typeof v}`).join(", ");
+          })();
+          const judge = judgeModel
+            ? await startActiveObservation("judge", async (jSpan) => {
+                const js = await judgeClaim({
+                  client: opts.client as unknown as import("./judge.js").JudgeClient, model: judgeModel,
+                  vulnClass: claim.vuln_class, invariant: claim.invariant as Invariant,
+                  exploit, control, steps: evidence?.captures, derivedInputSummary: safeDerivedSummary,
+                  bodyBytes: numEnv(opts.env, "SAHW_TOOL_PREVIEW_BYTES", 1400), signal: controller.signal,
+                });
+                jSpan.update({ output: { score: js.score, lean: js.lean, ok: js.ok, model: js.model, rationale: js.rationale } });
+                return js;
+              })
+            : { score: -1, lean: "unsure" as const, rationale: "judge disabled", model: "disabled", ok: false };
+          const adjudicatedStatus: string =
+            (gated.status === "NEEDS_REVIEW" && judge.ok && judge.score >= promoteThreshold)
+              ? "CONFIRMED_BY_ADJUDICATION"
+              : gated.status;
+
           const row: FindingRow = {
             engagement_id: engagement.authRef,
             finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
             vuln_class: claim.vuln_class,
             endpoint: claim.endpoint,
-            verdict: gated.status,
+            verdict: adjudicatedStatus,
             invariant_type: effectiveInvariantType,
             langfuse_trace_id: langfuseTraceId,
             utc: new Date().toISOString(),
@@ -1402,7 +1527,51 @@ const NO_CONTROL_INVARIANT_TYPES = new Set([
   "response_asserted", "derived", "state_changed", "state_violated", "file_created_then_deleted",
 ]);
 
+/** Canonicalise a claimed endpoint URL to the route a report would name.
+ *
+ * CodeIgniter (this and most PHP MVC targets) routes `controller` and
+ * `controller/index` to the SAME handler — `index` is the default method. A hunter
+ * that recovered the app's explicit route table will often claim the fully-qualified
+ * internal form (`/api/contactUs/index`) while the canonical route a pentester writes
+ * is `/api/contactUs`. Recording the fully-qualified form makes an otherwise-correct
+ * finding look like it targets a different endpoint than it does. This strips ONLY a
+ * trailing `/index` (optionally `/index.php`) path segment, preserving the query
+ * string; it is a general framework convention, not an app-specific rewrite, and the
+ * bare route is the one the answer key and a live request both resolve to. */
+export function canonicalizeEndpoint(url: string): string {
+  if (typeof url !== "string" || !url) return url;
+  const q = url.indexOf("?");
+  const base = q === -1 ? url : url.slice(0, q);
+  const query = q === -1 ? "" : url.slice(q);
+  const stripped = base.replace(/\/index(?:\.php)?\/?$/i, "");
+  // Never collapse a bare origin (e.g. "http://h/index" is a real doc root file the
+  // caller means literally); only strip when a path segment precedes it.
+  if (!/^https?:\/\/[^/]+\/.+/.test(stripped)) return url;
+  return stripped + query;
+}
+
 function parseClaim(messages: any[]): any | null {
+  // PREFERRED path: a submit_finding tool call. Reasoning models call tools reliably
+  // every turn but do not reliably end a turn with a free-text JSON object, so the
+  // claim is carried as the tool call's arguments. Scan newest-first for one.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const calls = messages[i]?.tool_calls;
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (call?.function?.name !== "submit_finding") continue;
+      let o: any;
+      try { o = JSON.parse(call.function.arguments ?? "{}"); } catch { continue; }
+      if (!o?.endpoint || !o?.invariant?.type) continue;
+      if (NO_CONTROL_INVARIANT_TYPES.has(o.invariant.type)) return o;
+      if (o.control_url) return o;
+      // A differential type submitted without a control is still the model's best
+      // claim — return it so the beat can give a precise "needs a control" rejection
+      // rather than silently falling through to a stale content-scanned claim.
+      return o;
+    }
+  }
+  // FALLBACK path (back-compat): a claim emitted as a fenced/bare JSON object in the
+  // message content — the original contract, still honoured for models that use it.
   for (let i = messages.length - 1; i >= 0; i--) {
     const c = messages[i]?.content;
     if (typeof c !== "string") continue;
@@ -1424,11 +1593,41 @@ function parseClaim(messages: any[]): any | null {
  * its steps) — forwarded verbatim to http_request's own `session` arg, which is the
  * ONLY path from a label to real auth material (see session.ts/tools.ts). This
  * function never sees or handles the material itself. */
-async function capture(runner: ToolRunner, url: string, session?: string): Promise<HttpCapture | null> {
-  const args: Record<string, unknown> = { method: "GET", url };
+/** One replayed request for a differential (body_contains / status_in) proof.
+ * Defaults to a bare GET — the historical behaviour — but a claim may specify a
+ * non-GET method, headers and/or body so the verifier reproduces the EXACT request
+ * that triggers the finding. This closes a real gap: a signup/transfer/reset proof
+ * lives in a POST BODY (e.g. a 1-character password returning a success code), which
+ * a GET of the URL can never reproduce, so such a claim used to be un-confirmable.
+ * Generic capability, no target specifics. */
+interface CaptureRequest {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+async function capture(
+  runner: ToolRunner, url: string, session?: string, req?: CaptureRequest,
+): Promise<HttpCapture | null> {
+  const method = (typeof req?.method === "string" && req.method.trim()) ? req.method.trim().toUpperCase() : "GET";
+  const args: Record<string, unknown> = { method, url };
+  if (req?.headers && isRecordOfStrings(req.headers)) args.headers = req.headers;
+  if (typeof req?.body === "string") args.body = req.body;
   if (session) args.session = session;
   const out = await runner.execute("http_request", args);
   return out.ok ? (out.result as HttpCapture) : null;
+}
+
+/** Reads a claim's optional per-request spec ({method,headers,body}) for the exploit
+ * (`request`) or control (`control_request`) leg of a differential proof. */
+export function claimCaptureRequest(claim: any, key: "request" | "control_request"): CaptureRequest | undefined {
+  const r = claim?.[key];
+  if (!r || typeof r !== "object" || Array.isArray(r)) return undefined;
+  const out: CaptureRequest = {};
+  if (typeof r.method === "string") out.method = r.method;
+  if (r.headers && isRecordOfStrings(r.headers)) out.headers = r.headers;
+  if (typeof r.body === "string") out.body = r.body;
+  return out;
 }
 
 // ---- Evidence assembly for derived / state_changed / state_violated /

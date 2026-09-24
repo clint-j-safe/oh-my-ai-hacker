@@ -261,3 +261,29 @@ test("a model failure on a LATER turn keeps the work already done", async () => 
   assert.equal(r.artifacts, 1, "its artifact must survive");
   assert.match(r.modelError ?? "", /ECONNRESET/);
 });
+
+test("nudgeAfterTurns injects a single forcing message once the model explores without submitting", async () => {
+  // Model keeps calling a tool (never submit_finding) — after nudgeAfterTurns turns a
+  // forcing user message is injected exactly once, then the model can still continue.
+  const { client, seen } = stub([
+    call("http_request", { method: "GET", url: "http://10.0.0.1:3000/a" }),
+    call("http_request", { method: "GET", url: "http://10.0.0.1:3000/b" }),
+    call("http_request", { method: "GET", url: "http://10.0.0.1:3000/c" }),
+    say("stopping"),
+  ]);
+  const opts = { ...(await OPTS(client)), maxTurns: 10, nudgeAfterTurns: 2 };
+  const r = await runAgent(opts);
+  const nudges = r.messages.filter((m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("have NOT called submit_finding"));
+  assert.equal(nudges.length, 1, "exactly one nudge should be injected");
+});
+
+test("nudgeAfterTurns never fires once submit_finding is called", async () => {
+  const { client } = stub([
+    call("submit_finding", { vuln_class: "sqli", endpoint: "http://10.0.0.1:3000/x", invariant: { statement: "s", type: "body_contains", expression: "e" } }),
+  ]);
+  const opts = { ...(await OPTS(client)), maxTurns: 10, nudgeAfterTurns: 1 };
+  const r = await runAgent(opts);
+  assert.equal(r.stopReason, "done");
+  const nudges = r.messages.filter((m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("have NOT called submit_finding"));
+  assert.equal(nudges.length, 0, "no nudge when the model submits");
+});

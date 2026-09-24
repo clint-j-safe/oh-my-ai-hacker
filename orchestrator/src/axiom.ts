@@ -12,7 +12,12 @@ export interface Invariant {
   expression: string;
 }
 
-export type VerdictStatus = "CONFIRMED" | "FALSE_POSITIVE" | "NEEDS_REVIEW" | "BLOCKED";
+// CONFIRMED_BY_ADJUDICATION is a DISTINCT tier from the deterministic CONFIRMED: it is
+// only ever set by the pre-gate LLM judge promoting a deterministic NEEDS_REVIEW whose
+// evidence the judge scores as clearly meeting the invariant's rubric. It carries its
+// own provenance (judge score + rationale) and MUST NOT be counted as a deterministic
+// CONFIRMED anywhere the audit trail's integrity depends on determinism.
+export type VerdictStatus = "CONFIRMED" | "CONFIRMED_BY_ADJUDICATION" | "FALSE_POSITIVE" | "NEEDS_REVIEW" | "BLOCKED";
 
 export interface Verdict {
   status: VerdictStatus;

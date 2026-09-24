@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildHunterBrief, type HunterBriefState } from "../src/brief.js";
+import { buildHunterBrief, deriveOrigins, resolveRelativeEndpoint, type HunterBriefState } from "../src/brief.js";
 import { VULN_CLASSES } from "../src/vuln-classes.js";
 
 const EMPTY_STATE: HunterBriefState = {
@@ -20,7 +20,7 @@ test("the brief is well-formed: opens and closes with the root tag, one concern 
   assert.match(xml.trim(), /<\/safe_ai_hacker_hunter>$/);
   for (const tag of [
     "system_identity", "operational_principles", "attack_surface", "recovered_intel",
-    "already_proved", "dead_ends", "thinking_framework", "parameter_analysis",
+    "already_proved", "target", "remaining_targets", "dead_ends", "thinking_framework", "parameter_analysis",
     "prioritization_rules", "evidence_discipline", "tool_guidance", "output_contract", "budget",
   ]) {
     assert.match(xml, new RegExp(`<${tag}>`), `missing <${tag}>`);
@@ -64,17 +64,23 @@ test("a populated spine emits its endpoints, proved list and dead ends into the 
   };
   const xml = buildHunterBrief(state);
 
+  // URLs are now rendered RELATIVE to the target base (:3000 is primary here — most
+  // frequent), and the <target> block carries the base legend once.
+  const target = section(xml, "target");
+  assert.match(target, /BASE \(primary\) = http:\/\/10\.0\.0\.1:3000/);
+
   const attackSurface = section(xml, "attack_surface");
-  assert.match(attackSurface, /http:\/\/10\.0\.0\.1:3000\/api\/users/);
+  assert.match(attackSurface, /url="\/api\/users"/);
   assert.match(attackSurface, /method="GET"/);
   assert.match(attackSurface, /status="200"/);
 
   const recoveredIntel = section(xml, "recovered_intel");
-  assert.match(recoveredIntel, /<api_base>http:\/\/10\.0\.0\.1:4000<\/api_base>/);
+  // :4000 is a secondary origin -> aliased
+  assert.match(recoveredIntel, /<api_base>\[:4000\]<\/api_base>/);
 
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="idor"/);
-  assert.match(alreadyProved, /endpoint="http:\/\/10\.0\.0\.1:3000\/api\/users\/2"/);
+  assert.match(alreadyProved, /endpoint="\/api\/users\/2"/);
 
   const deadEnds = section(xml, "dead_ends");
   assert.match(deadEnds, /vuln_class="sqli"/);
@@ -95,7 +101,8 @@ test("a proved (vuln_class, endpoint) appears in <already_proved>, AND the vuln_
   const xml = buildHunterBrief(state);
   const alreadyProved = section(xml, "already_proved");
   assert.match(alreadyProved, /vuln_class="path_traversal"/);
-  assert.match(alreadyProved, /endpoint="http:\/\/10\.0\.0\.1:3000\/download"/);
+  // single origin -> primary base -> relative
+  assert.match(alreadyProved, /endpoint="\/download"/);
 
   const outputContract = section(xml, "output_contract");
   for (const v of VULN_CLASSES) {
@@ -123,4 +130,88 @@ test("recovered_intel rendering is BOUNDED: a huge intel map does not bloat the 
   assert.match(sect, /api_route_table/);
   assert.match(sect, /jwt_key_source/);
   assert.match(sect, /omitted to keep this brief lean/);
+});
+
+test("<remaining_targets> renders the human-method probe for OPEN classes as PRIORITY, and widen-probes for recurring proved classes", () => {
+  // proved covers sqli + xss_reflected but NOT the auth/signup classes → those stay open
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    proved: [
+      { vuln_class: "sqli", endpoint: "http://h/api/x", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" },
+      { vuln_class: "info_disclosure", endpoint: "http://h/info.php", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-2" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const sect = section(xml, "remaining_targets");
+  assert.match(sect, /PRIORITY \(open classes/);
+  // open classes get a concrete behavioural method, not a path
+  assert.match(sect, /weak_password_policy: .*1-character password/);
+  assert.match(sect, /insecure_transport: .*tls_unavailable/);
+  assert.match(sect, /improper_session_invalidation: .*OLD token/);
+  // a proved recurring class shows up under WIDEN, not PRIORITY
+  assert.match(sect, /WIDEN/);
+  assert.match(sect, /info_disclosure: .*debug\/stack-trace/);
+});
+
+test("<canonical_targets> marks recovered routes tested vs UNTESTED from the proved list (recon+spine derived)", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    recoveredIntel: { api_route_table: "/api/login /api/password/change /api/loan/apply /api/beneficiary/pay" },
+    proved: [
+      { vuln_class: "auth_bypass", endpoint: "http://h/api/password/change", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const sect = section(xml, "canonical_targets");
+  // the route with a proved finding shows its class; other routes show [none]
+  assert.match(sect, /\/api\/password\/change\s+— proved: auth_bypass/);
+  assert.match(sect, /\/api\/loan\/apply\s+— proved: \[none\]/);
+  assert.match(sect, /\/api\/beneficiary\/pay\s+— proved: \[none\]/);
+  assert.match(sect, /route\(s\) with NO finding yet/);
+});
+
+test("<canonical_targets> is per (route × class): a route with one class still shows that class, flagging OTHER classes open there", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    recoveredIntel: { api_route_table: "/api/loan/apply /api/login" },
+    proved: [
+      { vuln_class: "deserialization_rce", endpoint: "http://h/api/loan/apply", invariant_type: "state_changed", verdict: "CONFIRMED", finding_id: "SAHW-9" },
+    ],
+  };
+  const sect = section(buildHunterBrief(state), "canonical_targets");
+  // loan/apply shows the RCE but the directive makes clear other classes remain open there
+  assert.match(sect, /\/api\/loan\/apply\s+— proved: deserialization_rce/);
+  assert.match(sect, /per \(route × vuln_class\)/);
+});
+
+test("URL efficiency: brief relativizes to the target base once, and relative endpoints round-trip back to absolute", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    attackSurface: [
+      { url: "http://10.0.0.1/api/login", method: "POST", status: 200, content_type: "application/json", semantic_role: "auth" },
+      { url: "http://10.0.0.1/api/loan/apply", method: "POST", status: 200, content_type: "application/json", semantic_role: "data" },
+      { url: "http://10.0.0.1:3000/static/js/main.js.map", method: "GET", status: 200, content_type: "application/json", semantic_role: "asset" },
+    ] as any,
+    recoveredIntel: { api_route_table: "/api/login /api/loan/apply /api/loan" },
+    proved: [{ vuln_class: "sqli", endpoint: "http://10.0.0.1/api/login", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" }],
+  };
+  const xml = buildHunterBrief(state);
+  // primary base (most frequent = the :80 host) declared once; secondary :3000 aliased
+  const target = section(xml, "target");
+  assert.match(target, /BASE \(primary\) = http:\/\/10\.0\.0\.1\b/);
+  assert.match(target, /\[:3000\] = http:\/\/10\.0\.0\.1:3000/);
+  // the full primary origin should NOT be repeated in attack_surface (it's relative there)
+  const as = section(xml, "attack_surface");
+  assert.match(as, /url="\/api\/login"/);
+  assert.doesNotMatch(as, /http:\/\/10\.0\.0\.1\/api\/login/);
+  // the :3000 asset becomes alias-prefixed
+  assert.match(as, /url="\[:3000\]\/static\/js\/main\.js\.map"/);
+
+  // round-trip: what the model emits relative resolves back to the exact absolute URL
+  const origins = deriveOrigins(state);
+  assert.equal(resolveRelativeEndpoint("/api/loan/apply", origins), "http://10.0.0.1/api/loan/apply");
+  assert.equal(resolveRelativeEndpoint("[:3000]/static/js/main.js.map", origins), "http://10.0.0.1:3000/static/js/main.js.map");
+  // absolute in -> unchanged; unknown -> left as-is (rejected downstream, never a scope bypass)
+  assert.equal(resolveRelativeEndpoint("http://10.0.0.1/api/x", origins), "http://10.0.0.1/api/x");
+  assert.equal(resolveRelativeEndpoint("[:9999]/x", origins), "[:9999]/x");
 });
