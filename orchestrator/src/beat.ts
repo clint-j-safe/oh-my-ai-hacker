@@ -192,6 +192,12 @@ const CAUSE_GUIDANCE: Record<FailureCause, string> = {
     "The verifier could not attribute a specific cause to this failure.",
 };
 
+/** Bound a verdict rationale so it stays a compact record field (never a wall of text). */
+function boundReason(s: string): string {
+  const t = (s ?? "").trim();
+  return t.length > 500 ? `${t.slice(0, 500)}…` : t;
+}
+
 function feedbackForVerdict(
   vuln_class: string, endpoint: string, verdict: string, reason: string,
   cause?: FailureCause, causeDetail?: string | null,
@@ -1235,6 +1241,8 @@ export async function runBeat(opts: {
                 endpoint: claim.endpoint,
                 verdict: "FALSE_POSITIVE",
                 invariant_type: claim.invariant.type,
+                verdict_reason: boundReason(
+                  review.reasoning || "adversarial-self-review rejected this claim before replay"),
                 langfuse_trace_id: obs.traceId(),
                 utc: new Date().toISOString(),
               };
@@ -1440,6 +1448,16 @@ export async function runBeat(opts: {
               ? "CONFIRMED_BY_ADJUDICATION"
               : gated.status;
 
+          // The rationale carried on the record. For an adjudication promotion it names
+          // the judge score + rationale; otherwise it is the final gated verdict's reason
+          // (which reflects a provenance downgrade if one happened), falling back to the
+          // raw Axiom reason. Bounded so a long reason can't bloat the row.
+          const verdictReason = boundReason(
+            adjudicatedStatus === "CONFIRMED_BY_ADJUDICATION"
+              ? `adjudication promoted NEEDS_REVIEW (judge score ${judge.score}): ${judge.rationale}`
+              : gated.status !== axiom.status
+                ? `${axiom.reason} — provenance-gated to ${gated.status} (missing: ${gated.missing.join(", ") || "n/a"})`
+                : (axiom.reason || ""));
           const row: FindingRow = {
             engagement_id: engagement.authRef,
             finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
@@ -1447,6 +1465,7 @@ export async function runBeat(opts: {
             endpoint: claim.endpoint,
             verdict: adjudicatedStatus,
             invariant_type: effectiveInvariantType,
+            verdict_reason: verdictReason,
             langfuse_trace_id: langfuseTraceId,
             utc: new Date().toISOString(),
           };

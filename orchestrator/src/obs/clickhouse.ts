@@ -3,6 +3,12 @@ import { createClient, type ClickHouseClient } from "@clickhouse/client";
 export interface FindingRow {
   engagement_id: string; finding_id: string; vuln_class: string; endpoint: string;
   verdict: string; invariant_type: string;
+  // The deterministic RATIONALE for `verdict` — the Axiom's own reason string (or the
+  // pre-verifier's) explaining WHY this finding was CONFIRMED, FALSE_POSITIVE, or
+  // NEEDS_REVIEW (e.g. "marker present in exploit, absent in control", "control response
+  // also contains X", "no control request captured; cannot differentiate"). Carried on
+  // the record so an analyst can see the verdict's basis without digging into the trace.
+  verdict_reason: string;
   // null, never a placeholder, when no real Langfuse trace was active — see
   // src/obs/langfuse.ts and the Provenance Gate, which downgrades a finding to
   // NEEDS_REVIEW rather than accept a fabricated id here.
@@ -27,8 +33,13 @@ export class ClickHouseWriter {
     await this.client.command({
       query: `CREATE TABLE IF NOT EXISTS sahw_findings (
         engagement_id String, finding_id String, vuln_class String, endpoint String,
-        verdict String, invariant_type String, langfuse_trace_id Nullable(String), utc DateTime64(3)
+        verdict String, invariant_type String, verdict_reason String DEFAULT '',
+        langfuse_trace_id Nullable(String), utc DateTime64(3)
       ) ENGINE = MergeTree ORDER BY (engagement_id, utc)`,
+    });
+    // Migrate an already-existing table that predates verdict_reason. Idempotent.
+    await this.client.command({
+      query: `ALTER TABLE sahw_findings ADD COLUMN IF NOT EXISTS verdict_reason String DEFAULT ''`,
     });
   }
 

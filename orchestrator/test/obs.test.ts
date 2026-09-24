@@ -7,7 +7,8 @@ import { Neo4jWriter } from "../src/obs/neo4j.js";
 const ROW = {
   engagement_id: "ENG-1", finding_id: "SAHW-0001", vuln_class: "path_traversal",
   endpoint: "http://10.0.0.1:3000/x", verdict: "CONFIRMED",
-  invariant_type: "body_contains", langfuse_trace_id: "t-1", utc: "2026-09-22T12:00:00Z",
+  invariant_type: "body_contains", verdict_reason: "marker present in exploit, absent in control",
+  langfuse_trace_id: "t-1", utc: "2026-09-22T12:00:00Z",
 };
 
 test("unconfigured env yields a working no-op observability", async () => {
@@ -38,6 +39,7 @@ test("ClickHouse writer sends JSONEachRow to the findings table", async () => {
   assert.equal(sent.utc, "2026-09-22 12:00:00", "ISO T/Z stripped to DateTime64 form (ms preserved when present)");
   assert.ok(!/[TZ]/.test(sent.utc), `utc must carry no T/Z for DateTime64: got ${sent.utc}`);
   assert.equal(sent.finding_id, ROW.finding_id);   // the rest of the row is unchanged
+  assert.equal(sent.verdict_reason, ROW.verdict_reason, "the verdict rationale is persisted");
 });
 
 test("Neo4j writer MERGEs so repeated beats do not duplicate", async () => {
@@ -49,6 +51,7 @@ test("Neo4j writer MERGEs so repeated beats do not duplicate", async () => {
   assert.equal(queries.length, 2);
   for (const q of queries) assert.match(q, /MERGE/);
   assert.ok(queries.some((q) => /:Finding/.test(q)));
+  assert.ok(queries.some((q) => /verdict_reason/.test(q)), "the Finding node records verdict_reason");
 });
 
 test("one store failing does not take down the others", async () => {
