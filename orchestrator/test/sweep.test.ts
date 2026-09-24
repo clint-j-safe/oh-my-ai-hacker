@@ -53,3 +53,21 @@ test("renderSweepLeads emits a directive only for strong hits, naming the canoni
   assert.match(rendered, /xss_reflected @ http:\/\/h\/api\/contactUs/);
   assert.equal(renderSweepLeads([]), "");
 });
+
+test("budget is round-robined so a later endpoint still gets probed (no depth-first starvation)", async () => {
+  const many: SweepTarget[] = [
+    { endpoint: "http://h/api/signup", method: "POST", params: ["a", "b", "c", "d"] },
+    { endpoint: "http://h/api/contactUs", method: "POST", params: ["name"] },
+  ];
+  const hit: SweepPayload[] = [{ payloadClass: "xss_reflected", payload: "<script>sahwX</script>", marker: "sahwX", note: "x" }];
+  const seen = new Set<string>();
+  const send: SendProbe = async (t, _p, value) => {
+    seen.add(t.endpoint);
+    // contactUs reflects the canary; signup never does (its fields validation-fail)
+    if (t.endpoint.includes("contactUs") && value && value.includes("sahwX")) return { status: 200, body: "hi <script>sahwX</script>" };
+    return { status: 200, body: "generic" };
+  };
+  const hits = await runSweep({ targets: many, payloadsFor: (c) => c === "xss_reflected" ? hit : [], send, budget: 20 });
+  assert.ok(seen.has("http://h/api/contactUs"), "the later endpoint was still reached despite the earlier high-field one");
+  assert.ok(hits.some((h) => h.endpoint === "http://h/api/contactUs" && h.strength === "strong"), "contactUs XSS hit found");
+});

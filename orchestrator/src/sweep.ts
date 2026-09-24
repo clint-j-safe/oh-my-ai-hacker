@@ -107,23 +107,29 @@ export async function runSweep(opts: {
   const weak: SweepHit[] = [];
   let spent = 0;
   const baselineCache = new Map<string, FuzzResponse>();
+  // ROUND-ROBIN the budget so EVERY endpoint gets probed before any one is exhausted —
+  // otherwise a high-field endpoint (e.g. signup) eats the whole budget and the sweep
+  // never reaches a reflection endpoint (e.g. contactUs). Each target gets a fair share,
+  // with a floor so a target is never starved to nothing.
+  const perTarget = Math.max(8, Math.floor(opts.budget / Math.max(1, targets.length)));
 
   for (const target of targets) {
+    let targetSpent = 0;
     for (const param of target.params) {
-      if (spent >= opts.budget) break;
+      if (spent >= opts.budget || targetSpent >= perTarget) break;
       const key = `${target.method} ${target.endpoint}\u0000${param}`;
       let baseline = baselineCache.get(key);
       if (!baseline) {
         baseline = await send(target, param, null);
-        spent++;
+        spent++; targetSpent++;
         baselineCache.set(key, baseline);
       }
       for (const cls of classOrder) {
-        if (spent >= opts.budget) break;
+        if (spent >= opts.budget || targetSpent >= perTarget) break;
         for (const pl of payloadsFor(cls)) {
-          if (spent >= opts.budget) break;
+          if (spent >= opts.budget || targetSpent >= perTarget) break;
           const candidate = await send(target, param, pl.payload);
-          spent++;
+          spent++; targetSpent++;
           const probe: FuzzProbe = { payloadClass: pl.payloadClass, payload: pl.payload, marker: pl.marker, computedMarker: pl.computedMarker };
           const signal = diffResponses(baseline, candidate, probe);
           let strength = classifySignal(signal, probe);

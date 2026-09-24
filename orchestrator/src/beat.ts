@@ -925,8 +925,13 @@ export async function runBeat(opts: {
   // oracle. Strong hits become a high-priority brief directive the hunter submits first;
   // the Axiom still decides, and canonicalizeEndpoint records the win on the canonical
   // route. Fails soft — any error yields no leads and the normal loop proceeds.
+  // Run the sweep ONCE per run — on the first beat only. Its strong hits are banked into
+  // the spine's proved set, so re-sweeping every beat would just re-spend the budget and
+  // starve the LLM loop (observed: beats stalling at 0 findings). beatNo<=1 (or unknown)
+  // = first beat. Later beats inherit the banked findings via the spine.
   let sweepLeads = "";
-  if (engagement.deep.enabled) {
+  const sweepBeatNo = Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1)));
+  if (engagement.deep.enabled && sweepBeatNo <= 1) {
     sweepLeads = await runDeepSweep({
       runner, workspace, scopeOrigins, canon: canonicalizeEndpoint,
       budget: engagement.deep.maxSweepRequests,
