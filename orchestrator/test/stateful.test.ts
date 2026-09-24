@@ -94,3 +94,31 @@ test("F-24 proof shape: FALSE_POSITIVE guard if the marker was already present p
   const v = evaluate({ statement: "s", type: "state_changed", expression: `appeared:${jwt}` }, c2, null, { captures: [c0, act, c2] });
   assert.equal(v.status, "FALSE_POSITIVE", v.reason);
 });
+
+import { classifyContactField, extractAssignedId } from "../src/stateful.js";
+
+test("classifyContactField: email/mobile by generic naming", () => {
+  assert.equal(classifyContactField("email"), "email");
+  assert.equal(classifyContactField("mobile"), "mobile");
+  assert.equal(classifyContactField("phone"), "mobile");
+  assert.equal(classifyContactField("firstname"), null);
+});
+
+test("extractAssignedId: named id field wins, else an assigned-id-shaped value", () => {
+  assert.equal(extractAssignedId(`{"status":"Success","data":{"userId":"BNK64092","refNo":"174543797617147"}}`), "BNK64092");
+  assert.equal(extractAssignedId(`{"data":{"foo":"bar","account":"ACC12345"}}`), "ACC12345"); // id-shaped fallback
+  assert.equal(extractAssignedId(`{"status":"Failed","data":{}}`), null);
+  assert.equal(extractAssignedId(null), null);
+});
+
+import { findDeviceObject, graftDevice } from "../src/stateful.js";
+
+test("findDeviceObject + graftDevice: carry a known-good device block across bodies", () => {
+  const good = `{"requestBody":{"device":{"deviceid":"D1","os":"android"},"data":{"x":"1"}}}`;
+  const dev = findDeviceObject(JSON.parse(good));
+  assert.deepEqual(dev, { deviceid: "D1", os: "android" });
+  const stale = `{"requestBody":{"device":{"deviceid":"D9","os":"windows"},"data":{"userid":"U"}}}`;
+  const fixed = graftDevice(stale, dev);
+  assert.ok(fixed.includes('"os":"android"') && !fixed.includes('"os":"windows"'));
+  assert.ok(fixed.includes('"userid":"U"'), "non-device data is preserved");
+});

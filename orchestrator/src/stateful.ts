@@ -72,3 +72,71 @@ export function extractJwt(body: string | null | undefined): string | null {
   if (!matches || matches.length === 0) return null;
   return matches.reduce((a, b) => (b.length > a.length ? b : a));
 }
+
+/** Classify a field as a contact identifier that must be UNIQUE per signup (so a cloned
+ * signup envelope doesn't collide with an existing account). Generic naming. */
+export function classifyContactField(name: string): "email" | "mobile" | null {
+  const n = name.toLowerCase();
+  if (/mail/.test(n)) return "email";
+  if (/(mobile|phone|msisdn|contact)/.test(n)) return "mobile";
+  return null;
+}
+
+/** Extract a server-ASSIGNED account identifier from a signup/registration response: a
+ * field named user/id/account/cust (…Id) whose value the login endpoint expects, or a
+ * value shaped like an assigned id (LETTERS+DIGITS, e.g. BNK64092). Generic — no target
+ * literal. Returns the identifier or null. */
+const ASSIGNED_ID_VALUE = /^[A-Za-z]{2,6}\d{3,}$/;
+export function extractAssignedId(body: string | null | undefined): string | null {
+  if (!body) return null;
+  let obj: unknown;
+  try { obj = JSON.parse(body); } catch { return null; }
+  // 1) A field explicitly named like a user/account id, at any depth.
+  const NAMED = /^(userid|user_id|custid|customerid|accountid|acctid|loginid|id)$/i;
+  const stack: unknown[] = [obj];
+  const idFields: string[] = [];
+  const idShaped: string[] = [];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== "object") continue;
+    for (const [k, v] of Object.entries(cur as Record<string, unknown>)) {
+      if (typeof v === "string") {
+        if (NAMED.test(k)) idFields.push(v);
+        else if (ASSIGNED_ID_VALUE.test(v)) idShaped.push(v);
+      } else if (v && typeof v === "object") stack.push(v);
+    }
+  }
+  return idFields[0] ?? idShaped[0] ?? null;
+}
+
+/** Recursively find the first object-valued "device" property in a parsed body (the app's
+ * device/client envelope). Generic — used to carry a KNOWN-GOOD device block (from a
+ * request that already succeeded) into other requests whose captured template may hold a
+ * stale/invalid device (e.g. an os value the server rejects). Returns the object or null. */
+export function findDeviceObject(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (depth > 6 || !value || typeof value !== "object") return null;
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k.toLowerCase() === "device" && v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+    const nested = findDeviceObject(v, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+/** Return a deep clone of `bodyJson` with every "device" object replaced by `device`. If
+ * the body has no device key or is unparseable, returns it unchanged. */
+export function graftDevice(bodyJson: string, device: Record<string, unknown> | null): string {
+  if (!device) return bodyJson;
+  let obj: unknown;
+  try { obj = JSON.parse(bodyJson); } catch { return bodyJson; }
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 6 || !node || typeof node !== "object") return;
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k.toLowerCase() === "device" && v && typeof v === "object" && !Array.isArray(v)) {
+        (node as Record<string, unknown>)[k] = device;
+      } else walk(v, depth + 1);
+    }
+  };
+  walk(obj, 0);
+  return JSON.stringify(obj);
+}

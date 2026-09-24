@@ -21,7 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
-import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, type FieldMap } from "./stateful.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -262,12 +262,15 @@ async function runDeepSweep(opts: {
     // Fire an arbitrary request through the gated path, returning the full capture.
     // `sess` controls the session: undefined => the run's default authed session;
     // null => explicitly UNAUTHENTICATED (e.g. a fresh login attempt); a label => that
-    // session (e.g. change password as the account under test).
-    const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null): Promise<HttpCapture | null> => {
+    // session. `authToken` sets an explicit Authorization header to the RAW issued token
+    // (matching this app's convention and the session-injection posture, which carry the
+    // token verbatim with no "Bearer " prefix) for an account the probe itself just
+    // authenticated; it takes precedence over any session.
+    const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string): Promise<HttpCapture | null> => {
       const h = { ...headers }; delete h.Authorization; delete h.authorization;
       const args: Record<string, unknown> = { method, url, headers: h, body };
-      const useLabel = sess === undefined ? sessionLabel : sess;
-      if (useLabel) args.session = useLabel;
+      if (authToken) { h.Authorization = authToken; }
+      else { const useLabel = sess === undefined ? sessionLabel : sess; if (useLabel) args.session = useLabel; }
       const r = await opts.runner.execute("http_request", args);
       return r.ok ? (r.result as HttpCapture) : null;
     };
@@ -359,12 +362,10 @@ async function runDeepSweep(opts: {
     }
 
     // STATEFUL broken-password-change probe (F-24): observe->act->observe via the Axiom's
-    // state_changed. Uses existing usable sessions (username is non-secret; token injected
-    // by label). Runs last — it mutates a synthetic disposable account's password.
-    const usableSessions = opts.runner.getSessionMeta()
-      .filter((m) => m.has_auth_material)
-      .map((m) => ({ label: m.label, username: m.username }));
-    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, usableSessions, "");
+    // state_changed. Self-contained: creates its OWN throwaway account (needs no pre-known
+    // credential), then proves login with an attacker-set password succeeds after a change
+    // made with a WRONG old_pass. Runs last — it mutates only that throwaway account.
+    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire);
     proved.push(...pwProved);
 
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
@@ -442,86 +443,116 @@ async function bankStateChanged(
 }
 
 /**
- * STATEFUL broken-password-change probe (benchmark F-24 shape), fully generic/black-box.
- * Proves a password-change endpoint COMMITS a new password even when the supplied current
- * ("old") password is WRONG — a genuine state_changed, not a mere success-code reflection.
+ * STATEFUL broken-password-change probe (benchmark F-24 shape), fully self-contained and
+ * generic/black-box. Proves a password-change endpoint COMMITS a new password even when
+ * the supplied current ("old") password is WRONG — a genuine state_changed, not a mere
+ * success-code reflection.
  *
- * Mechanics, using an existing usable session Z (its token injected by label; we never see
- * it) and Z's username (non-secret SessionMeta):
- *   pre  C0 = login(usernameZ, P2)              -> fails; P2 is a fresh random password.
- *   act        change(session=Z, old=WRONG, new=P2)
- *   post C2 = login(usernameZ, P2)              -> succeeds IFF the change committed.
- * The success marker is the JWT extracted from C2's OWN response (a successful login on a
- * JWT app issues one; a failed login does not) — absent in C0, present in C2 => the Axiom
- * confirms `appeared:<jwt>`. No target-specific literal; degrades safely (correct app =>
- * C2 login fails => no JWT => no finding). Mutates only a synthetic disposable account.
+ * It creates and drives its OWN throwaway account so it needs no pre-known credential:
+ *   0) clone a captured SUCCESSFUL signup envelope, swap contact fields + password to
+ *      fresh unique values (P1); POST it; extract the server-ASSIGNED login id (userId).
+ *   pre  C0 = login(id, P2)                    -> fails; P2 is a second fresh password.
+ *   auth      login(id, P1) -> JWT1            (the account's own token, to authorize the change)
+ *   act       change(Bearer JWT1, old=WRONG, new=P2)
+ *   post C2 = login(id, P2)                    -> succeeds (JWT issued) IFF the change committed.
+ * Marker = the JWT extracted from C2's OWN response (a successful login on a JWT app issues
+ * one; a failed login does not) — absent in C0, present in C2 => the Axiom confirms
+ * `appeared:<jwt>`. No target-specific literal; degrades safely (correct app => C2 login
+ * fails => no JWT => no finding). Mutates only the throwaway account it created.
  */
 async function sweepBrokenPasswordChange(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
   targets: SweepTargetWithBody[],
-  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null) => Promise<HttpCapture | null>,
-  sessions: { label: string; username: string }[],
-  passwordPolicyHint: string,
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, bearer?: string) => Promise<HttpCapture | null>,
 ): Promise<ProvedEntry[]> {
   const proved: ProvedEntry[] = [];
-  if (sessions.length === 0) return proved;
 
-  // Find a login template (unauth: username+password, no old/new split) and a
-  // change-password template (old+new password, or a change-verb URL) among captures.
+  // Locate signup, login, change-password and logout templates among captured requests.
+  let signupT: SweepTargetWithBody | undefined;
   let loginT: SweepTargetWithBody | undefined; let loginFm: FieldMap | undefined;
   let changeT: SweepTargetWithBody | undefined; let changeFm: FieldMap | undefined;
+  let logoutT: SweepTargetWithBody | undefined;
   for (const t of targets) {
+    const u = t.endpoint.toLowerCase();
+    if (!logoutT && /(logout|signout)/.test(u)) logoutT = t; // logout may carry no fuzzable body
     if (!t.bodyTemplate) continue;
-    const jsonLeaves = t.params.filter((p) => t.paramKind[p] === "json");
-    const fm = mapFields(jsonLeaves);
+    const leaves = t.params.filter((p) => t.paramKind[p] === "json");
+    const fm = mapFields(leaves);
+    if (!signupT && /(signup|register)/.test(u) && fm.password) signupT = t;
     if (!loginT && looksLikeLogin(fm, t.endpoint)) { loginT = t; loginFm = fm; }
     if (!changeT && looksLikePasswordChange(fm, t.endpoint)) { changeT = t; changeFm = fm; }
   }
-  if (!loginT || !loginFm || !changeT || !changeFm || !loginFm.username || !loginFm.password || !changeFm.new_password) {
-    return proved;
-  }
+  if (!signupT || !loginT || !loginFm || !changeT || !changeFm) return proved;
+  if (!loginFm.username || !loginFm.password || !changeFm.new_password) return proved;
 
-  // A fresh, policy-valid password nothing has yet. Mixed classes + length to satisfy a
-  // typical policy; generic, not derived from the target. passwordPolicyHint reserved for
-  // future policy shaping (currently unused beyond length).
-  void passwordPolicyHint;
-  const P2 = `Sahw!${randomUUID().slice(0, 8)}Z9`;
-
+  const jsonHdr = { "Content-Type": "application/json" };
   const buildBody = (template: string, assigns: Array<[string, string]>): string => {
     let obj: unknown;
     try { obj = JSON.parse(template); } catch { return template; }
     for (const [path, val] of assigns) obj = setAtPath(obj, path, val);
     return JSON.stringify(obj);
   };
-  const jsonHdr = { "Content-Type": "application/json" };
 
-  for (const sess of sessions.slice(0, 2)) {
-    // pre: login as this user with the not-yet-set P2 -> should fail (no JWT). UNAUTH.
-    const c0 = await fire(loginT.method, loginT.endpoint, jsonHdr,
-      buildBody(loginT.bodyTemplate!, [[loginFm.username!, sess.username], [loginFm.password!, P2]]), null);
-    if (!c0) continue;
-    if (extractJwt(c0.response.body)) continue; // P2 already works? impossible normally — skip, cannot prove a delta.
-
-    // act: change password with a WRONG old_pass, as the authenticated session.
-    const changeAssigns: Array<[string, string]> = [[changeFm.new_password!, P2]];
-    if (changeFm.old_password) changeAssigns.push([changeFm.old_password, `Wrong!${randomUUID().slice(0, 6)}`]);
-    const act = await fire(changeT.method, changeT.endpoint, jsonHdr,
-      buildBody(changeT.bodyTemplate!, changeAssigns), sess.label);
-    if (!act) continue;
-
-    // post: login again with P2 -> succeeds (JWT issued) IFF the change committed. UNAUTH.
-    const c2 = await fire(loginT.method, loginT.endpoint, jsonHdr,
-      buildBody(loginT.bodyTemplate!, [[loginFm.username!, sess.username], [loginFm.password!, P2]]), null);
-    if (!c2) continue;
-    const jwt = extractJwt(c2.response.body);
-    if (!jwt) continue; // login with P2 still fails => change was correctly rejected => no finding.
-
-    const banked = await bankStateChanged(
-      opts, "auth_bypass", changeT.endpoint, `appeared:${jwt}`, [c0, act, c2],
-      "password changed with a WRONG old_pass — login with the attacker-set new password now succeeds",
-    );
-    if (banked) { proved.push(banked); break; }
+  // 0) Fresh, unique, policy-valid credentials for a throwaway signup. Password uses the
+  // same generic alphanumeric shape the framework's disposable creds use (S + hex + z9) —
+  // some signup validators reject special characters, and this shape passes broadly.
+  const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
+  const mkPw = () => `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
+  const P1 = mkPw();
+  const P2 = mkPw();
+  const signupLeaves = signupT.params.filter((p) => signupT!.paramKind[p] === "json");
+  const signupFm = mapFields(signupLeaves);
+  const assigns: Array<[string, string]> = [];
+  if (signupFm.password) assigns.push([signupFm.password, P1]);
+  for (const leaf of signupLeaves) {
+    const kind = classifyContactField(leaf.split(".").pop() || leaf);
+    if (kind === "email") assigns.push([leaf, `sahw${uniq}@mailinator.com`]);
+    else if (kind === "mobile") assigns.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
   }
+  const signupBody = buildBody(signupT.bodyTemplate!, assigns);
+  const signupResp = await fire(signupT.method, signupT.endpoint, jsonHdr, signupBody, null);
+  if (!signupResp) return proved;
+  const userId = extractAssignedId(signupResp.response.body);
+  if (!userId) return proved; // signup did not succeed / no id returned -> cannot proceed.
+
+  // The signup we just sent succeeded, so its device block is KNOWN-GOOD for this app.
+  // Graft it into the login/change/logout bodies whose captured templates may carry a
+  // device value the server rejects (e.g. an os the login endpoint refuses -> ERR009).
+  const goodDevice = findDeviceObject(JSON.parse(signupBody));
+  const loginBody = (pw: string) => graftDevice(buildBody(loginT!.bodyTemplate!, [[loginFm!.username!, userId], [loginFm!.password!, pw]]), goodDevice);
+
+  // pre: login with the not-yet-set P2 -> must fail (no JWT).
+  const c0 = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P2), null);
+  if (!c0 || extractJwt(c0.response.body)) return proved;
+
+  // auth: login with P1 to obtain this account's own token for the change call.
+  const authResp = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P1), null);
+  const jwt1 = extractJwt(authResp?.response.body);
+  if (!jwt1) return proved; // signup/login mismatch -> abort rather than mis-report.
+
+  // act: change password with a WRONG old_pass, authenticated as the account itself.
+  const changeAssigns: Array<[string, string]> = [[changeFm.new_password!, P2]];
+  if (changeFm.old_password) changeAssigns.push([changeFm.old_password, `Wrong9!${randomUUID().slice(0, 6)}`]);
+  const act = await fire(changeT.method, changeT.endpoint, jsonHdr, graftDevice(buildBody(changeT.bodyTemplate!, changeAssigns), goodDevice), null, jwt1);
+  if (!act) return proved;
+
+  // Log out JWT1 first: this app refuses a second concurrent login ("already logged in")
+  // while a session is active, which would mask the delta. Best-effort, generic.
+  if (logoutT) {
+    const logoutBody = logoutT.bodyTemplate ? graftDevice(buildBody(logoutT.bodyTemplate, []), goodDevice) : null;
+    await fire(logoutT.method, logoutT.endpoint, logoutBody ? jsonHdr : {}, logoutBody, null, jwt1);
+  }
+
+  // post: login with P2 -> succeeds (JWT issued) IFF the change committed despite wrong old.
+  const c2 = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P2), null);
+  const jwt2 = extractJwt(c2?.response.body);
+  if (!c2 || !jwt2) return proved; // still fails => change correctly rejected => no finding.
+
+  const banked = await bankStateChanged(
+    opts, "auth_bypass", changeT.endpoint, `appeared:${jwt2}`, [c0, act, c2],
+    "password changed with a WRONG old_pass — login with the attacker-set new password now succeeds",
+  );
+  if (banked) proved.push(banked);
   return proved;
 }
 
