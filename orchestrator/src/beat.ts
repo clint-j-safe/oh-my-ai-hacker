@@ -505,8 +505,15 @@ async function sweepBrokenPasswordChange(
     if (!changeT && looksLikePasswordChange(fm, t.endpoint)) { changeT = t; changeFm = fm; }
   }
   // The logout endpoint takes an EMPTY data bag, so deriveTargets drops it (no fuzzable
-  // leaves) — find its URL directly from records instead.
-  const logoutUrl = records.find((r) => /(logout|signout)/.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
+  // leaves) — find its URL directly from records. CAUTION: an LFI can leave source-file
+  // paths like /api/application/controllers/Logout in the store; those return PHP SOURCE,
+  // not a logout. Require a real API path (…/logout as a segment, not under /application/)
+  // whose RESPONSE is JSON (the real endpoint answers JSON; the source leak answers code).
+  const logoutUrl = records.find((r) => {
+    const u = r.request?.url?.toLowerCase() ?? "";
+    const resp = (r.response?.body ?? "").trimStart();
+    return /\/logout(\/|\?|$)/.test(u) && !u.includes("/application/") && resp.startsWith("{");
+  })?.request?.url ?? null;
   if (!signupTemplate) { dbg("no successful signup exchange found in records — abort"); return proved; }
   if (!loginTemplate) { dbg("no successful login exchange (JWT) found in records — abort"); return proved; }
   if (!loginT || !loginFm) { dbg("no login target/field-map — abort"); return proved; }
