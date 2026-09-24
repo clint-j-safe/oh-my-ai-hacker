@@ -20,7 +20,7 @@ import {
 } from "./spine.js";
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
-import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
+import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
 import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
@@ -333,9 +333,17 @@ async function runDeepSweep(opts: {
       if (!renderEp) continue;
       const renderT = targetByEndpoint.get(renderEp);
       // Candidate render calls, most-specific first. Session-authed (the listing is
-      // authenticated in F-19), reusing the run's default session.
+      // authenticated in F-19), reusing the run's default session. The listing endpoint
+      // (e.g. POST /api/loan) often takes the SAME request envelope with an EMPTY data bag
+      // — but because that body has no fuzzable string leaves, deriveTargets drops it, so
+      // it has no captured template. Reconstruct it from the create template with `data`
+      // emptied (a valid envelope this app requires; a bare "{}" is rejected as ERR001).
       const renderShapes: Array<{ method: string; body: string | null; hdr: Record<string, string> }> = [];
       if (renderT?.bodyTemplate) renderShapes.push({ method: renderT.method, body: renderT.bodyTemplate, hdr: { "Content-Type": "application/json" } });
+      try {
+        const env = JSON.parse(createT.bodyTemplate); emptyDataInPlace(env);
+        renderShapes.push({ method: renderT?.method ?? "POST", body: JSON.stringify(env), hdr: { "Content-Type": "application/json" } });
+      } catch { /* skip */ }
       renderShapes.push({ method: renderT?.method ?? "POST", body: "{}", hdr: { "Content-Type": "application/json" } });
       renderShapes.push({ method: "GET", body: null, hdr: {} });
       const jsonLeaves = createT.params.filter((p) => createT.paramKind[p] === "json").slice(0, 4);
@@ -365,7 +373,7 @@ async function runDeepSweep(opts: {
     // state_changed. Self-contained: creates its OWN throwaway account (needs no pre-known
     // credential), then proves login with an attacker-set password succeeds after a change
     // made with a WRONG old_pass. Runs last — it mutates only that throwaway account.
-    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire);
+    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, records as RawRecord[]);
     proved.push(...pwProved);
 
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
@@ -460,30 +468,53 @@ async function bankStateChanged(
  * `appeared:<jwt>`. No target-specific literal; degrades safely (correct app => C2 login
  * fails => no JWT => no finding). Mutates only the throwaway account it created.
  */
+interface RawRecord { request?: { method?: string; url?: string; body?: string | null }; response?: { body?: string } }
+
 async function sweepBrokenPasswordChange(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
   targets: SweepTargetWithBody[],
   fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, bearer?: string) => Promise<HttpCapture | null>,
+  records: RawRecord[],
 ): Promise<ProvedEntry[]> {
   const proved: ProvedEntry[] = [];
+  const dbg = (m: string) => { try { console.error(`[f24-probe] ${m}`); } catch { /* ignore */ } };
 
-  // Locate signup, login, change-password and logout templates among captured requests.
-  let signupT: SweepTargetWithBody | undefined;
-  let loginT: SweepTargetWithBody | undefined; let loginFm: FieldMap | undefined;
+  // Learn KNOWN-GOOD templates from SUCCESSFUL captured exchanges rather than from
+  // deriveTargets' single representative (which can be a malformed variant, e.g. a signup
+  // using a short/invalid field that the server rejects with SNUP03). A signup whose
+  // RESPONSE yields an assigned id, and a login whose RESPONSE carries a JWT, are proven
+  // to work against THIS app — the most robust, still-black-box source of a valid envelope.
+  const bodyOf = (re: RegExp, ok: (respBody: string) => boolean): string | null => {
+    for (const r of records) {
+      const u = r.request?.url?.toLowerCase() ?? "";
+      const b = r.request?.body;
+      if (re.test(u) && typeof b === "string" && b.trim().startsWith("{") && ok(r.response?.body ?? "")) return b;
+    }
+    return null;
+  };
+  const signupTemplate = bodyOf(/(signup|register)/, (rb) => extractAssignedId(rb) !== null);
+  const loginTemplate = bodyOf(/login/, (rb) => extractJwt(rb) !== null);
+
+  // Change + logout endpoints: their captured field NAMES suffice (we supply the values).
   let changeT: SweepTargetWithBody | undefined; let changeFm: FieldMap | undefined;
   let logoutT: SweepTargetWithBody | undefined;
+  let loginT: SweepTargetWithBody | undefined; let loginFm: FieldMap | undefined;
   for (const t of targets) {
     const u = t.endpoint.toLowerCase();
-    if (!logoutT && /(logout|signout)/.test(u)) logoutT = t; // logout may carry no fuzzable body
+    if (!logoutT && /(logout|signout)/.test(u)) logoutT = t;
     if (!t.bodyTemplate) continue;
-    const leaves = t.params.filter((p) => t.paramKind[p] === "json");
-    const fm = mapFields(leaves);
-    if (!signupT && /(signup|register)/.test(u) && fm.password) signupT = t;
+    const fm = mapFields(t.params.filter((p) => t.paramKind[p] === "json"));
     if (!loginT && looksLikeLogin(fm, t.endpoint)) { loginT = t; loginFm = fm; }
     if (!changeT && looksLikePasswordChange(fm, t.endpoint)) { changeT = t; changeFm = fm; }
   }
-  if (!signupT || !loginT || !loginFm || !changeT || !changeFm) return proved;
-  if (!loginFm.username || !loginFm.password || !changeFm.new_password) return proved;
+  if (!signupTemplate) { dbg("no successful signup exchange found in records — abort"); return proved; }
+  if (!loginTemplate) { dbg("no successful login exchange (JWT) found in records — abort"); return proved; }
+  if (!loginT || !loginFm) { dbg("no login target/field-map — abort"); return proved; }
+  if (!changeT || !changeFm || !changeFm.new_password) { dbg("no change-password target/new_pass field — abort"); return proved; }
+
+  // Endpoints to send to (canonical), taken from the successful exchanges' own URLs.
+  const signupUrl = records.find((r) => /(signup|register)/.test(r.request?.url?.toLowerCase() ?? "") && extractAssignedId(r.response?.body ?? "") !== null)!.request!.url!;
+  const loginUrl = records.find((r) => /login/.test(r.request?.url?.toLowerCase() ?? "") && extractJwt(r.response?.body ?? "") !== null)!.request!.url!;
 
   const jsonHdr = { "Content-Type": "application/json" };
   const buildBody = (template: string, assigns: Array<[string, string]>): string => {
@@ -493,48 +524,51 @@ async function sweepBrokenPasswordChange(
     return JSON.stringify(obj);
   };
 
-  // 0) Fresh, unique, policy-valid credentials for a throwaway signup. Password uses the
-  // same generic alphanumeric shape the framework's disposable creds use (S + hex + z9) —
-  // some signup validators reject special characters, and this shape passes broadly.
+  // 0) Fresh, unique, policy-valid credentials. Password uses the generic S+hex+z9 shape
+  // the framework's disposable creds use (some validators reject special characters).
   const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
   const mkPw = () => `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
   const P1 = mkPw();
   const P2 = mkPw();
-  const signupLeaves = signupT.params.filter((p) => signupT!.paramKind[p] === "json");
-  const signupFm = mapFields(signupLeaves);
+  const signupFm = mapFields(jsonStringLeafPaths(JSON.parse(signupTemplate)));
   const assigns: Array<[string, string]> = [];
   if (signupFm.password) assigns.push([signupFm.password, P1]);
-  for (const leaf of signupLeaves) {
+  for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
     const kind = classifyContactField(leaf.split(".").pop() || leaf);
     if (kind === "email") assigns.push([leaf, `sahw${uniq}@mailinator.com`]);
     else if (kind === "mobile") assigns.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
   }
-  const signupBody = buildBody(signupT.bodyTemplate!, assigns);
-  const signupResp = await fire(signupT.method, signupT.endpoint, jsonHdr, signupBody, null);
-  if (!signupResp) return proved;
-  const userId = extractAssignedId(signupResp.response.body);
-  if (!userId) return proved; // signup did not succeed / no id returned -> cannot proceed.
+  const signupBody = buildBody(signupTemplate, assigns);
+  const signupResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);
+  const userId = extractAssignedId(signupResp?.response.body);
+  if (!userId) { dbg(`signup did not return an assigned id: ${(signupResp?.response.body ?? "").slice(0, 80)}`); return proved; }
+  dbg(`signup ok, userId=${userId}`);
+
+  // Login field names from the SUCCESSFUL login template.
+  const loginFmGood = mapFields(jsonStringLeafPaths(JSON.parse(loginTemplate)));
+  if (!loginFmGood.username || !loginFmGood.password) { dbg("successful login template lacks username/password fields — abort"); return proved; }
 
   // The signup we just sent succeeded, so its device block is KNOWN-GOOD for this app.
-  // Graft it into the login/change/logout bodies whose captured templates may carry a
-  // device value the server rejects (e.g. an os the login endpoint refuses -> ERR009).
   const goodDevice = findDeviceObject(JSON.parse(signupBody));
-  const loginBody = (pw: string) => graftDevice(buildBody(loginT!.bodyTemplate!, [[loginFm!.username!, userId], [loginFm!.password!, pw]]), goodDevice);
+  const loginBody = (pw: string) => graftDevice(buildBody(loginTemplate, [[loginFmGood.username!, userId], [loginFmGood.password!, pw]]), goodDevice);
 
   // pre: login with the not-yet-set P2 -> must fail (no JWT).
-  const c0 = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P2), null);
-  if (!c0 || extractJwt(c0.response.body)) return proved;
+  const c0 = await fire("POST", loginUrl, jsonHdr, loginBody(P2), null);
+  if (!c0) { dbg("pre-login request failed to capture — abort"); return proved; }
+  if (extractJwt(c0.response.body)) { dbg("pre-login with P2 unexpectedly returned a JWT — abort"); return proved; }
 
   // auth: login with P1 to obtain this account's own token for the change call.
-  const authResp = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P1), null);
+  const authResp = await fire("POST", loginUrl, jsonHdr, loginBody(P1), null);
   const jwt1 = extractJwt(authResp?.response.body);
-  if (!jwt1) return proved; // signup/login mismatch -> abort rather than mis-report.
+  if (!jwt1) { dbg(`auth-login with P1 returned no JWT: ${(authResp?.response.body ?? "").slice(0, 80)} — abort`); return proved; }
+  dbg("auth-login ok, have JWT1");
 
   // act: change password with a WRONG old_pass, authenticated as the account itself.
   const changeAssigns: Array<[string, string]> = [[changeFm.new_password!, P2]];
-  if (changeFm.old_password) changeAssigns.push([changeFm.old_password, `Wrong9!${randomUUID().slice(0, 6)}`]);
+  if (changeFm.old_password) changeAssigns.push([changeFm.old_password, `Swrong99old${randomUUID().slice(0, 4)}z9`]);
   const act = await fire(changeT.method, changeT.endpoint, jsonHdr, graftDevice(buildBody(changeT.bodyTemplate!, changeAssigns), goodDevice), null, jwt1);
-  if (!act) return proved;
+  if (!act) { dbg("change request failed to capture — abort"); return proved; }
+  dbg(`change resp: ${(act.response.body ?? "").slice(0, 80)}`);
 
   // Log out JWT1 first: this app refuses a second concurrent login ("already logged in")
   // while a session is active, which would mask the delta. Best-effort, generic.
@@ -544,9 +578,10 @@ async function sweepBrokenPasswordChange(
   }
 
   // post: login with P2 -> succeeds (JWT issued) IFF the change committed despite wrong old.
-  const c2 = await fire(loginT.method, loginT.endpoint, jsonHdr, loginBody(P2), null);
+  const c2 = await fire("POST", loginUrl, jsonHdr, loginBody(P2), null);
   const jwt2 = extractJwt(c2?.response.body);
-  if (!c2 || !jwt2) return proved; // still fails => change correctly rejected => no finding.
+  if (!c2 || !jwt2) { dbg(`post-login with P2 returned no JWT (change correctly rejected, or logout needed): ${(c2?.response.body ?? "").slice(0, 80)}`); return proved; }
+  dbg("post-login with P2 SUCCEEDED — banking state_changed");
 
   const banked = await bankStateChanged(
     opts, "auth_bypass", changeT.endpoint, `appeared:${jwt2}`, [c0, act, c2],
