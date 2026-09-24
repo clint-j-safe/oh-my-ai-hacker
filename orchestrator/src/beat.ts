@@ -324,7 +324,7 @@ async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sess
   const benign = `<?xml version="1.0"?><r><x>sahwbenignxml</x></r>`;
   let n = 0;
   for (const t of targets) {
-    if (n >= 8) break;
+    if (n >= 24) break;  // cover all derived targets, not just the first few (contactUs sorts late)
     if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
     if (!t.bodyTemplate) continue;
     n++;
