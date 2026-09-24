@@ -133,3 +133,31 @@ test("buildXxeXml: elements named after the app's fields, entity in non-email fi
   assert.ok(xml.includes("<email>sahwxxe@example.test</email>"), "email gets a benign value");
   assert.ok(!xml.includes("<x>"), "no generic placeholder element");
 });
+
+test("F-13 deriver: CONFIRMED when OTP issued from a single identity field, no secondary factor", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "no_secondary_factor_before_otp" },
+    cap(200, ""), null,
+    { derivedInput: { requestFieldNames: ["data.userid", "data.otp_type"], exploitResponse: '{"status":"Success","status_code":"OTP001","data":{"response":"enc=="}}', controlResponse: '{"status":"Failed","status_code":"PSW002"}' } },
+  );
+  assert.equal(v.status, "CONFIRMED", v.reason);
+});
+
+test("F-13 deriver: FALSE_POSITIVE when a secondary-factor field is present", () => {
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "no_secondary_factor_before_otp" },
+    cap(200, ""), null,
+    { derivedInput: { requestFieldNames: ["data.userid", "data.dob", "data.otp_type"], exploitResponse: '{"status":"Success"}', controlResponse: '{"status":"Failed"}' } },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE", v.reason);
+});
+
+test("F-13 deriver: FALSE_POSITIVE when exploit and control responses are identical (issuance not shown)", () => {
+  const same = '{"status":"Success","status_code":"OTP001"}';
+  const v = evaluate(
+    { statement: "s", type: "derived", expression: "no_secondary_factor_before_otp" },
+    cap(200, ""), null,
+    { derivedInput: { requestFieldNames: ["data.userid", "data.otp_type"], exploitResponse: same, controlResponse: same } },
+  );
+  assert.equal(v.status, "FALSE_POSITIVE", v.reason);
+});

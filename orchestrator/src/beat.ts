@@ -376,6 +376,11 @@ async function runDeepSweep(opts: {
     const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, records as RawRecord[]);
     proved.push(...pwProved);
 
+    // DERIVED probe (F-13): password-reset OTP issued from a single identity field, no
+    // secondary factor. Non-destructive; banks via the Axiom's no_secondary_factor deriver.
+    const nsfProved = await sweepNoSecondaryFactorOtp(opts, fire, records as RawRecord[]);
+    proved.push(...nsfProved);
+
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
   } catch { return empty; }
@@ -469,6 +474,97 @@ async function bankStateChanged(
  * fails => no JWT => no finding). Mutates only the throwaway account it created.
  */
 interface RawRecord { request?: { method?: string; url?: string; body?: string | null }; response?: { body?: string } }
+
+/** Read a dot-path string leaf from a parsed JSON value (mirror of setAtPath). */
+function readAtPath(obj: unknown, path: string): string | null {
+  let cur: unknown = obj;
+  for (const part of path.split(".")) {
+    if (!cur || typeof cur !== "object") return null;
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return typeof cur === "string" ? cur : null;
+}
+
+/** Bank a `derived` sweep finding through the Axiom's named-deriver registry. The deriver
+ * (fixed, reviewed code) computes the verdict from typed evidence; a claim cannot supply
+ * the answer. Records with invariant_type=derived on CONFIRMED. */
+async function bankDerived(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  vulnClass: string, endpoint: string, deriverName: string, derivedInput: unknown, reasonPrefix: string,
+): Promise<ProvedEntry | null> {
+  const inv: Invariant = { statement: `deep-sweep: ${reasonPrefix}`, type: "derived", expression: deriverName };
+  // derived reads evidence.derivedInput; exploit/control are unused by it. Pass a minimal
+  // placeholder capture for the (unused) exploit arg.
+  const placeholder = { request: { method: "POST", url: endpoint, headers: {}, body: null }, response: { status: 0, headers: {}, body: "" } } as unknown as HttpCapture;
+  const verdict = evaluate(inv, placeholder, null, { derivedInput });
+  if (verdict.status !== "CONFIRMED") return null;
+  const ep = opts.canon(endpoint);
+  const findingId = `SAHW-${randomUUID().slice(0, 8)}`;
+  const row: FindingRow = {
+    engagement_id: opts.engagementId, finding_id: findingId, vuln_class: vulnClass, endpoint: ep,
+    verdict: "CONFIRMED", invariant_type: "derived",
+    verdict_reason: boundReason(`deep-sweep (${reasonPrefix}): ${verdict.reason}`),
+    langfuse_trace_id: opts.obs.traceId(), utc: new Date().toISOString(),
+  };
+  await opts.obs.mergeEndpoint(ep, "POST");
+  await opts.obs.mergeFinding(row);
+  await opts.obs.recordFinding(row);
+  return { vuln_class: vulnClass, endpoint: ep, invariant_type: "derived", verdict: "CONFIRMED", finding_id: findingId };
+}
+
+/**
+ * STATELESS derived probe (benchmark F-13): prove the password-reset OTP is issued from a
+ * SINGLE identity field with NO secondary factor. Uses a registered userid recovered from a
+ * successful signup exchange as the valid identity, and a syntactically-valid but
+ * unregistered id as the control. Banks via the no_secondary_factor_before_otp deriver,
+ * which confirms only from the request's field structure + the valid/invalid differential.
+ */
+async function sweepNoSecondaryFactorOtp(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string) => Promise<HttpCapture | null>,
+  records: RawRecord[],
+): Promise<ProvedEntry[]> {
+  const proved: ProvedEntry[] = [];
+  const dbg = (m: string) => { try { console.error(`[f13-probe] ${m}`); } catch { /* ignore */ } };
+  // A forgot-password request whose response ISSUED an OTP (data payload present) — proven
+  // good, and carries the exact field shape + a valid registered userid.
+  const forgotRec = records.find((r) => /forgot/.test(r.request?.url?.toLowerCase() ?? "")
+    && typeof r.request?.body === "string" && r.request.body.trim().startsWith("{")
+    && /otp/i.test(r.response?.body ?? "") && /success/i.test(r.response?.body ?? ""));
+  if (!forgotRec) { dbg("no successful OTP-issuing forgot exchange in records — abort"); return proved; }
+  const forgotUrl = forgotRec.request!.url!;
+  const forgotBody = forgotRec.request!.body!;
+  let parsed: unknown;
+  try { parsed = JSON.parse(forgotBody); } catch { dbg("forgot body unparseable"); return proved; }
+  const leaves = jsonStringLeafPaths(parsed);
+  const idFm = mapFields(leaves);
+  const idPath = idFm.username; // the identity leaf (userid)
+  if (!idPath) { dbg("no identity field in forgot body"); return proved; }
+  const validId = readAtPath(parsed, idPath);
+  if (!validId) { dbg("no valid userid value in the successful forgot body"); return proved; }
+
+  const jsonHdr = { "Content-Type": "application/json" };
+  const build = (idVal: string) => {
+    const clone = JSON.parse(forgotBody);
+    return JSON.stringify(setAtPath(clone, idPath, idVal));
+  };
+  // exploit: the KNOWN-GOOD forgot (valid registered userid) -> OTP issued.
+  const exploit = await fire("POST", forgotUrl, jsonHdr, build(validId), null);
+  // control: same shape, a syntactically-valid but unregistered id -> no OTP.
+  const invalidId = `SAHW${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  const control = await fire("POST", forgotUrl, jsonHdr, build(invalidId), null);
+  if (!exploit || !control) { dbg("forgot exploit/control failed to capture"); return proved; }
+  dbg(`exploit=${(exploit.response.body ?? "").slice(0, 50)} control=${(control.response.body ?? "").slice(0, 50)}`);
+
+  const banked = await bankDerived(
+    opts, "auth_bypass", forgotUrl, "no_secondary_factor_before_otp",
+    { requestFieldNames: leaves, exploitResponse: exploit.response.body ?? "", controlResponse: control.response.body ?? "" },
+    "OTP issued from a single identity field with no secondary factor required",
+  );
+  if (banked) { proved.push(banked); dbg("F-13 banked"); }
+  else dbg("deriver did not confirm");
+  return proved;
+}
 
 async function sweepBrokenPasswordChange(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },

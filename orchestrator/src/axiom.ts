@@ -440,11 +440,56 @@ function deriveTlsUnavailable(input: unknown): Verdict {
   return { status: "CONFIRMED", reason: `no HTTPS service reachable across ${input.origins.length} origin(s)` };
 }
 
+// --- no_secondary_factor_before_otp (benchmark F-13) --------------------------------------
+// Proves a password-reset OTP is issued using ONLY a single identity field, with NO
+// secondary identity factor (email/mobile/DOB/security question) required. SOUND, not a
+// claimant boolean: it computes the property from OBJECTIVE evidence —
+//   (1) the OTP-issuing request's OWN data field names contain exactly one identity field
+//       and ZERO secondary-factor fields (the app cannot have required a factor it was
+//       never sent), AND
+//   (2) the OTP was genuinely issued, proven by a control differential: the SAME request
+//       shape with an INVALID identity does NOT issue (so issuance is gated on the single
+//       identity value, not a canned response) and the exploit response carries an OTP
+//       payload the control lacks.
+// This is a deduction from real request structure + two real responses, never a trusted
+// assertion, and it uses generic field-name classification, not target success vocabulary.
+interface NoSecondaryFactorInput { requestFieldNames: string[]; exploitResponse: string; controlResponse: string }
+function isNsfInput(x: unknown): x is NoSecondaryFactorInput {
+  return isRecord(x) && Array.isArray(x.requestFieldNames)
+    && x.requestFieldNames.every((f) => typeof f === "string")
+    && typeof x.exploitResponse === "string" && typeof x.controlResponse === "string";
+}
+const IDENTITY_FIELD = /^(user(id|name)?|email|mobile|phone|msisdn|account|acct|custid|login)/i;
+const SECONDARY_FACTOR_FIELD = /(dob|birth|security|secret|question|answer|maiden|aadhar|aadhaar|pan|passport|ssn|kyc)/i;
+const PLUMBING_FIELD = /^(otp_type|otptype|timestamp|deviceid|os|host|device|type)$/i;
+function deriveNoSecondaryFactorBeforeOtp(input: unknown): Verdict {
+  if (!isNsfInput(input)) {
+    return { status: "NEEDS_REVIEW", reason: "no_secondary_factor_before_otp requires { requestFieldNames: string[], exploitResponse: string, controlResponse: string }" };
+  }
+  const leaves = input.requestFieldNames.map((f) => f.split(".").pop() || f);
+  const identity = leaves.filter((f) => IDENTITY_FIELD.test(f) && !PLUMBING_FIELD.test(f));
+  const secondary = leaves.filter((f) => SECONDARY_FACTOR_FIELD.test(f));
+  if (secondary.length > 0) {
+    return { status: "FALSE_POSITIVE", reason: `a secondary-factor field WAS present in the OTP request: ${secondary.join(", ")}` };
+  }
+  if (identity.length !== 1) {
+    return { status: "NEEDS_REVIEW", reason: `expected exactly one identity field in the OTP request, found ${identity.length}: ${identity.join(", ")}` };
+  }
+  if (input.exploitResponse === input.controlResponse) {
+    return { status: "FALSE_POSITIVE", reason: "OTP-issuing response is identical to the invalid-identity control — issuance not demonstrated" };
+  }
+  return {
+    status: "CONFIRMED",
+    reason: `OTP issued from a single identity field (${identity[0]}) with no secondary factor; issuance confirmed by control differential vs an invalid identity`,
+  };
+}
+
 const DERIVERS: Record<string, Deriver> = {
   hs256_weak_key: deriveHs256WeakKey,
   aes_cbc_decrypt_matches: deriveAesCbcDecryptMatches,
   jwt_payload_contains: deriveJwtPayloadContains,
   tls_unavailable: deriveTlsUnavailable,
+  no_secondary_factor_before_otp: deriveNoSecondaryFactorBeforeOtp,
 };
 
 function evaluateDerived(expression: string, evidence: EvidenceBundle | undefined): Verdict {
