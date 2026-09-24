@@ -250,6 +250,47 @@ export const TOOL_SCHEMAS: OpenAI.Chat.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "submit_finding",
+      description:
+        "Submit ONE proven finding for verification. This is HOW you bank a finding — " +
+        "call it the moment you have evidence for a violated invariant; do NOT just " +
+        "describe the finding in prose. The verifier replays your claim independently " +
+        "and rules CONFIRMED / NEEDS_REVIEW / FALSE_POSITIVE, then you are asked for " +
+        "the NEXT, DIFFERENT finding. Fields mirror the claim contract: `endpoint` and " +
+        "`invariant` are required; add `control_url` for body_contains/status_in; add " +
+        "`request`/`control_request` ({method,headers?,body?}) when the trigger is a " +
+        "non-GET request; add `steps` for state_changed/state_violated/" +
+        "file_created_then_deleted; add `derived_input` for a derived claim; attach " +
+        "durable recon as `intel`. Never put secret values in any field.",
+      parameters: {
+        type: "object",
+        properties: {
+          vuln_class: { type: "string", description: "Exactly one snake_case class from the allowed vocabulary." },
+          endpoint: { type: "string" },
+          control_url: { type: "string" },
+          invariant: {
+            type: "object",
+            properties: {
+              statement: { type: "string" },
+              type: { type: "string" },
+              expression: { type: "string" },
+            },
+            required: ["statement", "type", "expression"],
+          },
+          request: { type: "object", description: "Exploit request spec: {method, headers?, body?}. Endpoint is the URL." },
+          control_request: { type: "object", description: "Control request spec for control_url: {method, headers?, body?}." },
+          steps: { type: "array", description: "Ordered request specs for state_changed/state_violated/file_created_then_deleted." },
+          derived_input: { type: "object", description: "Typed input for a derived claim's deriver." },
+          session: { type: "string", description: "Optional session label (e.g. \"B\") to run the proof authenticated." },
+          intel: { type: "object", description: "Durable recon facts (string/boolean values) to persist. Never secrets." },
+        },
+        required: ["vuln_class", "endpoint", "invariant"],
+      },
+    },
+  },
 ];
 
 // --- skill_run: one dispatcher tool for every pre-built skill, not 37 separate ones --
@@ -813,6 +854,19 @@ export class ToolRunner {
       if (tool === "grep_artifact") return { ok: true, result: await this.grepArtifact(args) };
       if (tool === "skill_run") return { ok: true, result: await this.skillRun(args) };
       if (tool === "register_account") return { ok: true, result: await this.registerAccount(args) };
+      if (tool === "submit_finding") {
+        // Pure control-plane ack. The claim itself is read from THIS call's arguments
+        // by the beat (parseClaim), which runs the real verification (replay + Axiom +
+        // provenance). Executing here does no I/O and changes no state — it only
+        // acknowledges receipt so the model's turn closes cleanly. A missing required
+        // field is reported so the model can resubmit a well-formed claim.
+        const missing = (["vuln_class", "endpoint", "invariant"] as const)
+          .filter((k) => args[k] === undefined || args[k] === null || args[k] === "");
+        if (missing.length) {
+          return { ok: false, kind: "invalid_argument", denied: `submit_finding missing required field(s): ${missing.join(", ")}` };
+        }
+        return { ok: true, result: { received: true, note: "claim received; verification will run — proceed to your NEXT, different finding." } };
+      }
       return { ok: false, kind: "no_executor", denied: `no executor for tool: ${tool}` };
     } catch (err) {
       // Belt-and-braces: even with the upfront hash validation below, ArtifactStore.get()

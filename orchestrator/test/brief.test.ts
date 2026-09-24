@@ -20,7 +20,7 @@ test("the brief is well-formed: opens and closes with the root tag, one concern 
   assert.match(xml.trim(), /<\/safe_ai_hacker_hunter>$/);
   for (const tag of [
     "system_identity", "operational_principles", "attack_surface", "recovered_intel",
-    "already_proved", "dead_ends", "thinking_framework", "parameter_analysis",
+    "already_proved", "remaining_targets", "dead_ends", "thinking_framework", "parameter_analysis",
     "prioritization_rules", "evidence_discipline", "tool_guidance", "output_contract", "budget",
   ]) {
     assert.match(xml, new RegExp(`<${tag}>`), `missing <${tag}>`);
@@ -123,4 +123,56 @@ test("recovered_intel rendering is BOUNDED: a huge intel map does not bloat the 
   assert.match(sect, /api_route_table/);
   assert.match(sect, /jwt_key_source/);
   assert.match(sect, /omitted to keep this brief lean/);
+});
+
+test("<remaining_targets> renders the human-method probe for OPEN classes as PRIORITY, and widen-probes for recurring proved classes", () => {
+  // proved covers sqli + xss_reflected but NOT the auth/signup classes → those stay open
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    proved: [
+      { vuln_class: "sqli", endpoint: "http://h/api/x", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" },
+      { vuln_class: "info_disclosure", endpoint: "http://h/info.php", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-2" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const sect = section(xml, "remaining_targets");
+  assert.match(sect, /PRIORITY \(open classes/);
+  // open classes get a concrete behavioural method, not a path
+  assert.match(sect, /weak_password_policy: .*1-character password/);
+  assert.match(sect, /insecure_transport: .*tls_unavailable/);
+  assert.match(sect, /improper_session_invalidation: .*OLD token/);
+  // a proved recurring class shows up under WIDEN, not PRIORITY
+  assert.match(sect, /WIDEN/);
+  assert.match(sect, /info_disclosure: .*debug\/stack-trace/);
+});
+
+test("<canonical_targets> marks recovered routes tested vs UNTESTED from the proved list (recon+spine derived)", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    recoveredIntel: { api_route_table: "/api/login /api/password/change /api/loan/apply /api/beneficiary/pay" },
+    proved: [
+      { vuln_class: "auth_bypass", endpoint: "http://h/api/password/change", invariant_type: "body_contains", verdict: "CONFIRMED", finding_id: "SAHW-1" },
+    ],
+  };
+  const xml = buildHunterBrief(state);
+  const sect = section(xml, "canonical_targets");
+  // the route with a proved finding shows its class; other routes show [none]
+  assert.match(sect, /\/api\/password\/change\s+— proved: auth_bypass/);
+  assert.match(sect, /\/api\/loan\/apply\s+— proved: \[none\]/);
+  assert.match(sect, /\/api\/beneficiary\/pay\s+— proved: \[none\]/);
+  assert.match(sect, /route\(s\) with NO finding yet/);
+});
+
+test("<canonical_targets> is per (route × class): a route with one class still shows that class, flagging OTHER classes open there", () => {
+  const state: HunterBriefState = {
+    ...EMPTY_STATE,
+    recoveredIntel: { api_route_table: "/api/loan/apply /api/login" },
+    proved: [
+      { vuln_class: "deserialization_rce", endpoint: "http://h/api/loan/apply", invariant_type: "state_changed", verdict: "CONFIRMED", finding_id: "SAHW-9" },
+    ],
+  };
+  const sect = section(buildHunterBrief(state), "canonical_targets");
+  // loan/apply shows the RCE but the directive makes clear other classes remain open there
+  assert.match(sect, /\/api\/loan\/apply\s+— proved: deserialization_rce/);
+  assert.match(sect, /per \(route × vuln_class\)/);
 });

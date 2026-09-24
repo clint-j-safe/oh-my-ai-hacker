@@ -183,6 +183,11 @@ export function checkCommand(cmd: string): Decision {
 const KNOWN_TOOLS = new Set([
   "http_request", "read_artifact", "grep_artifact", "glob_artifact",
   "write_file", "shell_exec", "skill_run", "register_account",
+  // submit_finding is a control-plane tool: it carries the hunter's claim to the
+  // verifier and performs NO I/O of its own (no network, no filesystem, no state
+  // change), so it is unconditionally allowed like read_artifact — the gate has no
+  // network branch for it and falls through to ALLOW.
+  "submit_finding",
 ]);
 
 // --- skill_run egress classification -------------------------------------------------
