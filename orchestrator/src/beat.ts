@@ -495,18 +495,18 @@ async function sweepBrokenPasswordChange(
   const signupTemplate = bodyOf(/(signup|register)/, (rb) => extractAssignedId(rb) !== null);
   const loginTemplate = bodyOf(/login/, (rb) => extractJwt(rb) !== null);
 
-  // Change + logout endpoints: their captured field NAMES suffice (we supply the values).
+  // Change endpoint: its captured field NAMES suffice (we supply the values).
   let changeT: SweepTargetWithBody | undefined; let changeFm: FieldMap | undefined;
-  let logoutT: SweepTargetWithBody | undefined;
   let loginT: SweepTargetWithBody | undefined; let loginFm: FieldMap | undefined;
   for (const t of targets) {
-    const u = t.endpoint.toLowerCase();
-    if (!logoutT && /(logout|signout)/.test(u)) logoutT = t;
     if (!t.bodyTemplate) continue;
     const fm = mapFields(t.params.filter((p) => t.paramKind[p] === "json"));
     if (!loginT && looksLikeLogin(fm, t.endpoint)) { loginT = t; loginFm = fm; }
     if (!changeT && looksLikePasswordChange(fm, t.endpoint)) { changeT = t; changeFm = fm; }
   }
+  // The logout endpoint takes an EMPTY data bag, so deriveTargets drops it (no fuzzable
+  // leaves) — find its URL directly from records instead.
+  const logoutUrl = records.find((r) => /(logout|signout)/.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
   if (!signupTemplate) { dbg("no successful signup exchange found in records — abort"); return proved; }
   if (!loginTemplate) { dbg("no successful login exchange (JWT) found in records — abort"); return proved; }
   if (!loginT || !loginFm) { dbg("no login target/field-map — abort"); return proved; }
@@ -570,11 +570,16 @@ async function sweepBrokenPasswordChange(
   if (!act) { dbg("change request failed to capture — abort"); return proved; }
   dbg(`change resp: ${(act.response.body ?? "").slice(0, 80)}`);
 
-  // Log out JWT1 first: this app refuses a second concurrent login ("already logged in")
-  // while a session is active, which would mask the delta. Best-effort, generic.
-  if (logoutT) {
-    const logoutBody = logoutT.bodyTemplate ? graftDevice(buildBody(logoutT.bodyTemplate, []), goodDevice) : null;
-    await fire(logoutT.method, logoutT.endpoint, logoutBody ? jsonHdr : {}, logoutBody, null, jwt1);
+  // Log out JWT1 first: this app refuses a second concurrent login ("already logged in" —
+  // LGN005) while a session is active, which masks the delta. Reconstruct a valid logout
+  // envelope from the signup body with `data` emptied (a bare body is rejected), POST it
+  // authenticated as JWT1. Generic, best-effort.
+  if (logoutUrl) {
+    let logoutBody: string;
+    try { const env = JSON.parse(signupBody); emptyDataInPlace(env); logoutBody = JSON.stringify(env); }
+    catch { logoutBody = "{}"; }
+    const lo = await fire("POST", logoutUrl, jsonHdr, graftDevice(logoutBody, goodDevice), null, jwt1);
+    dbg(`logout resp: ${(lo?.response.body ?? "").slice(0, 60)}`);
   }
 
   // post: login with P2 -> succeeds (JWT issued) IFF the change committed despite wrong old.
