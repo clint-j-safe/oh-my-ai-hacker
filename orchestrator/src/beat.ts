@@ -617,9 +617,13 @@ async function sweepNegativeTransfer(
   // Endpoint URL discovery from records (canonical API origin).
   const urlFor = (re: RegExp) => records.find((r) => re.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
   const jsonBody = (x: RawRecord) => typeof x.request?.body === "string" && x.request.body.trim().startsWith("{");
-  const signupTemplate = (() => { const r = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractAssignedId(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
-  const loginTemplate = (() => { const r = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractJwt(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
-  const signupUrl = urlFor(/(signup|register)/), loginUrl = urlFor(/\/login(\/|\?|$)/);
+  // Derive URL and body from the SAME SUCCESSFUL record so they can't mismatch (e.g. a
+  // probe's 404 /api/register url paired with a real /api/signup body).
+  const signupRec = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractAssignedId(x.response?.body ?? "") !== null);
+  const loginRec = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractJwt(x.response?.body ?? "") !== null);
+  const signupTemplate = signupRec?.request?.body ?? null;
+  const loginTemplate = loginRec?.request?.body ?? null;
+  const signupUrl = signupRec?.request?.url ?? null, loginUrl = loginRec?.request?.url ?? null;
   const payUrl = urlFor(/beneficiary\/pay/), listUrl = urlFor(/beneficiary\/list/);
   const otpGetUrl = urlFor(/otp\/get/), otpVerifyUrl = urlFor(/otp\/verify/), detailsUrl = urlFor(/account\/details/);
   if (!signupTemplate || !loginTemplate || !signupUrl || !loginUrl || !payUrl || !listUrl || !otpGetUrl || !otpVerifyUrl || !detailsUrl) {
