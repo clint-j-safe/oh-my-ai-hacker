@@ -288,10 +288,12 @@ async function runDeepSweep(opts: {
     // XSS. The render endpoint's METHOD/body is NOT always GET — F-19's listing is a
     // POST /api/loan with a JSON body — so we try several generic render shapes (the
     // captured template if any, then POST {}, then GET) and take the first that echoes.
+    const sxdbg = (m: string) => { try { console.error(`[f19-probe] ${m}`); } catch { /* ignore */ } };
     for (const createT of targets.slice(0, 50)) {
       if (!createT.bodyTemplate) continue;
       const renderEp = renderEndpointFor(createT.endpoint);
       if (!renderEp) continue;
+      if (/loan/i.test(createT.endpoint)) sxdbg(`create=${createT.endpoint} render=${renderEp} leaves=${createT.params.filter((p) => createT.paramKind[p] === "json").join(",")}`);
       const renderT = targetByEndpoint.get(renderEp);
       // Candidate render calls, most-specific first. Session-authed (the listing is
       // authenticated in F-19), reusing the run's default session. The listing endpoint
@@ -327,13 +329,16 @@ async function runDeepSweep(opts: {
           const injectValue = swapped ? Buffer.from(swapped, "utf8").toString("base64") : xss;
           persistBody = JSON.stringify(setAtPath(tmplObj, leaf, injectValue));
         } catch { continue; }
+        const isLoan = /loan/i.test(createT.endpoint);
+        if (isLoan) sxdbg(`leaf=${leaf} gadget=${Boolean(swapped)} shapes=${renderShapes.length}`);
         for (const shape of renderShapes) {
           const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
-          if (!baseline) continue;
+          if (!baseline) { if (isLoan) sxdbg(`baseline null (${shape.method})`); continue; }
           if ((baseline.response.body ?? "").includes(canary)) continue; // canary already there? bogus shape
-          await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
+          const persistResp = await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
           const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body);
           if (!rendered) continue;
+          if (isLoan) sxdbg(`${shape.method} persist=${(persistResp?.response.body ?? "").slice(0,30)} rendered_has_canary=${(rendered.response.body ?? "").includes(canary)} renderlen=${(rendered.response.body ?? "").length}`);
           if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
             const b = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
             if (b) { proved.push(b); banked = true; break; }
