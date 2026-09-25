@@ -39,6 +39,7 @@ export interface Engagement {
   maxRetries: number;
   profile: "test" | "prod";
   deep: DeepConfig;
+  auth: AuthConfig;
 }
 
 type Env = Record<string, string | undefined>;
@@ -94,6 +95,49 @@ export function loadDeepConfig(env: Env, authRef: string): DeepConfig {
   }
 
   return { enabled: true, weaponize, maxSweepRequests, maxEscalationDepth, weaponizeAuthRef };
+}
+
+export type AuthMode = "off" | "bypass" | "authenticated";
+export interface AuthLogin { email?: string; username?: string; password: string; loginUrl?: string; fieldHints?: Record<string, string> }
+export interface AuthConfig {
+  mode: AuthMode;
+  login: AuthLogin | null;
+  totp: string | { secret: string; algorithm?: string; digits?: number; period?: number } | null;
+}
+
+/** Auth-scan config. Fail-closed: bypass/authenticated require SAHW_AUTH_LOGIN (with a
+ * password). TOTP is parsed only in authenticated mode; bypass NEVER consumes a secret.
+ * A TOTP-gated flow with no secret is caught later, at record time, not here. */
+export function loadAuthConfig(env: Env): AuthConfig {
+  const raw = (env.SAHW_AUTH_MODE ?? "off").trim().toLowerCase();
+  if (raw !== "off" && raw !== "bypass" && raw !== "authenticated") {
+    throw new ConfigError(`SAHW_AUTH_MODE must be off|bypass|authenticated, got: ${env.SAHW_AUTH_MODE}`);
+  }
+  const mode = raw as AuthMode;
+  if (mode === "off") return { mode, login: null, totp: null };
+
+  const loginRaw = env.SAHW_AUTH_LOGIN?.trim();
+  if (!loginRaw) throw new ConfigError(`SAHW_AUTH_MODE=${mode} requires SAHW_AUTH_LOGIN`);
+  let login: AuthLogin;
+  try { login = JSON.parse(loginRaw) as AuthLogin; }
+  catch { throw new ConfigError("SAHW_AUTH_LOGIN is not valid JSON"); }
+  if (!login || typeof login.password !== "string" || login.password === "") {
+    throw new ConfigError("SAHW_AUTH_LOGIN must include a non-empty password");
+  }
+  if (!login.email && !login.username) {
+    throw new ConfigError("SAHW_AUTH_LOGIN must include an email or username");
+  }
+
+  let totp: AuthConfig["totp"] = null;
+  if (mode === "authenticated") {
+    const t = env.SAHW_TOTP?.trim();
+    if (t) {
+      totp = t.toLowerCase().startsWith("otpauth://") ? t : (() => {
+        try { return JSON.parse(t) as { secret: string }; } catch { return t; }
+      })();
+    }
+  }
+  return { mode, login, totp };
 }
 
 function urls(raw: string | undefined, key: string): URL[] {
@@ -159,5 +203,6 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
     maxRetries: num(env, "SAHW_MAX_RETRIES", 0),
     profile: profileRaw,
     deep: loadDeepConfig(env, authRef),
+    auth: loadAuthConfig(env),
   };
 }
