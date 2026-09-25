@@ -217,6 +217,33 @@ interface SweepObs {
 // their own label (valid enterprise findings; scored non-canonical for the 28).
 const SWEEP_CLASS_MAP: Record<string, string> = { html_injection: "xss_reflected", dom_xss: "xss_reflected" };
 
+/** Raw HTTP/1.1 GET over a TCP socket with an EXPLICIT Host header. fetch()/undici silently
+ * DROP a manually-set Host (it is a forbidden request header), which would send every vhost
+ * probe to the default site — so vhost routing must be done at the socket level. Returns
+ * {status, body}; {status:0} on failure. */
+async function httpHostRaw(ip: string, hostHeader: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const socket = netConnect({ host: ip, port: 80, timeout: 8000 });
+    const done = (r: { status: number; body: string }) => { if (settled) return; settled = true; try { socket.destroy(); } catch { /* */ } resolve(r); };
+    socket.on("timeout", () => done({ status: 0, body: "" }));
+    socket.on("error", () => done({ status: 0, body: "" }));
+    socket.on("data", (d: Buffer | string) => chunks.push(Buffer.from(d)));
+    socket.on("close", () => {
+      const raw = Buffer.concat(chunks).toString("latin1");
+      const sep = raw.indexOf("\r\n\r\n");
+      const head = sep >= 0 ? raw.slice(0, sep) : raw;
+      const body = sep >= 0 ? raw.slice(sep + 4) : "";
+      const status = parseInt(/^HTTP\/\d\.\d\s+(\d{3})/.exec(head)?.[1] ?? "0", 10) || 0;
+      done({ status, body });
+    });
+    socket.on("connect", () => {
+      socket.write(`GET / HTTP/1.1\r\nHost: ${hostHeader}\r\nUser-Agent: sahw-recon\r\nAccept: */*\r\nConnection: close\r\n\r\n`);
+    });
+  });
+}
+
 /** Raw-TCP AXFR (zone transfer) against <server>:53 for <domain>. Best-effort: returns the
  * names it can reconstruct from the response, or [] on any failure/timeout. */
 async function axfrTcp(domain: string, server: string): Promise<string[]> {
@@ -254,7 +281,7 @@ async function axfrTcp(domain: string, server: string): Promise<string[]> {
  * traces to the IP's own DNS (PTR/AXFR) or a scoped domain.
  */
 async function runDnsRecon(opts: {
-  runner: ToolRunner; engagement: Engagement; scopeOrigins: string[]; scopeUrls: string[]; attackSurface: SpineEndpoint[];
+  engagement: Engagement; scopeOrigins: string[]; scopeUrls: string[]; attackSurface: SpineEndpoint[];
 }): Promise<string[]> {
   const log = (m: string) => { try { console.error(`[dns-recon] ${m}`); } catch { /* */ } };
   try {
@@ -264,12 +291,7 @@ async function runDnsRecon(opts: {
         catch { return []; }
       },
       axfr: (domain, server) => axfrTcp(domain, server),
-      httpHost: async (ip, host) => {
-        const r = await opts.runner.execute("http_request", { method: "GET", url: `http://${ip}/`, headers: { Host: host } });
-        if (!r.ok) return { status: 0, body: "" };
-        const cap = r.result as HttpCapture;
-        return { status: cap.response.status, body: cap.response.body ?? "" };
-      },
+      httpHost: (ip, host) => httpHostRaw(ip, host),
     };
     const found = await discoverVhosts(opts.scopeOrigins, exec, log);
     const seeded: string[] = [];
@@ -1743,7 +1765,7 @@ export async function runBeat(opts: {
   // built so discovered vhosts land in scope, /etc/hosts, and the attack surface the hunter
   // is briefed on. Mutates in place. Fails soft.
   if (engagement.deep.enabled && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
-    await runDnsRecon({ runner, engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
+    await runDnsRecon({ engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
   }
 
   // Registration phase (deterministic half) — runs BEFORE the brief is built so
