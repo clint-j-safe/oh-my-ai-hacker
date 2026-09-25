@@ -162,3 +162,57 @@ export async function judgeClaim(opts: {
     return { score: -1, lean: "unsure", rationale: `judge call failed: ${(e as Error)?.message ?? e}`, model: opts.model, ok: false };
   }
 }
+
+export interface GenuineVerdict { isGenuine: boolean; confidence: number; rationale: string; model: string; ok: boolean }
+
+const GENUINE_SCHEMA = {
+  type: "object", additionalProperties: false,
+  properties: {
+    is_genuine: { type: "boolean" },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    rationale: { type: "string" },
+  },
+  required: ["is_genuine", "confidence", "rationale"],
+} as const;
+
+/**
+ * SEMANTIC false-positive auditor (distinct from judgeClaim, which scores rubric adherence).
+ * A deterministic gate already CONFIRMED this via a control-differential; this asks whether
+ * the finding is a GENUINE, reportable vulnerability of its class — not a server error, a
+ * public-by-design asset, or a benign default. ADVISORY + fail-open: the caller only ever
+ * DEMOTES to NEEDS_REVIEW on a confident not-genuine, never drops or upgrades.
+ */
+export async function verifyGenuineFinding(opts: {
+  client: JudgeClient | undefined; model: string | undefined;
+  vulnClass: string; invariant: Invariant; exploit: HttpCapture | null; control: HttpCapture | null;
+  bodyBytes?: number; signal?: AbortSignal;
+}): Promise<GenuineVerdict> {
+  const FAIL: GenuineVerdict = { isGenuine: true, confidence: 0, rationale: "strict-verify unavailable", model: opts.model ?? "disabled", ok: false };
+  if (!opts.client || !opts.model || !opts.model.trim()) return FAIL;
+  const bytes = Math.max(200, opts.bodyBytes ?? 1400);
+  const system =
+    "You are a STRICT false-positive auditor for a web pentest. A deterministic gate already " +
+    "CONFIRMED a finding via a control-differential. Decide if it is a GENUINE, reportable " +
+    "vulnerability of the stated class — NOT a 5xx server error, NOT a public-by-design static " +
+    "asset, NOT a benign framework/CORS default, NOT an incidental differential. Be conservative: " +
+    'only say is_genuine=false with high confidence when you are sure it is not a real finding. ' +
+    'Reply JSON only: {"is_genuine":bool,"confidence":0..1,"rationale":"<=200 chars"}.';
+  const user =
+    `VULN CLASS: ${opts.vulnClass}\nINVARIANT: ${opts.invariant.type}\n` +
+    `CLAIM: ${clip(opts.invariant.statement, 300)}\nEXPRESSION: ${clip(opts.invariant.expression, 200)}\n\n` +
+    `${captureView("EXPLOIT", opts.exploit, bytes)}\n${captureView("CONTROL", opts.control, bytes)}`;
+  try {
+    const completion = await opts.client.chat.completions.create(
+      { model: opts.model, messages: [{ role: "system", content: system }, { role: "user", content: user }],
+        response_format: { type: "json_schema", json_schema: { name: "genuine_verdict", strict: true, schema: GENUINE_SCHEMA } },
+        max_tokens: 300 },
+      opts.signal ? { signal: opts.signal } : undefined);
+    const content = completion?.choices?.[0]?.message?.content;
+    const parsed = typeof content === "string" ? firstJsonObject(content) : null;
+    if (!parsed || typeof parsed.is_genuine !== "boolean" || typeof parsed.confidence !== "number") return FAIL;
+    return { isGenuine: parsed.is_genuine, confidence: Math.max(0, Math.min(1, parsed.confidence)),
+             rationale: clip(String(parsed.rationale ?? ""), 240), model: opts.model, ok: true };
+  } catch (e) {
+    return { ...FAIL, rationale: `strict-verify call failed: ${(e as Error)?.message ?? e}` };
+  }
+}

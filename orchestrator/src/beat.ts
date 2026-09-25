@@ -8,7 +8,7 @@ import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type Ski
 import { SessionStore } from "./session.js";
 import { runAgent, type MinimalClient } from "./agent.js";
 import { evaluate, guardConfirmedVerdict, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
-import { judgeClaim } from "./judge.js";
+import { judgeClaim, verifyGenuineFinding } from "./judge.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
@@ -3039,14 +3039,30 @@ export async function runBeat(opts: {
           const finalStatus = guarded.status;
           const finalReason = guarded.status !== adjudicatedStatus ? boundReason(guarded.reason ?? "class guard demotion") : verdictReason;
 
+          // STRICT-VERIFY LLM VETO (opt-in, self-hosted, best-effort). Only on coarse-invariant
+          // CONFIRMEDs; can only DEMOTE to NEEDS_REVIEW on a confident not-genuine; fails open.
+          const COARSE_INVARIANTS = new Set(["status_in", "body_contains", "response_asserted"]);
+          let vStatus = finalStatus, vReason = finalReason;
+          if (engagement.strictVerify && vStatus === "CONFIRMED" && COARSE_INVARIANTS.has(effectiveInvariantType) && judgeModel) {
+            const gv = await verifyGenuineFinding({
+              client: opts.client as unknown as import("./judge.js").JudgeClient, model: judgeModel,
+              vulnClass: claim.vuln_class, invariant: claim.invariant as Invariant,
+              exploit, control, bodyBytes: numEnv(opts.env, "SAHW_TOOL_PREVIEW_BYTES", 1400), signal: controller.signal,
+            });
+            if (gv.ok && !gv.isGenuine && gv.confidence >= engagement.strictVerifyThreshold) {
+              vStatus = "NEEDS_REVIEW";
+              vReason = boundReason(`strict-verify demoted CONFIRMED (not genuine @ ${gv.confidence}): ${gv.rationale}`);
+            }
+          }
+
           const row: FindingRow = {
             engagement_id: engagement.authRef,
             finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
             vuln_class: claim.vuln_class,
             endpoint: claim.endpoint,
-            verdict: finalStatus,
+            verdict: vStatus,
             invariant_type: effectiveInvariantType,
-            verdict_reason: finalReason,
+            verdict_reason: vReason,
             langfuse_trace_id: langfuseTraceId,
             utc: new Date().toISOString(),
           };
