@@ -1,2 +1,0 @@
-HTTP 200 POST /api/account/details
-{"status":"Success","status_code":"ACT002","message":"Account details","timestamp":1789881863,"data":{"accountNumber":"911777887041","accountBalance":"956922.29","incomeTaxNumber":"7674475681","openDate":"2026-09-20 00:00:00","currency":"INR","fname":"Beta","lname":"Beta","avatar":null,"address":"2 Bb Street","dob":"1991-02-02","mobileNo":"9111111122","email":"bbbeta2609200515@bbtest.io","aadharId":"948680225301","panCardId":"0301199968","walletId":"7507054304","gender":"1","countryId":"IND","userId":"BNK00623"}}

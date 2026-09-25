@@ -1,2 +1,0 @@
-reset via A's OTP ref: Success PSW004
-login B with attacker-set password: Success LGN002

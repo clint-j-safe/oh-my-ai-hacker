@@ -1,2 +1,0 @@
-HTTP 200 /api/beneficiary/fetch
-{"status":"Success","status_code":"BNF012","message":"Bank Details of Beneficiary","timestamp":1789883466,"data":{"alias":"XPATH syntax error: '~8.0.19'","email":"NULL","accountNumber":"NULL","ifscCode":"NULL","creationDateTime":"NULL"}}

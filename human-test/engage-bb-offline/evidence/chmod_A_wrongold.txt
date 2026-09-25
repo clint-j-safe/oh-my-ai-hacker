@@ -1,2 +1,0 @@
-HTTP 200 /api/password/change
-{"status":"Success","status_code":"PSW008","message":"Password Changed Successfully","timestamp":1789882587,"data":{}}

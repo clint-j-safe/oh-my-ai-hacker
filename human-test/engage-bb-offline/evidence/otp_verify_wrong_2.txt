@@ -1,2 +1,0 @@
-HTTP 200 /api/otp/verify
-{"status":"Failed","status_code":"OTP004","message":"Incorrect OTP","timestamp":1789883469,"data":[]}

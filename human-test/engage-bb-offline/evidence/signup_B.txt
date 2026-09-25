@@ -1,6 +1,0 @@
-HTTP 200  POST /api/signup
-  Server: Apache/2.4.33 (Unix)
-  X-Powered-By: PHP/7.2.7
-  Access-Control-Allow-Origin: *
-  Access-Control-Allow-Credentials: true
-{"status":"Success","status_code":"SNUP02","message":"Signup Successful","timestamp":1789881533,"data":{"userId":"BNK00623","refNo":"806785125159685"}}

@@ -1,2 +1,0 @@
-GET /bbpoc_66155.php -> HTTP 200
-BBPOC_66155_OK
