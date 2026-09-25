@@ -656,6 +656,7 @@ async function sweepNegativeTransfer(
     } catch { return null; }
   };
 
+  dbg("AES recovered — signing up throwaway payer");
   // Signup + login a throwaway payer, device grafted.
   const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
   const P1 = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
@@ -666,12 +667,13 @@ async function sweepNegativeTransfer(
   for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
     const k = classifyContactField(leaf.split(".").pop() || leaf);
     if (k === "email") sAssign.push([leaf, `sahw${uniq}@mailinator.com`]);
-    else if (k === "mobile") sAssign.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
+    else if (k === "mobile") sAssign.push([leaf, `9${Array.from({length:9},()=>Math.floor(Math.random()*10)).join("")}`]);
   }
   const signupBody = build(signupTemplate, sAssign);
   const sResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);
   const P = extractAssignedId(sResp?.response.body);
-  if (!P) { dbg(`signup failed: ${(sResp?.response.body ?? "").slice(0, 60)}`); return proved; }
+  if (!P) { dbg(`signup failed (${(sResp?.response.body ?? "").slice(0, 70)})`); return proved; }
+  dbg(`payer signed up: ${P}`);
   const goodDevice = findDeviceObject(JSON.parse(signupBody));
   const lFm = mapFields(jsonStringLeafPaths(JSON.parse(loginTemplate)));
   if (!lFm.username || !lFm.password) { dbg("login template missing fields"); return proved; }
@@ -813,7 +815,7 @@ async function sweepBrokenPasswordChange(
   for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
     const kind = classifyContactField(leaf.split(".").pop() || leaf);
     if (kind === "email") assigns.push([leaf, `sahw${uniq}@mailinator.com`]);
-    else if (kind === "mobile") assigns.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
+    else if (kind === "mobile") assigns.push([leaf, `9${Array.from({length:9},()=>Math.floor(Math.random()*10)).join("")}`]);
   }
   const signupBody = buildBody(signupTemplate, assigns);
   const signupResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);
