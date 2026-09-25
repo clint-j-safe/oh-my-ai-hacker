@@ -289,10 +289,18 @@ async function runDeepSweep(opts: {
     // POST /api/loan with a JSON body — so we try several generic render shapes (the
     // captured template if any, then POST {}, then GET) and take the first that echoes.
     const sxdbg = (m: string) => { try { console.error(`[f19-probe] ${m}`); } catch { /* ignore */ } };
+    const rawRecs = records as RawRecord[];
     for (const createT of targets.slice(0, 50)) {
       if (!createT.bodyTemplate) continue;
       const renderEp = renderEndpointFor(createT.endpoint);
       if (!renderEp) continue;
+      // Persist from a SUCCESSFUL captured create request when one exists — deriveTargets'
+      // representative body may carry fuzz values (e.g. amount="sahwbenign") the create
+      // endpoint rejects, so the row never persists+renders. A success body has valid values.
+      const createBody = (() => {
+        const r = rawRecs.find((x) => { try { return opts.canon(x.request?.url ?? "") === createT.endpoint && typeof x.request?.body === "string" && x.request.body.trim().startsWith("{") && /success/i.test(x.response?.body ?? ""); } catch { return false; } });
+        return r?.request?.body ?? createT.bodyTemplate!;
+      })();
       if (/loan/i.test(createT.endpoint)) sxdbg(`create=${createT.endpoint} render=${renderEp} leaves=${createT.params.filter((p) => createT.paramKind[p] === "json").join(",")}`);
       const renderT = targetByEndpoint.get(renderEp);
       // Candidate render calls, most-specific first. Session-authed (the listing is
@@ -304,7 +312,7 @@ async function runDeepSweep(opts: {
       const renderShapes: Array<{ method: string; body: string | null; hdr: Record<string, string> }> = [];
       if (renderT?.bodyTemplate) renderShapes.push({ method: renderT.method, body: renderT.bodyTemplate, hdr: { "Content-Type": "application/json" } });
       try {
-        const env = JSON.parse(createT.bodyTemplate); emptyDataInPlace(env);
+        const env = JSON.parse(createBody); emptyDataInPlace(env);
         renderShapes.push({ method: renderT?.method ?? "POST", body: JSON.stringify(env), hdr: { "Content-Type": "application/json" } });
       } catch { /* skip */ }
       renderShapes.push({ method: renderT?.method ?? "POST", body: "{}", hdr: { "Content-Type": "application/json" } });
@@ -318,7 +326,7 @@ async function runDeepSweep(opts: {
         let persistBody: string;
         let usedGadget = false;
         try {
-          const tmplObj = JSON.parse(createT.bodyTemplate);
+          const tmplObj = JSON.parse(createBody);
           // If this field's CAPTURED value is a base64 PHP-serialized gadget (the app
           // unserializes it and stores one string property — e.g. a loan `type` carrying a
           // LogWrite whose `logdata` is persisted+rendered), inject the canary INTO that
