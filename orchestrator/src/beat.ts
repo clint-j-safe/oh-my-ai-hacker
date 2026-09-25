@@ -22,8 +22,8 @@ import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelat
 import {
   candidateLoginRequests, classifyLoginResponse,
   extractScriptSrcs, extractApiHints, candidateLoginUrls, classifyLoginProbe, detectCognito,
-  extractApiRoutes, fillRouteTemplate, looksLikeRealEndpoint,
-  type DiscoveredLogin,
+  detectTokenHeaders, extractApiRoutes, fillRouteTemplate, looksLikeRealEndpoint,
+  type DiscoveredLogin, type DiscoveredTokenHeaders,
 } from "./auth-recon.js";
 import { parseTotp, TotpEmitter } from "./totp.js";
 import { cognitoAuthenticate, AWS_REGION_RE, COGNITO_CLIENT_ID_RE, type CognitoConfig, type CognitoTokens } from "./auth-cognito.js";
@@ -1956,24 +1956,36 @@ async function fingerprintCognito(opts: {
   fetchImpl: typeof fetch;
   inScope: (url: string) => boolean;
   maxBundles?: number;
-}): Promise<CognitoConfig | null> {
+}): Promise<{ config: CognitoConfig; headers: DiscoveredTokenHeaders } | null> {
   const { scopeOrigin, fetchImpl, inScope } = opts;
   const readText = async (url: string): Promise<string | null> => {
     if (!inScope(url)) return null;
     try { const res = await fetchImpl(url, { redirect: "manual" } as any); return await res.text(); }
     catch { return null; }
   };
+  // Accumulate the token-header mapping across every scanned bundle (first-seen wins) —
+  // the {id,access,refresh}TokenHeader object may live in a different chunk than the
+  // Amplify Auth config that carries region/clientId. Keep scanning for headers even
+  // after the config is found.
+  const headers: DiscoveredTokenHeaders = {};
+  const mergeHeaders = (h: DiscoveredTokenHeaders): void => {
+    if (!headers.idTokenHeader && h.idTokenHeader) headers.idTokenHeader = h.idTokenHeader;
+    if (!headers.accessTokenHeader && h.accessTokenHeader) headers.accessTokenHeader = h.accessTokenHeader;
+    if (!headers.refreshTokenHeader && h.refreshTokenHeader) headers.refreshTokenHeader = h.refreshTokenHeader;
+  };
   const root = await readText(new URL("/", scopeOrigin).toString());
   if (!root) return null;
+  mergeHeaders(detectTokenHeaders(root));
+  let config: CognitoConfig | null = null;
   const srcs = extractScriptSrcs(root, scopeOrigin).slice(0, opts.maxBundles ?? 5);
   for (const s of srcs) {
     const js = await readText(s);
     if (js) {
-      const cfg = detectCognito(js);
-      if (cfg) return cfg;
+      mergeHeaders(detectTokenHeaders(js));
+      if (!config) config = detectCognito(js);
     }
   }
-  return null;
+  return config ? { config, headers } : null;
 }
 
 export async function runAuthRecord(opts: {
@@ -2014,8 +2026,13 @@ export async function runAuthRecord(opts: {
   // normal in-scope path.
   const provider = auth.provider ?? "auto";
   let cognitoConfig: CognitoConfig | null = auth.cognito ?? null;
+  // Token-header names discovered from the target's own bundle (never hardcoded). Only
+  // populated on the fingerprint path; with an explicit SAHW_COGNITO the operator supplies
+  // header names via config instead.
+  let discoveredHeaders: DiscoveredTokenHeaders = {};
   if (provider !== "form" && !cognitoConfig && opts.scopeOrigin) {
-    cognitoConfig = await fingerprintCognito({ scopeOrigin: opts.scopeOrigin, fetchImpl, inScope });
+    const fp = await fingerprintCognito({ scopeOrigin: opts.scopeOrigin, fetchImpl, inScope });
+    if (fp) { cognitoConfig = fp.config; discoveredHeaders = fp.headers; }
   }
   const useCognito = provider === "cognito" || (provider === "auto" && cognitoConfig !== null);
   if (useCognito) {
@@ -2042,11 +2059,32 @@ export async function runAuthRecord(opts: {
     const username = login.email ?? login.username;
     if (!username) throw new Error("cognito login requires login.email or login.username");
     const totpSecret = typeof auth.totp === "string" ? auth.totp : auth.totp?.secret;
-    const authHeader = auth.authHeader ?? "x-safe-id-token";
-    // Access-token header (secondary). Unset -> "authorization" (Amplify convention);
-    // explicitly "" -> disabled (id-token-only backends). See the sessions.create below.
+    // ID-token header: explicit config (SAHW_AUTH_HEADER) > discovered from the target
+    // bundle > (below) fail-closed. NEVER a hardcoded target-specific default — the header
+    // name is a per-app convention and must come from the target or the operator.
+    const authHeader = auth.authHeader ?? discoveredHeaders.idTokenHeader;
+    // Access-token header (secondary): explicit config (SAHW_COGNITO_ACCESS_HEADER) >
+    // discovered > "authorization" (the Amplify convention, a safe last-resort fallback).
+    // Explicit "" disables it entirely (id-token-only backends).
     const accessHeaderRaw = opts.env?.SAHW_COGNITO_ACCESS_HEADER;
-    const accessHeader = accessHeaderRaw === undefined ? "authorization" : accessHeaderRaw.trim();
+    const accessHeader = accessHeaderRaw !== undefined
+      ? accessHeaderRaw.trim()
+      : (discoveredHeaders.accessTokenHeader ?? "authorization");
+    // Fail-closed: if we could neither discover nor be told the id-token header name, do
+    // NOT guess (a wrong header authenticates but then 403s on every call, masquerading as
+    // an entitlement problem). Seed no session and log a clear, actionable reason.
+    if (!authHeader) {
+      console.error("[auth-record] cognito: id-token header name is neither configured (SAHW_AUTH_HEADER) nor discoverable from the target bundle; seeding no session this beat");
+      return {
+        login_url: `cognito://${cognitoConfig.region}/${cognitoConfig.clientId}`,
+        content_type: "json",
+        identifier_field: login.email ? "email" : "username",
+        password_field: "password",
+        auth_header_name: "none",
+        token_location: "none",
+        two_factor: "none",
+      };
+    }
 
     // FAIL SOFT (fix round 1): a Cognito authentication FAILURE AT RUNTIME — wrong
     // credentials (NotAuthorizedException etc.), a transport/network error reaching

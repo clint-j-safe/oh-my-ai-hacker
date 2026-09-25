@@ -131,7 +131,8 @@ test("cognito provider auto-fingerprinted from the target's own bundle; bundle f
     "GET https://t/": () => ({ status: 200, body: '<html><script src="/app.js"></script></html>' }),
     "GET https://t/app.js": () => ({
       status: 200,
-      body: "var c={userPoolId:`us-east-1_Y4lomyxe9`,userPoolWebClientId:`4e4np8b76ra8uvf8ou2t6fmm9t`,region:`us-east-1`};",
+      body: "var c={userPoolId:`us-east-1_Y4lomyxe9`,userPoolWebClientId:`4e4np8b76ra8uvf8ou2t6fmm9t`,region:`us-east-1`};" +
+        "var h={accessTokenHeader:`authorization`,idTokenHeader:`x-safe-id-token`,refreshTokenHeader:`x-safe-refresh-token`};",
     }),
     [`POST ${IDP} AWSCognitoIdentityProviderService.InitiateAuth`]: () => ({
       status: 200, body: JSON.stringify({ AuthenticationResult: { IdToken: "id-direct", AccessToken: "acc-direct" } }),
@@ -147,9 +148,32 @@ test("cognito provider auto-fingerprinted from the target's own bundle; bundle f
     scopeOrigin: "https://t",
   });
   assert.match(shape.login_url, /^cognito:\/\/us-east-1\/4e4np8b76ra8uvf8ou2t6fmm9t$/);
-  assert.equal(shape.auth_header_name, "x-safe-id-token"); // default header
+  assert.equal(shape.auth_header_name, "x-safe-id-token"); // DISCOVERED from the bundle, not hardcoded
   assert.ok(sessions.has("A"));
   assert.equal(sessions.authMaterialFor("A"), "id-direct");
+  // access-token header also discovered from the bundle
+  assert.deepEqual(sessions.extraHeadersFor("A"), { authorization: "acc-direct" });
+});
+
+test("cognito auto-fingerprint but bundle has NO token-header mapping and no SAHW_AUTH_HEADER: fails closed, seeds no session (never guesses a header)", async () => {
+  const sessions = new SessionStore({ maxAccounts: 3 });
+  const IDP = "https://cognito-idp.us-east-1.amazonaws.com/";
+  const fetchImpl = routerFetch({
+    "GET https://t/": () => ({ status: 200, body: '<html><script src="/app.js"></script></html>' }),
+    // config present (region/clientId) but NO {id,access}TokenHeader mapping anywhere
+    "GET https://t/app.js": () => ({ status: 200, body: "var c={userPoolId:`us-east-1_Y4lomyxe9`,userPoolWebClientId:`4e4np8b76ra8uvf8ou2t6fmm9t`,region:`us-east-1`};" }),
+    [`POST ${IDP} AWSCognitoIdentityProviderService.InitiateAuth`]: () => ({
+      status: 200, body: JSON.stringify({ AuthenticationResult: { IdToken: "id-x", AccessToken: "acc-x" } }),
+    }),
+  });
+  const shape = await runAuthRecord({
+    auth: { mode: "bypass", login: { email: "u@x.io", password: "pw" }, totp: null },
+    inScope: (u) => u.startsWith("https://t"),
+    fetchImpl, sessions, now: () => 59_000, sleep: async () => {}, scopeOrigin: "https://t",
+  });
+  assert.equal(shape.auth_header_name, "none");
+  assert.equal(shape.token_location, "none");
+  assert.ok(!sessions.has("A"), "no session seeded when the header name is unknown");
 });
 
 test("cognito provider: a runtime auth failure (wrong credentials) fails SOFT — no session seeded, beat proceeds, does not throw", async () => {

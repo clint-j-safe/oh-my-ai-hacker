@@ -43,12 +43,16 @@ test("invalid mode value throws", () => {
   assert.throws(() => loadAuthConfig({ SAHW_AUTH_MODE: "full" }));
 });
 
-test("cognito provider defaults: provider auto, cognito null, cognitoEnroll false, authHeader x-safe-id-token", () => {
+test("cognito provider defaults: provider auto, cognito null, cognitoEnroll false, authHeader UNDEFINED (no hardcoded target-specific default)", () => {
   const c = loadAuthConfig({});
   assert.equal(c.provider, "auto");
   assert.equal(c.cognito, null);
   assert.equal(c.cognitoEnroll, false);
-  assert.equal(c.authHeader, "x-safe-id-token");
+  assert.equal(c.authHeader, undefined);
+});
+
+test("SAHW_AUTH_HEADER, when set, is the explicit override for the id-token header", () => {
+  assert.equal(loadAuthConfig({ SAHW_AUTH_HEADER: "x-my-id-token" }).authHeader, "x-my-id-token");
 });
 
 test("SAHW_AUTH_PROVIDER=cognito + SAHW_COGNITO parses region/clientId", () => {

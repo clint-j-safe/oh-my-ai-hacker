@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse, detectCognito } from "../src/auth-recon.js";
+import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse, detectCognito, detectTokenHeaders } from "../src/auth-recon.js";
 
 test("candidateLoginRequests emits json-first email/username variants, cheap-first", () => {
   const a = candidateLoginRequests("https://t/login", { email: "e@x.io", password: "p" });
@@ -100,6 +100,23 @@ test("detectCognito derives region from the pool id's own prefix when region is 
   const snippet = "userPoolId:'us-east-1_Y4lomyxe9',userPoolWebClientId:'4e4np8b76ra8uvf8ou2t6fmm9t'";
   const cfg = detectCognito(snippet);
   assert.deepEqual(cfg, { region: "us-east-1", clientId: "4e4np8b76ra8uvf8ou2t6fmm9t" });
+});
+
+test("detectTokenHeaders extracts the SPA's id/access/refresh token header mapping from its bundle", () => {
+  const snippet = "var s={accessTokenHeader:`authorization`,idTokenHeader:`x-safe-id-token`,refreshTokenHeader:`x-safe-refresh-token`};";
+  assert.deepEqual(detectTokenHeaders(snippet), {
+    idTokenHeader: "x-safe-id-token",
+    accessTokenHeader: "authorization",
+    refreshTokenHeader: "x-safe-refresh-token",
+  });
+});
+
+test("detectTokenHeaders omits keys that are absent or not header-name-shaped (never guesses)", () => {
+  assert.deepEqual(detectTokenHeaders("const x = 1;"), {});
+  // present key but a non-header-name value (spaces/quotes) is rejected
+  assert.deepEqual(detectTokenHeaders("idTokenHeader:`not a header name`"), {});
+  // partial mapping: only what's present and valid
+  assert.deepEqual(detectTokenHeaders("idTokenHeader:'x-id'"), { idTokenHeader: "x-id" });
 });
 
 test("detectCognito returns null when the bundle has no Cognito config", () => {

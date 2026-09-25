@@ -128,6 +128,36 @@ export function classifyLoginResponse(resp: { status: number; headers: Record<st
  * that fails the shape check is treated as "not confidently Cognito" — this function
  * returns null rather than a best-effort/unsafe guess.
  */
+/** Custom auth-token header names an SPA sends its Cognito tokens under, as published
+ * in its own bundle config (e.g. `{accessTokenHeader:'authorization',
+ * idTokenHeader:'x-safe-id-token',refreshTokenHeader:'x-safe-refresh-token'}`). The engine
+ * discovers these from the target rather than hardcoding any one app's convention. */
+export interface DiscoveredTokenHeaders {
+  idTokenHeader?: string;
+  accessTokenHeader?: string;
+  refreshTokenHeader?: string;
+}
+
+// A plausible HTTP header name (RFC 7230 token chars, kept conservative). Guards against a
+// bundle string that matched the key but is not a real header name.
+const TOKEN_HEADER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+
+/** Extract the SPA's token-header mapping from bundle text. Returns only the keys actually
+ * present and shaped like a header name; missing/malformed keys are omitted (never guessed).
+ * Pure and side-effect-free, mirroring detectCognito. */
+export function detectTokenHeaders(bundleText: string): DiscoveredTokenHeaders {
+  const grab = (key: string): string | undefined => {
+    const m = bundleText.match(new RegExp(key + "\\s*:\\s*[`'\"]([^`'\"]+)[`'\"]"));
+    const v = m?.[1]?.trim();
+    return v && TOKEN_HEADER_NAME_RE.test(v) ? v : undefined;
+  };
+  const out: DiscoveredTokenHeaders = {};
+  const id = grab("idTokenHeader"); if (id) out.idTokenHeader = id;
+  const ac = grab("accessTokenHeader"); if (ac) out.accessTokenHeader = ac;
+  const rf = grab("refreshTokenHeader"); if (rf) out.refreshTokenHeader = rf;
+  return out;
+}
+
 export function detectCognito(bundleText: string): CognitoConfig | null {
   const poolId = bundleText.match(/userPoolId\s*:\s*[`'"]([^`'"]+)[`'"]/);
   const clientId = bundleText.match(/userPoolWebClientId\s*:\s*[`'"]([^`'"]+)[`'"]/);

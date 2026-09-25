@@ -127,9 +127,11 @@ export interface AuthConfig {
    * account requiring setup with this false fails closed rather than silently
    * enrolling a device the operator didn't ask for. */
   cognitoEnroll?: boolean;
-  /** Header name the IdToken (or, for non-Cognito flows, any recovered auth
-   * material) is injected under when seeding session "A". Default "x-safe-id-token"
-   * — this app's own convention, not a generic Authorization/Bearer header. */
+  /** Explicit override (SAHW_AUTH_HEADER) for the header name the IdToken (or, for
+   * non-Cognito flows, any recovered auth material) is injected under when seeding
+   * session "A". Undefined by default — NOT hardcoded to any one app's convention: the
+   * Cognito path discovers the header name from the target's own bundle, and this
+   * override wins when set. */
   authHeader?: string;
 }
 
@@ -168,7 +170,7 @@ export function loadAuthConfig(env: Env): AuthConfig {
   }
 
   const cognitoEnroll = boolEnv(env, "SAHW_COGNITO_ENROLL", false);
-  const authHeader = env.SAHW_AUTH_HEADER?.trim() || "x-safe-id-token";
+  const authHeader = env.SAHW_AUTH_HEADER?.trim() || undefined;
 
   if (mode === "off") return { mode, login: null, totp: null, provider, cognito, cognitoEnroll, authHeader };
 
