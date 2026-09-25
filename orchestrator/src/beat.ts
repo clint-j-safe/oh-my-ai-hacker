@@ -290,6 +290,40 @@ async function runDeepSweep(opts: {
     // captured template if any, then POST {}, then GET) and take the first that echoes.
     const sxdbg = (m: string) => { try { console.error(`[f19-probe] ${m}`); } catch { /* ignore */ } };
     const rawRecs = records as RawRecord[];
+    // Acquire a FRESH self-created session for the persist/render — the run's default
+    // session may be stale, and these create/list endpoints reject a bad token (ERR002).
+    // Fall back to the default session if signup/login templates aren't recoverable.
+    let xssTok: string | null | undefined = undefined; // undefined => default session
+    let xssDevice: Record<string, unknown> | null = null;
+    try {
+      const jb = (x: RawRecord) => typeof x.request?.body === "string" && x.request.body.trim().startsWith("{");
+      const suRec = rawRecs.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jb(x) && extractAssignedId(x.response?.body ?? "") !== null);
+      const loRec = rawRecs.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jb(x) && extractJwt(x.response?.body ?? "") !== null);
+      if (suRec?.request?.url && suRec.request.body && loRec?.request?.url && loRec.request.body) {
+        const uq = randomUUID().replace(/-/g, "").slice(0, 10);
+        const pw = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
+        const suFm = mapFields(jsonStringLeafPaths(JSON.parse(suRec.request.body)));
+        const asg: Array<[string, string]> = [];
+        if (suFm.password) asg.push([suFm.password, pw]);
+        for (const lf of jsonStringLeafPaths(JSON.parse(suRec.request.body))) {
+          const k = classifyContactField(lf.split(".").pop() || lf);
+          if (k === "email") asg.push([lf, `sahw${uq}@mailinator.com`]);
+          else if (k === "mobile") asg.push([lf, `9${Array.from({ length: 9 }, () => Math.floor(Math.random() * 10)).join("")}`]);
+        }
+        let suBody: unknown = JSON.parse(suRec.request.body);
+        for (const [p, v] of asg) suBody = setAtPath(suBody, p, v);
+        const suResp = await fire("POST", suRec.request.url, { "Content-Type": "application/json" }, JSON.stringify(suBody), null);
+        const uid = extractAssignedId(suResp?.response.body);
+        xssDevice = findDeviceObject(suBody);
+        const loFm = mapFields(jsonStringLeafPaths(JSON.parse(loRec.request.body)));
+        if (uid && loFm.username && loFm.password) {
+          const loBody = graftDevice(JSON.stringify(setAtPath(setAtPath(JSON.parse(loRec.request.body), loFm.username, uid), loFm.password, pw)), xssDevice);
+          const loResp = await fire("POST", loRec.request.url, { "Content-Type": "application/json" }, loBody, null);
+          xssTok = extractJwt(loResp?.response.body) ?? undefined;
+          sxdbg(`fresh session for stored-XSS: ${xssTok ? "ok" : "login failed, using default"}`);
+        }
+      }
+    } catch { /* fall back to default session */ }
     for (const createT of targets.slice(0, 50)) {
       if (!createT.bodyTemplate) continue;
       const renderEp = renderEndpointFor(createT.endpoint);
@@ -353,11 +387,11 @@ async function runDeepSweep(opts: {
         const isLoan = /loan/i.test(createT.endpoint);
         if (isLoan) sxdbg(`leaf=${leaf} gadget=${usedGadget} shapes=${renderShapes.length}`);
         for (const shape of renderShapes) {
-          const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
+          const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body, undefined, xssTok ?? undefined);
           if (!baseline) { if (isLoan) sxdbg(`baseline null (${shape.method})`); continue; }
           if ((baseline.response.body ?? "").includes(canary)) continue; // canary already there? bogus shape
-          const persistResp = await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
-          const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body);
+          const persistResp = await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody, undefined, xssTok ?? undefined);
+          const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body, undefined, xssTok ?? undefined);
           if (!rendered) continue;
           if (isLoan) sxdbg(`${shape.method} persist=${(persistResp?.response.body ?? "").slice(0,30)} rendered_has_canary=${(rendered.response.body ?? "").includes(canary)} renderlen=${(rendered.response.body ?? "").length}`);
           if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
