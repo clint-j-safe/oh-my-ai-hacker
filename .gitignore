@@ -40,3 +40,7 @@ docs/bench/
 docs/PROMPTS.md
 docs/LOOP.md
 docs/research/
+
+# Python build artifacts
+__pycache__/
+*.pyc
