@@ -14,8 +14,25 @@ const TOKEN_KEYS = [
   "access_token", "accessToken", "token", "id_token", "idToken",
   "jwt", "authToken", "auth_token", "bearerToken", "session_token",
 ];
-const TWO_FACTOR = /(?<![a-zA-Z])([Oo][Tt][Pp]|[Tt][Oo][Tt][Pp]|[Tt]wo[\s-]?[Ff]actor|2fa|[Mm][Ff][Aa]|[Aa]uthenticator|[Vv]erification\s*[Cc]ode|one[\s-]?[Tt]ime|[Cc]hallenge)(?![a-z])/;
-const SMS = /(?<![a-zA-Z])([Ss][Mm][Ss]|[Tt]ext\s*[Mm]essage|[Pp]hone\s*[Cc]ode)(?![a-z])/;
+
+// Case-insensitive keyword matching WITHOUT the /i flag, so the trailing boundary can stay
+// case-sensitive: an UPPERCASE letter after the keyword is a camelCase token boundary and is
+// allowed (otpRequired); a LOWERCASE letter is a word continuation and is rejected (footpath,
+// challenges). The leading (?<![a-zA-Z]) rejects a keyword glued to a preceding letter.
+const ci = (w: string) => w.replace(/[A-Za-z]/g, (c) => `[${c.toUpperCase()}${c.toLowerCase()}]`);
+const TWO_FACTOR = new RegExp(
+  `(?<![a-zA-Z])(${[
+    ci("otp"), ci("totp"), `${ci("two")}[\\s-]?${ci("factor")}`, `2${ci("fa")}`, ci("mfa"),
+    ci("authenticator"), `${ci("verification")}\\s*${ci("code")}`,
+    `${ci("one")}[\\s-]?${ci("time")}`, ci("challenge"),
+    ci("sms"), `${ci("text")}\\s*${ci("message")}`, `${ci("phone")}\\s*${ci("code")}`,
+  ].join("|")})(?![a-z])`,
+);
+const SMS = new RegExp(
+  `(?<![a-zA-Z])(${[
+    ci("sms"), `${ci("text")}\\s*${ci("message")}`, `${ci("phone")}\\s*${ci("code")}`,
+  ].join("|")})(?![a-z])`,
+);
 
 export function candidateLoginRequests(
   loginUrl: string,

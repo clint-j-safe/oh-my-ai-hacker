@@ -51,3 +51,41 @@ test("detectTwoFactor detects camelCase 2FA keys", () => {
     assert.equal(detectTwoFactor(200, JSON.stringify({ [k]: true })).present, true);
   }
 });
+
+test("detectTwoFactor detects all-caps and mixed-case 2FA keywords", () => {
+  const testCases = [
+    { body: '{"msg":"2FA required"}', expected: true },
+    { body: '{"msg":"2Fa"}', expected: true },
+    { body: '{"msg":"ONE-TIME password"}', expected: true },
+    { body: '{"msg":"AUTHENTICATOR"}', expected: true },
+    { body: '{"msg":"VERIFICATION CODE"}', expected: true },
+    { body: '{"msg":"TWO-FACTOR"}', expected: true },
+    { body: '{"msg":"CHALLENGE"}', expected: true },
+    { body: '{"msg":"TEXT MESSAGE"}', expected: true },
+  ];
+  for (const { body, expected } of testCases) {
+    assert.equal(detectTwoFactor(200, body).present, expected, `Failed for: ${body}`);
+  }
+});
+
+test("detectTwoFactor detects snake_case and space-separated variants", () => {
+  const testCases = [
+    { body: '{"otp_required":true}', expected: true },
+    { body: '{"msg":"Enter your authenticator code"}', expected: true },
+    { body: '{"msg":"verification code"}', expected: true },
+  ];
+  for (const { body, expected } of testCases) {
+    assert.equal(detectTwoFactor(200, body).present, expected, `Failed for: ${body}`);
+  }
+});
+
+test("detectTwoFactor rejects challenge variants that are part of longer words", () => {
+  const testCases = [
+    { body: '{"msg":"challenges"}', expected: false },
+    { body: '{"msg":"challenger"}', expected: false },
+  ];
+  for (const { body, expected } of testCases) {
+    const result = detectTwoFactor(200, body).present;
+    assert.equal(result, expected, `Failed for: ${body} - got ${result}, expected ${expected}`);
+  }
+});
