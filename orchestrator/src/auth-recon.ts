@@ -102,3 +102,73 @@ export function classifyLoginResponse(resp: { status: number; headers: Record<st
   if (resp.status >= 400) return { outcome: "invalid", authMaterial: null, twoFactor };
   return { outcome: "unknown", authMaterial: null, twoFactor };
 }
+
+// --- Login-endpoint DISCOVERY (deterministic; "envelope-from-error" idiom) ---
+//
+// Used when the operator did not provide login.loginUrl: crawl the app's own root HTML
+// for its script bundle(s), mine those bundles for API base paths, build candidate login
+// URLs, and probe each with a benign fake payload. The app's OWN validation-error envelope
+// (a 400/422 "field required" body, or a plain 401 invalid-credentials rejection) is what
+// confirms a candidate IS the login endpoint — never a guess, never a literal answer key.
+
+export interface DiscoveredLogin {
+  loginUrl: string;
+  contentType: "json" | "form";
+  identifierField: string; // e.g. "username" | "email"
+  passwordField: string;   // default "password"
+}
+
+/** Extract same-origin script src URLs from an HTML document, resolved against `origin`. */
+export function extractScriptSrcs(html: string, origin: string): string[] {
+  const out: string[] = [];
+  const re = /<script[^>]+src=["']([^"']+)["']/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    try {
+      const u = new URL(m[1]!, origin);
+      if (u.origin === new URL(origin).origin && /\.js(\?|$)/i.test(u.pathname)) out.push(u.toString());
+    } catch { /* skip */ }
+  }
+  return [...new Set(out)];
+}
+
+/** Extract API base paths (/api/vN or /vN) and auth-ish route literals from a JS bundle. */
+export function extractApiHints(js: string): { apiBases: string[]; authPaths: string[] } {
+  const apiBases = [...new Set(
+    Array.from(js.matchAll(/["'`](\/api\/v\d+|\/v\d+)["'`]/g), (m) => m[1]!)
+  )];
+  const authPaths = [...new Set(
+    Array.from(js.matchAll(/["'`](\/[a-zA-Z0-9/_-]*(?:login|authenticate|signin|verify-otp|token|session)[a-zA-Z0-9/_-]*)["'`]/gi), (m) => m[1]!)
+  )];
+  return { apiBases, authPaths };
+}
+
+/** Build ordered candidate login URLs from discovered bases (cheapest/most-likely first). */
+export function candidateLoginUrls(origin: string, apiBases: string[]): string[] {
+  const bases = apiBases.length ? apiBases : ["/api/v3", "/api/v1", "/api", ""];
+  const suffixes = ["/authenticate", "/login", "/users/login", "/auth/login", "/signin", "/sessions"];
+  const urls: string[] = [];
+  for (const b of bases) for (const s of suffixes) {
+    try { urls.push(new URL(`${b}${s}`, origin).toString()); } catch { /* skip */ }
+  }
+  return [...new Set(urls)];
+}
+
+/** Decide from a probe response whether this path is the login endpoint, and extract any
+ * required identifier field the app's validation error reveals ("envelope-from-error"). */
+export function classifyLoginProbe(status: number, body: string): { isLogin: boolean; requiredFields: string[] } {
+  // 403/404 (incl. API-gateway "explicit deny" / "Missing Authentication Token") => not a login route.
+  if (status === 403 || status === 404) return { isLogin: false, requiredFields: [] };
+  const fields: string[] = [];
+  try {
+    const j = JSON.parse(body) as any;
+    const errs = Array.isArray(j?.error) ? j.error : Array.isArray(j?.errors) ? j.errors : [];
+    for (const e of errs) if (e && typeof e.field === "string") fields.push(e.field);
+  } catch { /* not JSON */ }
+  // Also parse "The 'X' field is required" messages.
+  for (const m of body.matchAll(/[Tt]he ['"`]?([a-zA-Z0-9_]+)['"`]? field is required/g)) fields.push(m[1]!);
+  // A validation error (400/422) OR an invalid-credentials rejection (401) means the endpoint EXISTS
+  // and processes credentials — i.e. it is the login endpoint.
+  const isLogin = status === 400 || status === 422 || status === 401;
+  return { isLogin, requiredFields: [...new Set(fields)] };
+}

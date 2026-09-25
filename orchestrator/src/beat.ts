@@ -19,7 +19,11 @@ import {
   type SpineBeatRecord, type LoginSequenceShape,
 } from "./spine.js";
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
-import { candidateLoginRequests, classifyLoginResponse } from "./auth-recon.js";
+import {
+  candidateLoginRequests, classifyLoginResponse,
+  extractScriptSrcs, extractApiHints, candidateLoginUrls, classifyLoginProbe,
+  type DiscoveredLogin,
+} from "./auth-recon.js";
 import { parseTotp, TotpEmitter } from "./totp.js";
 import { inScope } from "./tether.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
@@ -1790,6 +1794,65 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
  * gets a synthetic, non-PII label, not the operator's real identity — the real
  * email/username is used only in the login request body via candidateLoginRequests.
  */
+/**
+ * DETERMINISTIC login-endpoint discovery ("envelope-from-error" idiom): when the operator
+ * did not provide `login.loginUrl`, crawl the app's own root HTML for its script bundle(s),
+ * mine those bundles for API base paths (e.g. `/api/v3`), build candidate login URLs, and
+ * probe each with a BENIGN FAKE payload — never the operator's real credentials. A
+ * candidate is confirmed as the login endpoint only by the app's OWN response: a
+ * validation-error envelope (400/422, revealing the required identifier field) or a plain
+ * 401 invalid-credentials rejection. A 403/404 (including an API-gateway "explicit deny" /
+ * "Missing Authentication Token" for a nonexistent route) is NOT treated as the login
+ * endpoint. Budget-capped (default <=5 bundles, <=8 probes) and scoped to `inScope`. Fails
+ * soft: returns null (never throws) when nothing is discovered, or on a transport error —
+ * the caller decides whether that is fatal.
+ */
+export async function discoverLoginEndpoint(opts: {
+  scopeOrigin: string;            // e.g. "https://demo.safeone.io"
+  fetchImpl: typeof fetch;
+  inScope: (url: string) => boolean;
+  log?: (m: string) => void;
+  maxBundles?: number;            // default 5
+  maxProbes?: number;             // default 8
+}): Promise<DiscoveredLogin | null> {
+  const { scopeOrigin, fetchImpl, inScope } = opts;
+  const log = opts.log ?? (() => {});
+  const readText = async (url: string): Promise<{ status: number; body: string } | null> => {
+    if (!inScope(url)) return null;
+    try {
+      const res = await fetchImpl(url, { redirect: "manual" } as any);
+      return { status: res.status, body: await res.text() };
+    } catch (e) { log(`[auth-discovery] fetch failed ${url}: ${String(e)}`); return null; }
+  };
+  // 1) root -> bundles
+  const root = await readText(new URL("/", scopeOrigin).toString());
+  const bases = new Set<string>();
+  if (root) {
+    const srcs = extractScriptSrcs(root.body, scopeOrigin).slice(0, opts.maxBundles ?? 5);
+    for (const s of srcs) {
+      const js = await readText(s);
+      if (js) for (const b of extractApiHints(js.body).apiBases) bases.add(b);
+    }
+  }
+  // 2) probe candidate login endpoints with a benign FAKE payload (never the real creds)
+  const fake = JSON.stringify({ username: "probe-nobody@example.test", email: "probe-nobody@example.test", password: "x" });
+  const candidates = candidateLoginUrls(scopeOrigin, [...bases]).slice(0, opts.maxProbes ?? 8);
+  for (const url of candidates) {
+    if (!inScope(url)) continue;
+    let res;
+    try { res = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: fake, redirect: "manual" } as any); }
+    catch (e) { log(`[auth-discovery] probe failed ${url}: ${String(e)}`); continue; }
+    const cls = classifyLoginProbe(res.status, await res.text());
+    if (cls.isLogin) {
+      const identifierField = cls.requiredFields.find((f) => /^(username|email|user|login)$/i.test(f)) ?? cls.requiredFields[0] ?? "username";
+      log(`[auth-discovery] login endpoint: ${url} (identifier field: ${identifierField})`);
+      return { loginUrl: url, contentType: "json", identifierField, passwordField: "password" };
+    }
+  }
+  log("[auth-discovery] no login endpoint discovered");
+  return null;
+}
+
 export async function runAuthRecord(opts: {
   auth: AuthConfig;
   inScope: (url: string) => boolean;
@@ -1797,12 +1860,30 @@ export async function runAuthRecord(opts: {
   sessions: SessionStore;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
+  /** The engagement's primary in-scope origin (e.g. scopeOrigins[0] from runBeat), used to
+   * seed login-endpoint DISCOVERY when `login.loginUrl` is not configured. Optional — only
+   * required when loginUrl is absent; the two loginUrl-explicit tests omit it. */
+  scopeOrigin?: string;
 }): Promise<LoginSequenceShape> {
   const { auth, inScope, fetchImpl, sessions } = opts;
   if (auth.mode === "off" || !auth.login) throw new Error("runAuthRecord called without an auth login");
   const login = auth.login;
-  const loginUrl = login.loginUrl ?? "";
-  if (!loginUrl) throw new Error("login_url discovery not yet recorded; provide login.loginUrl");
+  let loginUrl = login.loginUrl ?? "";
+  if (!loginUrl) {
+    if (!opts.scopeOrigin) throw new Error("login_url discovery not yet recorded; provide login.loginUrl");
+    const discovered = await discoverLoginEndpoint({
+      scopeOrigin: opts.scopeOrigin,
+      fetchImpl,
+      inScope,
+      log: (m) => console.error(m),
+    });
+    if (!discovered) throw new Error("could not discover a login endpoint; provide login.loginUrl");
+    loginUrl = discovered.loginUrl;
+    // Thread the discovered identifier field into candidateLoginRequests below via
+    // fieldHints — the request bodies still carry the operator's REAL configured
+    // credentials, never the discovery probe's benign fake payload.
+    login.fieldHints = { ...(login.fieldHints ?? {}), identifier: discovered.identifierField };
+  }
   if (!inScope(loginUrl)) throw new Error(`login_url out of scope: ${loginUrl}`);
 
   const attempts = candidateLoginRequests(loginUrl, { email: login.email, username: login.username, password: login.password }, login.fieldHints);
@@ -1981,6 +2062,7 @@ export async function runBeat(opts: {
       sessions: sessionStore,
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      scopeOrigin: scopeOrigins[0],
     });
     spineLoad.spine.recovered_intel.login_sequence = shape;
   }
