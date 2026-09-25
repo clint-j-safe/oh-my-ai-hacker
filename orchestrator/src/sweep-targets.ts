@@ -1,6 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SweepTarget } from "./sweep.js";
+import { parseFormBody } from "./sweep-forms.js";
 
 /**
  * Derives WHAT to fuzz for the deep-mode sweep, generically, from the REAL requests the
@@ -18,8 +19,9 @@ export interface SweepTargetWithBody extends SweepTarget {
    * query-only endpoints. */
   bodyTemplate: string | null;
   headers: Record<string, string>;
-  /** For each param, whether it is a JSON dot-path into bodyTemplate or a query key. */
-  paramKind: Record<string, "json" | "query">;
+  /** For each param, whether it is a JSON dot-path into bodyTemplate, a query key, or a
+   * key in a form-urlencoded (application/x-www-form-urlencoded) bodyTemplate. */
+  paramKind: Record<string, "json" | "query" | "form">;
 }
 
 /** Dot-paths to every STRING leaf in a JSON value, bounded in depth and count so a huge
@@ -83,6 +85,7 @@ export function deriveTargets(
     const key = `${method} ${base}`;
 
     const jsonParams: string[] = [];
+    const formParams: string[] = [];
     let bodyTemplate: string | null = null;
     if (req.body && /^\s*[[{]/.test(req.body)) {
       try {
@@ -90,20 +93,27 @@ export function deriveTargets(
         const leaves = jsonStringLeafPaths(parsed);
         if (leaves.length) { jsonParams.push(...leaves); bodyTemplate = req.body; }
       } catch { /* not JSON; ignore */ }
+    } else {
+      // application/x-www-form-urlencoded body (e.g. command=..&host=..) — its keys are
+      // fuzzable inputs the JSON path missed. This is what reached HTB Cronos's welcome.php.
+      const form = parseFormBody(req.body ?? null);
+      if (form) { formParams.push(...form); bodyTemplate = req.body!; }
     }
     const queryParams = query ? [...new Set([...query.keys()])] : [];
-    if (jsonParams.length === 0 && queryParams.length === 0) continue;
+    if (jsonParams.length === 0 && formParams.length === 0 && queryParams.length === 0) continue;
 
-    const paramKind: Record<string, "json" | "query"> = {};
+    const paramKind: Record<string, "json" | "query" | "form"> = {};
     for (const p of jsonParams) paramKind[p] = "json";
+    for (const p of formParams) paramKind[p] = "form";
     for (const p of queryParams) paramKind[p] = "query";
+    const allParams = [...jsonParams, ...formParams, ...queryParams];
 
-    // Prefer the richer template: keep the first that has a JSON body; otherwise merge params.
+    // Prefer the richer template: keep the first that has a body; otherwise merge params.
     const existing = byKey.get(key);
     if (!existing) {
-      byKey.set(key, { endpoint: base, method, params: [...jsonParams, ...queryParams], bodyTemplate, headers: req.headers ?? {}, paramKind });
+      byKey.set(key, { endpoint: base, method, params: allParams, bodyTemplate, headers: req.headers ?? {}, paramKind });
     } else if (!existing.bodyTemplate && bodyTemplate) {
-      byKey.set(key, { endpoint: base, method, params: [...jsonParams, ...queryParams], bodyTemplate, headers: req.headers ?? {}, paramKind });
+      byKey.set(key, { endpoint: base, method, params: allParams, bodyTemplate, headers: req.headers ?? {}, paramKind });
     }
     // Collect ALL distinct endpoints, then PRIORITIZE below — do not truncate in
     // encounter order (that dropped late-sorted but important endpoints like the create

@@ -50,3 +50,13 @@ test("deriveTargets drops out-of-scope requests", () => {
   const records = [{ request: { method: "GET", url: "http://evil/x?a=1" } }];
   assert.equal(deriveTargets(records, (u) => u.includes("h.internal"), (u) => u).length, 0);
 });
+
+test("deriveTargets: form-urlencoded POST body yields form params (Cronos welcome.php shape)", () => {
+  const recs = [{ request: { method: "POST", url: "http://admin.cronos.htb/welcome.php", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "command=ping+-c+1&host=8.8.8.8" } }];
+  const t = deriveTargets(recs as any, () => true, (u) => u);
+  const wp = t.find((x) => x.endpoint.endsWith("/welcome.php"));
+  assert.ok(wp, "welcome.php target derived");
+  assert.deepEqual(wp!.params.sort(), ["command", "host"]);
+  assert.equal(wp!.paramKind["host"], "form");
+  assert.equal(wp!.bodyTemplate, "command=ping+-c+1&host=8.8.8.8");
+});
