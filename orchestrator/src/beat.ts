@@ -316,6 +316,7 @@ async function runDeepSweep(opts: {
         const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
         const xss = `<script>${canary}</script>`;
         let persistBody: string;
+        let usedGadget = false;
         try {
           const tmplObj = JSON.parse(createT.bodyTemplate);
           // If this field's CAPTURED value is a base64 PHP-serialized gadget (the app
@@ -326,11 +327,12 @@ async function runDeepSweep(opts: {
           const orig = readAtPath(tmplObj, leaf);
           const deser = orig ? decodePhpSerialized(orig) : null;
           const swapped = deser ? swapLastPhpSerializedString(deser, xss) : null;
+          usedGadget = Boolean(swapped);
           const injectValue = swapped ? Buffer.from(swapped, "utf8").toString("base64") : xss;
           persistBody = JSON.stringify(setAtPath(tmplObj, leaf, injectValue));
         } catch { continue; }
         const isLoan = /loan/i.test(createT.endpoint);
-        if (isLoan) sxdbg(`leaf=${leaf} gadget=${Boolean(swapped)} shapes=${renderShapes.length}`);
+        if (isLoan) sxdbg(`leaf=${leaf} gadget=${usedGadget} shapes=${renderShapes.length}`);
         for (const shape of renderShapes) {
           const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
           if (!baseline) { if (isLoan) sxdbg(`baseline null (${shape.method})`); continue; }
