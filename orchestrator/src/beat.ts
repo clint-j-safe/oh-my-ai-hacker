@@ -1756,7 +1756,14 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
  * AUTH RECORD — deterministically drives the target's OWN login endpoint with the
  * operator-supplied creds and seeds session "A" in the injected SessionStore, so the
  * hunter has authenticated material from turn 1 instead of spending its budget
- * self-registering. Called once, on beat 1, when `engagement.auth.mode !== "off"`.
+ * self-registering. Called on EVERY beat when `engagement.auth.mode !== "off"` — the
+ * SessionStore is in-process only (each beat starts with a fresh, empty one; see
+ * runRegistrationPhase's own doc comment on why cross-beat session state can never be
+ * restored from the spine), so session "A" must be re-established by replaying the
+ * login sequence every single beat, not just the first (spec §3: "re-established
+ * in-process each run by replaying the sequence"). Persisting
+ * `recovered_intel.login_sequence` on every beat is idempotent — later beats simply
+ * re-write the same shape.
  *
  * bypass mode seeds a PRE-2FA session: it records whatever material the first login
  * response carried (even if none — has_auth_material=false is an acceptable outcome,
@@ -1764,10 +1771,24 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
  * TOTP step when the flow is 2FA-gated, and is fail-closed: a 2FA-gated flow with no
  * `auth.totp` configured throws rather than silently downgrading to bypass behavior.
  *
+ * FAILS SOFT on transport errors (mirrors runDnsRecon's own posture): each candidate
+ * login request is tried independently, and a network error on one candidate does not
+ * stop the others from being tried. If every candidate fails at the transport level
+ * (never even got a classifiable response), this logs to stderr and returns a
+ * materialless shape WITHOUT seeding a session, so the beat proceeds unauthenticated
+ * rather than aborting entirely over a network blip. This is distinct from the
+ * fail-CLOSED cases below (out-of-scope login_url, missing login_url, or a 2FA-gated
+ * authenticated flow with no TOTP secret) — those are configuration errors, not
+ * transport flakiness, and still throw.
+ *
  * Returns the non-secret LoginSequenceShape (login_url, field names, header name,
  * token location, two-factor kind) for the caller to persist to
  * `spine.recovered_intel.login_sequence` — never the credentials, tokens, or TOTP
- * secret, which stay in-process only (the SessionStore record / TotpEmitter).
+ * secret, which stay in-process only (the SessionStore record / TotpEmitter). The
+ * SessionStore record itself also never carries the operator's real email/username as
+ * persisted metadata: `SessionMeta.username` (which spine sessions[].username mirrors)
+ * gets a synthetic, non-PII label, not the operator's real identity — the real
+ * email/username is used only in the login request body via candidateLoginRequests.
  */
 export async function runAuthRecord(opts: {
   auth: AuthConfig;
@@ -1787,22 +1808,47 @@ export async function runAuthRecord(opts: {
   const attempts = candidateLoginRequests(loginUrl, { email: login.email, username: login.username, password: login.password }, login.fieldHints);
   let chosen: { attempt: typeof attempts[number]; cls: ReturnType<typeof classifyLoginResponse> } | null = null;
   for (const attempt of attempts) {
-    const res = await fetchImpl(attempt.url, {
-      method: attempt.method,
-      headers: { "content-type": attempt.contentType === "json" ? "application/json" : "application/x-www-form-urlencoded" },
-      body: attempt.body,
-      redirect: "manual",
-    } as any);
-    const headers: Record<string, string> = {};
-    res.headers.forEach((v: string, k: string) => { headers[k] = v; });
-    const cls = classifyLoginResponse({ status: res.status, headers, body: await res.text() });
-    if (cls.outcome !== "invalid" && cls.outcome !== "unknown") { chosen = { attempt, cls }; break; }
-    if (!chosen) chosen = { attempt, cls };
+    try {
+      const res = await fetchImpl(attempt.url, {
+        method: attempt.method,
+        headers: { "content-type": attempt.contentType === "json" ? "application/json" : "application/x-www-form-urlencoded" },
+        body: attempt.body,
+        redirect: "manual",
+      } as any);
+      const headers: Record<string, string> = {};
+      res.headers.forEach((v: string, k: string) => { headers[k] = v; });
+      const cls = classifyLoginResponse({ status: res.status, headers, body: await res.text() });
+      if (cls.outcome !== "invalid" && cls.outcome !== "unknown") { chosen = { attempt, cls }; break; }
+      if (!chosen) chosen = { attempt, cls };
+    } catch (err) {
+      // Transient network error/RST on THIS candidate only — fail soft and move on
+      // to the next candidate rather than aborting the whole beat (mirrors
+      // runDnsRecon's own fail-soft posture on a single-probe failure).
+      console.error(`[auth-record] login attempt to ${attempt.url} failed: ${(err as Error).message}`);
+    }
   }
-  const cls = chosen!.cls;
+
+  if (!chosen) {
+    // Every candidate failed at the transport level — never got a response to
+    // classify at all. Fail soft: log and let the beat proceed unauthenticated
+    // (no session seeded) rather than aborting the whole beat over a network blip.
+    console.error(`[auth-record] all login attempts to ${loginUrl} failed; proceeding without session A this beat`);
+    return {
+      login_url: loginUrl,
+      content_type: attempts[0]?.contentType ?? "json",
+      identifier_field: login.email ? "email" : "username",
+      password_field: login.fieldHints?.password ?? "password",
+      auth_header_name: "Authorization",
+      token_location: "none",
+      two_factor: "none",
+    };
+  }
+  const cls = chosen.cls;
 
   // authenticated mode must complete TOTP when the flow gates on it; bypass mode
-  // deliberately never does (session A stays pre-2FA — see doc comment above).
+  // deliberately never does (session A stays pre-2FA — see doc comment above). This
+  // is a CONFIG error (no secret configured for a flow that needs one), not a
+  // transport failure, so it still throws rather than failing soft.
   if (auth.mode === "authenticated" && cls.twoFactor.present) {
     if (!auth.totp) throw new Error("SAHW_AUTH_MODE=authenticated: flow requires TOTP but SAHW_TOTP is unset");
     const emitter = new TotpEmitter(parseTotp(auth.totp as any));
@@ -1810,16 +1856,22 @@ export async function runAuthRecord(opts: {
   }
 
   // Seed session A with whatever material the (pre-2FA in bypass) login yielded.
+  // credentials.username/email are a synthetic, non-PII label — NOT the operator's
+  // real email/username — because SessionMeta.username (unlike password/authMaterial)
+  // is non-secret metadata that flows straight into spine sessions[].username on
+  // persistSpine. The real email/username was already used above, in the login
+  // request body built by candidateLoginRequests; it has no further use once the
+  // response is classified, so it must not also ride along as session metadata.
   const material = cls.authMaterial;
   sessions.create({
-    credentials: { username: login.email ?? login.username ?? "seeded", email: login.email ?? "", password: login.password, mobile: "" },
+    credentials: { username: "auth-A", email: "", password: login.password, mobile: "" },
     authMaterial: material?.value ?? null,
     authHeaderName: material?.headerName ?? "Authorization",
   });
 
   const shape: LoginSequenceShape = {
     login_url: loginUrl,
-    content_type: chosen!.attempt.contentType,
+    content_type: chosen.attempt.contentType,
     identifier_field: login.email ? "email" : "username",
     password_field: login.fieldHints?.password ?? "password",
     auth_header_name: material?.headerName ?? "Authorization",
@@ -1906,18 +1958,22 @@ export async function runBeat(opts: {
     await runDnsRecon({ engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
   }
 
-  // AUTH RECORD (auth-scan modes, first beat): logs in with the operator's own
-  // creds via the target's own login endpoint and seeds session "A" in the SAME
-  // SessionStore the hunt's http_request/register_account tools use, so the
+  // AUTH RECORD (auth-scan modes, EVERY beat): logs in with the operator's own
+  // creds via the target's own login endpoint and (re-)seeds session "A" in the
+  // SAME SessionStore the hunt's http_request/register_account tools use, so the
   // hunter has authenticated material from turn 1 — see runAuthRecord's doc
-  // comment above for the bypass/authenticated split. Independent of deep mode
-  // (auth scanning is its own opt-in, gated only by SAHW_AUTH_MODE). Default path
-  // (mode:"off", the default from loadAuthConfig) never enters this block, so
-  // runBeat behaves byte-identically to before this feature existed. Mutates
-  // spineLoad.spine.recovered_intel in place (same "mutate before the brief is
-  // built" discipline as runDnsRecon above), so the shape is already visible to
-  // THIS beat's brief, not just the next one.
-  if (engagement.auth.mode !== "off" && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
+  // comment above for the bypass/authenticated split. Deliberately NOT gated to
+  // beat 1 (unlike runDnsRecon above): the SessionStore is in-process only and
+  // empty at the start of every beat, so session "A" must be re-established by
+  // replaying the login sequence on EVERY beat, not just the first — otherwise
+  // beat 2+ would hunt anonymously despite auth mode being configured. Independent
+  // of deep mode (auth scanning is its own opt-in, gated only by SAHW_AUTH_MODE).
+  // Default path (mode:"off", the default from loadAuthConfig) never enters this
+  // block, so runBeat behaves byte-identically to before this feature existed.
+  // Mutates spineLoad.spine.recovered_intel in place (same "mutate before the
+  // brief is built" discipline as runDnsRecon above) — idempotent across beats,
+  // so the shape is already visible to THIS beat's brief, not just the next one.
+  if (engagement.auth.mode !== "off") {
     const shape = await runAuthRecord({
       auth: engagement.auth,
       inScope: (u) => inScope(engagement, u).allow,
