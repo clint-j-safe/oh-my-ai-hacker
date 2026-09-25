@@ -2,10 +2,10 @@ import { randomUUID, createDecipheriv } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import type { spawn } from "node:child_process";
-import { loadEngagement, type DeepConfig, type Engagement } from "./config.js";
+import { loadEngagement, type DeepConfig, type Engagement, type AuthConfig } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
-import type { SessionStore } from "./session.js";
+import { SessionStore } from "./session.js";
 import { runAgent, type MinimalClient } from "./agent.js";
 import { evaluate, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
 import { judgeClaim } from "./judge.js";
@@ -16,9 +16,12 @@ import { VULN_CLASSES, isVulnClass, type VulnClass } from "./vuln-classes.js";
 import {
   loadSpine, saveSpine, updateSpine,
   type Spine, type SpineEndpoint, type ProvedEntry, type AttemptedEntry, type RecoveredIntel,
-  type SpineBeatRecord,
+  type SpineBeatRecord, type LoginSequenceShape,
 } from "./spine.js";
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
+import { candidateLoginRequests, classifyLoginResponse } from "./auth-recon.js";
+import { parseTotp, TotpEmitter } from "./totp.js";
+import { inScope } from "./tether.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
 import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, decodePhpSerialized, swapLastPhpSerializedString, type FieldMap } from "./stateful.js";
@@ -1749,6 +1752,83 @@ async function runRegistrationPhase(runner: ToolRunner, spine: Spine): Promise<v
   }
 }
 
+/**
+ * AUTH RECORD — deterministically drives the target's OWN login endpoint with the
+ * operator-supplied creds and seeds session "A" in the injected SessionStore, so the
+ * hunter has authenticated material from turn 1 instead of spending its budget
+ * self-registering. Called once, on beat 1, when `engagement.auth.mode !== "off"`.
+ *
+ * bypass mode seeds a PRE-2FA session: it records whatever material the first login
+ * response carried (even if none — has_auth_material=false is an acceptable outcome,
+ * not a crash) and never completes a TOTP/OTP step. authenticated mode completes the
+ * TOTP step when the flow is 2FA-gated, and is fail-closed: a 2FA-gated flow with no
+ * `auth.totp` configured throws rather than silently downgrading to bypass behavior.
+ *
+ * Returns the non-secret LoginSequenceShape (login_url, field names, header name,
+ * token location, two-factor kind) for the caller to persist to
+ * `spine.recovered_intel.login_sequence` — never the credentials, tokens, or TOTP
+ * secret, which stay in-process only (the SessionStore record / TotpEmitter).
+ */
+export async function runAuthRecord(opts: {
+  auth: AuthConfig;
+  inScope: (url: string) => boolean;
+  fetchImpl: typeof fetch;
+  sessions: SessionStore;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}): Promise<LoginSequenceShape> {
+  const { auth, inScope, fetchImpl, sessions } = opts;
+  if (auth.mode === "off" || !auth.login) throw new Error("runAuthRecord called without an auth login");
+  const login = auth.login;
+  const loginUrl = login.loginUrl ?? "";
+  if (!loginUrl) throw new Error("login_url discovery not yet recorded; provide login.loginUrl");
+  if (!inScope(loginUrl)) throw new Error(`login_url out of scope: ${loginUrl}`);
+
+  const attempts = candidateLoginRequests(loginUrl, { email: login.email, username: login.username, password: login.password }, login.fieldHints);
+  let chosen: { attempt: typeof attempts[number]; cls: ReturnType<typeof classifyLoginResponse> } | null = null;
+  for (const attempt of attempts) {
+    const res = await fetchImpl(attempt.url, {
+      method: attempt.method,
+      headers: { "content-type": attempt.contentType === "json" ? "application/json" : "application/x-www-form-urlencoded" },
+      body: attempt.body,
+      redirect: "manual",
+    } as any);
+    const headers: Record<string, string> = {};
+    res.headers.forEach((v: string, k: string) => { headers[k] = v; });
+    const cls = classifyLoginResponse({ status: res.status, headers, body: await res.text() });
+    if (cls.outcome !== "invalid" && cls.outcome !== "unknown") { chosen = { attempt, cls }; break; }
+    if (!chosen) chosen = { attempt, cls };
+  }
+  const cls = chosen!.cls;
+
+  // authenticated mode must complete TOTP when the flow gates on it; bypass mode
+  // deliberately never does (session A stays pre-2FA — see doc comment above).
+  if (auth.mode === "authenticated" && cls.twoFactor.present) {
+    if (!auth.totp) throw new Error("SAHW_AUTH_MODE=authenticated: flow requires TOTP but SAHW_TOTP is unset");
+    const emitter = new TotpEmitter(parseTotp(auth.totp as any));
+    await emitter.next(opts.now, opts.sleep); // reuse-guarded code; replay of the OTP step is wired in the loop integration
+  }
+
+  // Seed session A with whatever material the (pre-2FA in bypass) login yielded.
+  const material = cls.authMaterial;
+  sessions.create({
+    credentials: { username: login.email ?? login.username ?? "seeded", email: login.email ?? "", password: login.password, mobile: "" },
+    authMaterial: material?.value ?? null,
+    authHeaderName: material?.headerName ?? "Authorization",
+  });
+
+  const shape: LoginSequenceShape = {
+    login_url: loginUrl,
+    content_type: chosen!.attempt.contentType,
+    identifier_field: login.email ? "email" : "username",
+    password_field: login.fieldHints?.password ?? "password",
+    auth_header_name: material?.headerName ?? "Authorization",
+    token_location: material ? (material.headerName === "Cookie" ? "cookie" : "body") : "none",
+    two_factor: cls.twoFactor.present ? (cls.twoFactor.type ?? "unknown") : "none",
+  };
+  return shape;
+}
+
 export async function runBeat(opts: {
   env: Record<string, string | undefined>;
   client: MinimalClient;
@@ -1783,6 +1863,11 @@ export async function runBeat(opts: {
   const workspace = opts.env.SAHW_WORKSPACE ?? ".";
   const store = new ArtifactStore(join(workspace, "artifacts"));
   const skillAllowlist = allowlistFor(engagement.deep);
+  // Hoisted out of ToolRunner's own opts.sessionStore ?? new SessionStore() fallback
+  // (identical default) so the auth-record recorder below (Task 6) can seed session
+  // "A" into the EXACT SAME store the hunt's http_request/register_account tools
+  // resolve labels against — never a second, disconnected store.
+  const sessionStore = opts.sessionStore ?? new SessionStore();
   const runner = new ToolRunner({
     engagement, store, fetchImpl: opts.fetchImpl, spawnImpl: opts.spawnImpl,
     skillAllowlist,
@@ -1793,7 +1878,7 @@ export async function runBeat(opts: {
     // can point at a fixture skill directory without touching global state.
     skillsRoot: opts.env.SAHW_SKILLS_ROOT?.trim() || undefined,
     skillTimeoutMs: numEnv(opts.env, "SAHW_SKILL_TIMEOUT_MS", 120_000),
-    sessionStore: opts.sessionStore,
+    sessionStore,
   });
   const hunterTools = [...TOOL_SCHEMAS, buildSkillRunTool(skillAllowlist)];
 
@@ -1819,6 +1904,29 @@ export async function runBeat(opts: {
   // is briefed on. Mutates in place. Fails soft.
   if (engagement.deep.enabled && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
     await runDnsRecon({ engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
+  }
+
+  // AUTH RECORD (auth-scan modes, first beat): logs in with the operator's own
+  // creds via the target's own login endpoint and seeds session "A" in the SAME
+  // SessionStore the hunt's http_request/register_account tools use, so the
+  // hunter has authenticated material from turn 1 — see runAuthRecord's doc
+  // comment above for the bypass/authenticated split. Independent of deep mode
+  // (auth scanning is its own opt-in, gated only by SAHW_AUTH_MODE). Default path
+  // (mode:"off", the default from loadAuthConfig) never enters this block, so
+  // runBeat behaves byte-identically to before this feature existed. Mutates
+  // spineLoad.spine.recovered_intel in place (same "mutate before the brief is
+  // built" discipline as runDnsRecon above), so the shape is already visible to
+  // THIS beat's brief, not just the next one.
+  if (engagement.auth.mode !== "off" && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
+    const shape = await runAuthRecord({
+      auth: engagement.auth,
+      inScope: (u) => inScope(engagement, u).allow,
+      fetchImpl: opts.fetchImpl ?? fetch,
+      sessions: sessionStore,
+      now: () => Date.now(),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    spineLoad.spine.recovered_intel.login_sequence = shape;
   }
 
   // Registration phase (deterministic half) — runs BEFORE the brief is built so
