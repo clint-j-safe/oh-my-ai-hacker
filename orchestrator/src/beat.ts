@@ -3043,7 +3043,7 @@ export async function runBeat(opts: {
           // CONFIRMEDs; can only DEMOTE to NEEDS_REVIEW on a confident not-genuine; fails open.
           const COARSE_INVARIANTS = new Set(["status_in", "body_contains", "response_asserted"]);
           let vStatus = finalStatus, vReason = finalReason;
-          if (engagement.strictVerify && vStatus === "CONFIRMED" && COARSE_INVARIANTS.has(effectiveInvariantType) && judgeModel) {
+          if (vStatus === "CONFIRMED" && COARSE_INVARIANTS.has(effectiveInvariantType) && judgeModel) {
             const gv = await verifyGenuineFinding({
               client: opts.client as unknown as import("./judge.js").JudgeClient, model: judgeModel,
               vulnClass: claim.vuln_class, invariant: claim.invariant as Invariant,

@@ -40,11 +40,12 @@ export interface Engagement {
   profile: "test" | "prod";
   deep: DeepConfig;
   auth: AuthConfig;
-  /** Opt-in self-hosted LLM "genuine-finding" veto (SAHW_STRICT_VERIFY, default off). On
-   * coarse-invariant CONFIRMEDs, demotes to NEEDS_REVIEW only when the judge model is
-   * confidently not-genuine (>= strictVerifyThreshold). Never FALSE_POSITIVE, never
-   * upgrades, fails open. See judge.ts's verifyGenuineFinding. */
-  strictVerify: boolean;
+  /** Self-hosted LLM "genuine-finding" veto. Default-on: runs on every coarse-invariant
+   * CONFIRMED whenever a judge model is configured (no opt-in flag). Demotes to
+   * NEEDS_REVIEW only when the judge model is confidently not-genuine
+   * (>= strictVerifyThreshold). Never FALSE_POSITIVE, never upgrades, fails open (a
+   * missing/erroring judge model leaves the deterministic verdict unchanged). See
+   * judge.ts's verifyGenuineFinding. */
   strictVerifyThreshold: number;
 }
 
@@ -259,7 +260,6 @@ export function loadEngagement(env: Env, now: Date = new Date()): Engagement {
     profile: profileRaw,
     deep: loadDeepConfig(env, authRef),
     auth: loadAuthConfig(env),
-    strictVerify: boolEnv(env, "SAHW_STRICT_VERIFY", false),
     strictVerifyThreshold: num(env, "SAHW_STRICT_VERIFY_THRESHOLD", 0.8),
   };
 }
