@@ -38,6 +38,23 @@ export interface SpineEndpoint {
 }
 
 /**
+ * SHAPE only of a recorded login flow — never the credentials, tokens, or TOTP
+ * secret used to exercise it. This is what a later beat needs to replay an
+ * authenticated session's login step (Task 6), not what it needs to forge one on
+ * its own; the actual secret material lives only in-process (session.ts's
+ * SessionStore), same discipline as SpineSessionRecord above.
+ */
+export interface LoginSequenceShape {
+  login_url: string;
+  content_type: "json" | "form";
+  identifier_field: string;
+  password_field: string;
+  auth_header_name: string;
+  token_location: "body" | "cookie" | "none";
+  two_factor: "none" | "totp" | "otp" | "sms" | "unknown";
+}
+
+/**
  * Free-form but structured client-intel recovered from the target's own served
  * assets. Never a secret's plaintext value — see sanitizeIntelValue below, which
  * updateSpine runs over every string written here. A caller that has a real secret
@@ -49,6 +66,8 @@ export interface RecoveredIntel {
   request_envelope?: string;
   auth_header_style?: string;
   source_maps_seen?: boolean;
+  /** Non-secret shape of a recorded login flow — see LoginSequenceShape. */
+  login_sequence?: LoginSequenceShape;
   [key: string]: unknown;
 }
 
