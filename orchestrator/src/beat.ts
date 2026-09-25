@@ -25,7 +25,7 @@ import {
   type DiscoveredLogin,
 } from "./auth-recon.js";
 import { parseTotp, TotpEmitter } from "./totp.js";
-import { cognitoAuthenticate, type CognitoConfig } from "./auth-cognito.js";
+import { cognitoAuthenticate, AWS_REGION_RE, COGNITO_CLIENT_ID_RE, type CognitoConfig, type CognitoTokens } from "./auth-cognito.js";
 import { inScope } from "./tether.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
@@ -1934,20 +1934,75 @@ export async function runAuthRecord(opts: {
     if (!cognitoConfig) {
       throw new Error("SAHW_AUTH_PROVIDER=cognito requires SAHW_COGNITO or a fingerprinted Cognito app client");
     }
+    // SECURITY (fix round 1 — CRITICAL): validate region/clientId shape BEFORE this
+    // config is used for anything, regardless of whether it came from the operator's
+    // explicit SAHW_COGNITO or from fingerprintCognito's crawl of the TARGET's own
+    // served bundle. A target-controlled region string (e.g. a bundle containing
+    // region:'evil.com/x') would otherwise steer cognitoCall's request URL's HOST to
+    // an attacker-controlled destination on the very code path that deliberately
+    // bypasses inScope() below — and cognitoAuthenticate would then POST the
+    // operator's real username/password there. This mirrors, and is redundant with
+    // (defense in depth), detectCognito's own validation (auth-recon.ts) and
+    // cognitoCall's own point-of-use assertion (auth-cognito.ts) — a malformed shape
+    // reaching here at all means the explicit SAHW_COGNITO value itself is bad, which
+    // IS a genuine config error, so this stays a throw, not fail-soft.
+    if (!AWS_REGION_RE.test(cognitoConfig.region) || !COGNITO_CLIENT_ID_RE.test(cognitoConfig.clientId)) {
+      throw new Error(
+        `invalid Cognito config: region/clientId failed format validation ` +
+        `(region=${JSON.stringify(cognitoConfig.region)}, clientId=${JSON.stringify(cognitoConfig.clientId)})`);
+    }
     const username = login.email ?? login.username;
     if (!username) throw new Error("cognito login requires login.email or login.username");
     const totpSecret = typeof auth.totp === "string" ? auth.totp : auth.totp?.secret;
     const authHeader = auth.authHeader ?? "x-safe-id-token";
-    const { tokens, fetchedSeed, challenge } = await cognitoAuthenticate({
-      config: cognitoConfig,
-      username,
-      password: login.password,
-      totpSecret,
-      enroll: auth.cognitoEnroll ?? false,
-      fetchImpl, // direct — NOT gated through inScope; see EGRESS note above
-      now: opts.now,
-      sleep: opts.sleep,
-    });
+
+    // FAIL SOFT (fix round 1): a Cognito authentication FAILURE AT RUNTIME — wrong
+    // credentials (NotAuthorizedException etc.), a transport/network error reaching
+    // the IDP, a challenge type this module can't answer (missing totpSecret on a
+    // SOFTWARE_TOKEN_MFA challenge, enroll not requested on an MFA_SETUP challenge, an
+    // unsupported challenge kind, a rejected verification code) — must NOT abort the
+    // whole beat. Mirrors the form-login path's own fail-soft-on-transport-failure
+    // posture below (see "all login attempts ... failed; proceeding without session A
+    // this beat"): log ONE redacted line and return a materialless shape, seeding NO
+    // session, so the beat proceeds unauthenticated rather than crashing. Contrast
+    // with the two throws above (missing/invalid cognitoConfig) — those are static
+    // configuration errors independent of what the target does at request time, and
+    // stay fail-CLOSED.
+    let tokens: CognitoTokens;
+    let fetchedSeed: string | undefined;
+    let challenge: "SOFTWARE_TOKEN_MFA" | "MFA_SETUP" | undefined;
+    try {
+      const result = await cognitoAuthenticate({
+        config: cognitoConfig,
+        username,
+        password: login.password,
+        totpSecret,
+        enroll: auth.cognitoEnroll ?? false,
+        fetchImpl, // direct — NOT gated through inScope; see EGRESS note above
+        now: opts.now,
+        sleep: opts.sleep,
+      });
+      tokens = result.tokens;
+      fetchedSeed = result.fetchedSeed;
+      challenge = result.challenge;
+    } catch (err) {
+      // SECRET HYGIENE: (err as Error).message is safe to log verbatim here — neither
+      // auth-cognito.ts's own thrown errors nor Cognito's own API error bodies
+      // (__type/message) ever embed the actual password/totpSecret/seed VALUES, only
+      // descriptive text and Cognito's generic rejection reasons (e.g.
+      // "NotAuthorizedException: Incorrect username or password.").
+      console.error(`[auth-record] cognito authentication failed; proceeding without session A this beat: ${(err as Error).message}`);
+      return {
+        login_url: `cognito://${cognitoConfig.region}/${cognitoConfig.clientId}`,
+        content_type: "json",
+        identifier_field: login.email ? "email" : "username",
+        password_field: "password",
+        auth_header_name: authHeader,
+        token_location: "none",
+        two_factor: "none",
+      };
+    }
+
     // Seed session A with the IdToken under the configured header (default
     // x-safe-id-token) — same synthetic, non-PII SessionMeta.username convention as
     // the form-login path below; the real username was only ever used above, in the

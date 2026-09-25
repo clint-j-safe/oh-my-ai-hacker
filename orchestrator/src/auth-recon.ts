@@ -1,4 +1,4 @@
-import type { CognitoConfig } from "./auth-cognito.js";
+import { AWS_REGION_RE, COGNITO_CLIENT_ID_RE, type CognitoConfig } from "./auth-cognito.js";
 
 export const LOGIN_PATH_CANDIDATES = [
   "/api/login", "/api/auth/login", "/api/v1/auth/login", "/auth/login",
@@ -115,6 +115,18 @@ export function classifyLoginResponse(resp: { status: number; headers: Record<st
  * `userPoolId` and `userPoolWebClientId` to be present (either alone is too weak a
  * signal — `userPoolId` might appear without a paired client id in shared config
  * boilerplate) before returning a config; returns null otherwise.
+ *
+ * SECURITY (fix round 1): the extracted region/clientId are validated against
+ * AWS_REGION_RE/COGNITO_CLIENT_ID_RE (auth-cognito.ts) before being returned. This
+ * bundle text is TARGET-CONTROLLED (the target's own served JS), and the config this
+ * function returns flows into cognitoCall's request URL on a code path that
+ * deliberately bypasses the tether's inScope() gate (an explicit auth-provider
+ * egress — see beat.ts's EGRESS comment on runAuthRecord). Without this check, a
+ * bundle containing e.g. region:'evil.com/x' would previously yield an unvalidated
+ * config, and cognitoAuthenticate would go on to POST the operator's real
+ * username/password to an attacker-controlled host built from it. A region/clientId
+ * that fails the shape check is treated as "not confidently Cognito" — this function
+ * returns null rather than a best-effort/unsafe guess.
  */
 export function detectCognito(bundleText: string): CognitoConfig | null {
   const poolId = bundleText.match(/userPoolId\s*:\s*[`'"]([^`'"]+)[`'"]/);
@@ -122,8 +134,10 @@ export function detectCognito(bundleText: string): CognitoConfig | null {
   if (!poolId || !clientId) return null;
   const explicitRegion = bundleText.match(/(?<![a-zA-Z])region\s*:\s*[`'"]([^`'"]+)[`'"]/);
   const region = explicitRegion?.[1] ?? poolId[1]!.split("_")[0];
+  const cid = clientId[1]!;
   if (!region) return null;
-  return { region, clientId: clientId[1]! };
+  if (!AWS_REGION_RE.test(region) || !COGNITO_CLIENT_ID_RE.test(cid)) return null;
+  return { region, clientId: cid };
 }
 
 // --- Login-endpoint DISCOVERY (deterministic; "envelope-from-error" idiom) ---

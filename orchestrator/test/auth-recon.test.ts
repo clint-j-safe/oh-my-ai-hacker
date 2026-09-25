@@ -106,3 +106,26 @@ test("detectCognito returns null when the bundle has no Cognito config", () => {
   assert.equal(detectCognito("const x = 1; // nothing here"), null);
   assert.equal(detectCognito("userPoolId:'us-east-1_abc'"), null); // no paired client id
 });
+
+// --- fix round 1: scope-bypass / credential-exfiltration hole -----------------
+// detectCognito's output flows, unvalidated in the original implementation, into
+// cognitoCall's request URL on a code path that deliberately bypasses inScope()
+// (see beat.ts's EGRESS comment on runAuthRecord). A malicious/malformed region or
+// clientId string embedded in the TARGET's own served bundle must never be trusted
+// enough to steer that URL's host — detectCognito must refuse (return null) rather
+// than pass through an unvalidated value.
+
+test("detectCognito returns null for a bundle-supplied region that isn't a real AWS region shape (host-injection attempt)", () => {
+  const snippet = "userPoolId:'us-east-1_Y4lomyxe9',userPoolWebClientId:'4e4np8b76ra8uvf8ou2t6fmm9t',region:'evil.com/x'";
+  assert.equal(detectCognito(snippet), null);
+});
+
+test("detectCognito returns null for a bundle-supplied clientId containing characters outside the expected alphanumeric shape", () => {
+  const snippet = "userPoolId:'us-east-1_Y4lomyxe9',userPoolWebClientId:'evil.com/x',region:'us-east-1'";
+  assert.equal(detectCognito(snippet), null);
+});
+
+test("detectCognito still returns the valid config for the real (well-formed) snippet — the validation doesn't over-reject", () => {
+  const snippet = "userPoolId:`us-east-1_Y4lomyxe9`,userPoolWebClientId:`4e4np8b76ra8uvf8ou2t6fmm9t`,region:`us-east-1`";
+  assert.deepEqual(detectCognito(snippet), { region: "us-east-1", clientId: "4e4np8b76ra8uvf8ou2t6fmm9t" });
+});

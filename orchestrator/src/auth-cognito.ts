@@ -30,6 +30,23 @@ export interface CognitoConfig {
   clientId: string;
 }
 
+/**
+ * SECURITY (fix round 1): the AWS region shape (e.g. "us-east-1") and the Cognito app
+ * client id shape (alphanumeric). `config.region` flows UNMODIFIED into cognitoCall's
+ * request URL on a code path that deliberately bypasses the tether's inScope() gate
+ * (see beat.ts's EGRESS comment on runAuthRecord) — without this validation, a
+ * target-controlled `region` string (e.g. fingerprinted from the target's OWN served JS
+ * bundle: `region:'evil.com/x'`) could steer that URL's HOST to an attacker-controlled
+ * destination, and cognitoAuthenticate would then POST the operator's real
+ * username/password there. Exported so auth-recon.ts's detectCognito (which produces a
+ * CognitoConfig from untrusted target-bundle text) and beat.ts's runAuthRecord (which
+ * validates before ever touching an explicit SAHW_COGNITO-supplied config, or a
+ * fingerprinted one) enforce the exact same shape as cognitoCall's own point-of-use
+ * assertion below — defense in depth, not just one gate.
+ */
+export const AWS_REGION_RE = /^[a-z]{2}-[a-z]+-\d$/;
+export const COGNITO_CLIENT_ID_RE = /^[a-zA-Z0-9]+$/;
+
 export interface CognitoTokens {
   idToken: string;
   accessToken: string;
@@ -49,6 +66,15 @@ function extractTokens(ar: Record<string, unknown> | undefined): CognitoTokens |
  * `content-type: application/x-amz-json-1.1`, exactly as the public SPA client sends it
  * (no SigV4, no SECRET_HASH — those belong to server-side/confidential clients only).
  * Returns the parsed JSON body; throws (carrying the error body) on a non-2xx response.
+ *
+ * SECURITY (fix round 1): validates `config.region`/`config.clientId` against
+ * AWS_REGION_RE/COGNITO_CLIENT_ID_RE, and re-parses the constructed URL to assert its
+ * host is EXACTLY `cognito-idp.<region>.amazonaws.com`, BEFORE calling `fetchImpl` at
+ * all — this is the last line of defense against a malformed/attacker-steered
+ * `region`/`clientId` reaching the network on this inScope()-bypassing egress path, on
+ * top of detectCognito's own validation (auth-recon.ts) and runAuthRecord's own
+ * pre-check (beat.ts). No caller of cognitoCall — explicit SAHW_COGNITO, a fingerprint,
+ * or a test — is exempt from this check.
  */
 export async function cognitoCall(
   config: CognitoConfig,
@@ -56,7 +82,21 @@ export async function cognitoCall(
   body: Record<string, unknown>,
   fetchImpl: typeof fetch,
 ): Promise<any> {
+  if (!AWS_REGION_RE.test(config.region)) {
+    throw new Error(`cognitoCall: refusing to call — region does not match the AWS region shape: ${JSON.stringify(config.region)}`);
+  }
+  if (!COGNITO_CLIENT_ID_RE.test(config.clientId)) {
+    throw new Error(`cognitoCall: refusing to call — clientId does not match the expected alphanumeric shape: ${JSON.stringify(config.clientId)}`);
+  }
   const url = `https://cognito-idp.${config.region}.amazonaws.com/`;
+  const expectedHost = `cognito-idp.${config.region}.amazonaws.com`;
+  const actualHost = new URL(url).host;
+  if (actualHost !== expectedHost) {
+    // Should be unreachable given the regex checks above, but re-parsing and asserting
+    // the exact host — rather than trusting string interpolation — is the point of
+    // this defense-in-depth layer: it holds even if the regex above is ever loosened.
+    throw new Error(`cognitoCall: refusing to call — resolved host "${actualHost}" != expected "${expectedHost}"`);
+  }
   const res = await fetchImpl(url, {
     method: "POST",
     headers: {

@@ -131,6 +131,61 @@ test("cognito provider auto-fingerprinted from the target's own bundle; bundle f
   assert.equal(sessions.authMaterialFor("A"), "id-direct");
 });
 
+test("cognito provider: a runtime auth failure (wrong credentials) fails SOFT — no session seeded, beat proceeds, does not throw", async () => {
+  const sessions = new SessionStore({ maxAccounts: 3 });
+  const IDP = "https://cognito-idp.us-east-1.amazonaws.com/";
+  const fetchImpl = routerFetch({
+    [`POST ${IDP} AWSCognitoIdentityProviderService.InitiateAuth`]: () => ({
+      status: 400, body: JSON.stringify({ __type: "NotAuthorizedException", message: "Incorrect username or password." }),
+    }),
+  });
+  const shape = await runAuthRecord({
+    auth: {
+      mode: "authenticated",
+      provider: "cognito",
+      login: { email: "user@x.io", password: "wrong-password" },
+      totp: null,
+      cognito: { region: "us-east-1", clientId: "cid" },
+    },
+    inScope: () => false,
+    fetchImpl, sessions, now: () => 59_000, sleep: async () => {},
+  });
+  assert.equal(shape.token_location, "none");
+  assert.equal(shape.two_factor, "none");
+  assert.equal(sessions.has("A"), false);
+});
+
+test("cognito provider: SOFTWARE_TOKEN_MFA with no totpSecret configured fails SOFT (a challenge this beat can't answer), not a throw", async () => {
+  const sessions = new SessionStore({ maxAccounts: 3 });
+  const IDP = "https://cognito-idp.us-east-1.amazonaws.com/";
+  const fetchImpl = routerFetch({
+    [`POST ${IDP} AWSCognitoIdentityProviderService.InitiateAuth`]: () => ({
+      status: 200, body: JSON.stringify({ ChallengeName: "SOFTWARE_TOKEN_MFA", Session: "sess-1" }),
+    }),
+  });
+  const shape = await runAuthRecord({
+    auth: { mode: "bypass", provider: "cognito", login: { email: "user@x.io", password: "pw" }, totp: null, cognito: { region: "us-east-1", clientId: "cid" } },
+    inScope: () => true, fetchImpl, sessions, now: () => 59_000, sleep: async () => {},
+  });
+  assert.equal(shape.token_location, "none");
+  assert.equal(sessions.has("A"), false);
+});
+
+test("cognito provider: an invalid (host-injection-shaped) region in an explicit SAHW_COGNITO throws — a genuine config error, NOT fail-soft", async () => {
+  const sessions = new SessionStore({ maxAccounts: 3 });
+  let fetchCalled = false;
+  const fetchImpl = (async () => { fetchCalled = true; return { status: 200, headers: { forEach: () => {} }, text: async () => "{}" } as any; }) as unknown as typeof fetch;
+  await assert.rejects(
+    () => runAuthRecord({
+      auth: { mode: "bypass", provider: "cognito", login: { email: "user@x.io", password: "pw" }, totp: null, cognito: { region: "evil.com/x", clientId: "cid" } },
+      inScope: () => true, fetchImpl, sessions, now: () => 59_000, sleep: async () => {},
+    }),
+    /region/i,
+  );
+  assert.equal(fetchCalled, false, "an invalid region must be rejected before ANY network call, including to the (legitimate) target");
+  assert.equal(sessions.has("A"), false);
+});
+
 test("cognito provider explicit with no config anywhere throws a clear error", async () => {
   const sessions = new SessionStore({ maxAccounts: 3 });
   await assert.rejects(

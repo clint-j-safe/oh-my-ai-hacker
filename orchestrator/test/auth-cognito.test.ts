@@ -56,6 +56,51 @@ test("cognitoCall sets x-amz-target + content-type application/x-amz-json-1.1, n
   assert.ok(!("SECRET_HASH" in req.body.AuthParameters));
 });
 
+// --- fix round 1: scope-bypass / credential-exfiltration hole -----------------
+// config.region flows unmodified into cognitoCall's request URL, on a path that
+// deliberately bypasses the tether's inScope() gate (see beat.ts's EGRESS comment).
+// cognitoCall itself — the last line of defense, independent of any caller's own
+// validation — must refuse a malformed region/clientId BEFORE ever calling fetchImpl.
+
+test("cognitoCall refuses a malicious region (host-injection shape) and never calls fetchImpl at all", async () => {
+  let fetchCalled = false;
+  const fetchImpl = (async () => { fetchCalled = true; return { status: 200, text: async () => "{}" } as any; }) as unknown as typeof fetch;
+  const evilConfig: CognitoConfig = { region: "evil.com/x", clientId: "4e4np8b76ra8uvf8ou2t6fmm9t" };
+  await assert.rejects(
+    () => cognitoCall(evilConfig, "InitiateAuth", { AuthFlow: "USER_PASSWORD_AUTH", ClientId: evilConfig.clientId, AuthParameters: { USERNAME: "u", PASSWORD: "p" } }, fetchImpl),
+    /region/i,
+  );
+  assert.equal(fetchCalled, false, "fetchImpl must never be called when region fails validation");
+});
+
+test("cognitoCall refuses a malicious clientId shape and never calls fetchImpl at all", async () => {
+  let fetchCalled = false;
+  const fetchImpl = (async () => { fetchCalled = true; return { status: 200, text: async () => "{}" } as any; }) as unknown as typeof fetch;
+  const evilConfig: CognitoConfig = { region: "us-east-1", clientId: "evil.com/x" };
+  await assert.rejects(
+    () => cognitoCall(evilConfig, "InitiateAuth", { AuthFlow: "USER_PASSWORD_AUTH", ClientId: evilConfig.clientId, AuthParameters: { USERNAME: "u", PASSWORD: "p" } }, fetchImpl),
+    /clientId/i,
+  );
+  assert.equal(fetchCalled, false, "fetchImpl must never be called when clientId fails validation");
+});
+
+test("cognitoCall's URL, for any config that passes validation, always resolves to exactly cognito-idp.<region>.amazonaws.com", async () => {
+  let seenUrl = "";
+  const fetchImpl = (async (url: string) => { seenUrl = url; return { status: 200, text: async () => "{}" } as any; }) as unknown as typeof fetch;
+  await cognitoCall(CONFIG, "InitiateAuth", { AuthFlow: "USER_PASSWORD_AUTH", ClientId: CONFIG.clientId, AuthParameters: { USERNAME: "u", PASSWORD: "p" } }, fetchImpl);
+  assert.equal(new URL(seenUrl).host, `cognito-idp.${CONFIG.region}.amazonaws.com`);
+});
+
+test("cognitoAuthenticate (the full flow) also refuses a malicious region before ever reaching the network", async () => {
+  let fetchCalled = false;
+  const fetchImpl = (async () => { fetchCalled = true; return { status: 200, text: async () => "{}" } as any; }) as unknown as typeof fetch;
+  const evilConfig: CognitoConfig = { region: "evil.com/x", clientId: "cid" };
+  await assert.rejects(() => cognitoAuthenticate({
+    config: evilConfig, username: "user@x.io", password: "pw", fetchImpl, now, sleep,
+  }));
+  assert.equal(fetchCalled, false);
+});
+
 test("cognitoCall throws on a non-2xx response, carrying the error body", async () => {
   const fetchImpl = fakeCognitoFetch({
     InitiateAuth: () => ({ status: 400, body: { __type: "NotAuthorizedException", message: "Incorrect username or password." } }),
