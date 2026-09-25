@@ -98,23 +98,72 @@ export function loadDeepConfig(env: Env, authRef: string): DeepConfig {
 }
 
 export type AuthMode = "off" | "bypass" | "authenticated";
+export type AuthProvider = "auto" | "form" | "cognito";
 export interface AuthLogin { email?: string; username?: string; password: string; loginUrl?: string; fieldHints?: Record<string, string> }
 export interface AuthConfig {
   mode: AuthMode;
   login: AuthLogin | null;
   totp: string | { secret: string; algorithm?: string; digits?: number; period?: number } | null;
+  /** Which login protocol to speak. "auto" (default) tries the target's own
+   * form/JSON login unless a Cognito app client is fingerprinted from its served
+   * bundles (see auth-recon.ts's detectCognito), or SAHW_COGNITO is set explicitly.
+   * "form" never attempts Cognito even if fingerprinted. "cognito" requires either
+   * SAHW_COGNITO or a successful fingerprint, else runAuthRecord throws. Optional
+   * (defaults applied at load time) so existing hand-built AuthConfig literals
+   * (tests) that predate this field keep compiling. */
+  provider?: AuthProvider;
+  /** Explicit Cognito app-client config ({region, clientId}); when omitted and the
+   * provider is cognito/auto, it is taken from the fingerprint instead. */
+  cognito?: { region: string; clientId: string } | null;
+  /** Allow the MFA_SETUP "fetch and own a new TOTP seed" path (AssociateSoftwareToken)
+   * when the Cognito account has no TOTP device enrolled yet. Off by default — an
+   * account requiring setup with this false fails closed rather than silently
+   * enrolling a device the operator didn't ask for. */
+  cognitoEnroll?: boolean;
+  /** Header name the IdToken (or, for non-Cognito flows, any recovered auth
+   * material) is injected under when seeding session "A". Default "x-safe-id-token"
+   * — this app's own convention, not a generic Authorization/Bearer header. */
+  authHeader?: string;
 }
 
 /** Auth-scan config. Fail-closed: bypass/authenticated require SAHW_AUTH_LOGIN (with a
  * password). TOTP is parsed only in authenticated mode; bypass NEVER consumes a secret.
- * A TOTP-gated flow with no secret is caught later, at record time, not here. */
+ * A TOTP-gated flow with no secret is caught later, at record time, not here.
+ *
+ * provider/cognito/cognitoEnroll/authHeader are parsed regardless of mode — they carry
+ * no secrets of their own (region/clientId/header-name are public shape, not
+ * credentials), so there is nothing to gate. mode="off" still short-circuits before
+ * SAHW_AUTH_LOGIN is required, exactly as before this feature existed. */
 export function loadAuthConfig(env: Env): AuthConfig {
   const raw = (env.SAHW_AUTH_MODE ?? "off").trim().toLowerCase();
   if (raw !== "off" && raw !== "bypass" && raw !== "authenticated") {
     throw new ConfigError(`SAHW_AUTH_MODE must be off|bypass|authenticated, got: ${env.SAHW_AUTH_MODE}`);
   }
   const mode = raw as AuthMode;
-  if (mode === "off") return { mode, login: null, totp: null };
+
+  const providerRaw = (env.SAHW_AUTH_PROVIDER ?? "auto").trim().toLowerCase();
+  if (providerRaw !== "auto" && providerRaw !== "form" && providerRaw !== "cognito") {
+    throw new ConfigError(`SAHW_AUTH_PROVIDER must be auto|form|cognito, got: ${env.SAHW_AUTH_PROVIDER}`);
+  }
+  const provider = providerRaw as AuthProvider;
+
+  let cognito: AuthConfig["cognito"] = null;
+  const cognitoRaw = env.SAHW_COGNITO?.trim();
+  if (cognitoRaw) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(cognitoRaw); }
+    catch { throw new ConfigError("SAHW_COGNITO is not valid JSON"); }
+    const p = parsed as { region?: unknown; clientId?: unknown } | null;
+    if (!p || typeof p.region !== "string" || !p.region || typeof p.clientId !== "string" || !p.clientId) {
+      throw new ConfigError('SAHW_COGNITO must be JSON {"region": string, "clientId": string}');
+    }
+    cognito = { region: p.region, clientId: p.clientId };
+  }
+
+  const cognitoEnroll = boolEnv(env, "SAHW_COGNITO_ENROLL", false);
+  const authHeader = env.SAHW_AUTH_HEADER?.trim() || "x-safe-id-token";
+
+  if (mode === "off") return { mode, login: null, totp: null, provider, cognito, cognitoEnroll, authHeader };
 
   const loginRaw = env.SAHW_AUTH_LOGIN?.trim();
   if (!loginRaw) throw new ConfigError(`SAHW_AUTH_MODE=${mode} requires SAHW_AUTH_LOGIN`);
@@ -137,7 +186,7 @@ export function loadAuthConfig(env: Env): AuthConfig {
       })();
     }
   }
-  return { mode, login, totp };
+  return { mode, login, totp, provider, cognito, cognitoEnroll, authHeader };
 }
 
 function urls(raw: string | undefined, key: string): URL[] {

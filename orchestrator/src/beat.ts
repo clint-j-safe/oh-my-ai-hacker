@@ -21,10 +21,11 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import {
   candidateLoginRequests, classifyLoginResponse,
-  extractScriptSrcs, extractApiHints, candidateLoginUrls, classifyLoginProbe,
+  extractScriptSrcs, extractApiHints, candidateLoginUrls, classifyLoginProbe, detectCognito,
   type DiscoveredLogin,
 } from "./auth-recon.js";
 import { parseTotp, TotpEmitter } from "./totp.js";
+import { cognitoAuthenticate, type CognitoConfig } from "./auth-cognito.js";
 import { inScope } from "./tether.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
@@ -1853,6 +1854,43 @@ export async function discoverLoginEndpoint(opts: {
   return null;
 }
 
+/**
+ * Fingerprint a Cognito app client (region+clientId) from the target's OWN served
+ * bundles — pure discovery, no credentials involved. Reuses the exact same
+ * root->script-srcs->bundle-text crawl as discoverLoginEndpoint above (same budget
+ * cap, <=5 bundles), handing each bundle's text to auth-recon.ts's pure
+ * `detectCognito`. Every fetch here is a normal TARGET-app request and goes
+ * through the caller's `inScope` gate like any other in-scope discovery fetch —
+ * this is unrelated to the Cognito IDP egress note on runAuthRecord below,
+ * which is about the SEPARATE cognito-idp.<region>.amazonaws.com calls that
+ * happen only after a config is found. Fails soft: returns null (never throws)
+ * when nothing is found or a fetch errors.
+ */
+async function fingerprintCognito(opts: {
+  scopeOrigin: string;
+  fetchImpl: typeof fetch;
+  inScope: (url: string) => boolean;
+  maxBundles?: number;
+}): Promise<CognitoConfig | null> {
+  const { scopeOrigin, fetchImpl, inScope } = opts;
+  const readText = async (url: string): Promise<string | null> => {
+    if (!inScope(url)) return null;
+    try { const res = await fetchImpl(url, { redirect: "manual" } as any); return await res.text(); }
+    catch { return null; }
+  };
+  const root = await readText(new URL("/", scopeOrigin).toString());
+  if (!root) return null;
+  const srcs = extractScriptSrcs(root, scopeOrigin).slice(0, opts.maxBundles ?? 5);
+  for (const s of srcs) {
+    const js = await readText(s);
+    if (js) {
+      const cfg = detectCognito(js);
+      if (cfg) return cfg;
+    }
+  }
+  return null;
+}
+
 export async function runAuthRecord(opts: {
   auth: AuthConfig;
   inScope: (url: string) => boolean;
@@ -1862,12 +1900,82 @@ export async function runAuthRecord(opts: {
   sleep: (ms: number) => Promise<void>;
   /** The engagement's primary in-scope origin (e.g. scopeOrigins[0] from runBeat), used to
    * seed login-endpoint DISCOVERY when `login.loginUrl` is not configured. Optional — only
-   * required when loginUrl is absent; the two loginUrl-explicit tests omit it. */
+   * required when loginUrl is absent; the two loginUrl-explicit tests omit it. Also used,
+   * for the cognito provider, to fingerprint a Cognito app client from the target's own
+   * bundles when SAHW_COGNITO was not configured explicitly. */
   scopeOrigin?: string;
 }): Promise<LoginSequenceShape> {
   const { auth, inScope, fetchImpl, sessions } = opts;
   if (auth.mode === "off" || !auth.login) throw new Error("runAuthRecord called without an auth login");
   const login = auth.login;
+
+  // --- COGNITO PROVIDER PATH --------------------------------------------------
+  // Taken when the operator pinned provider:"cognito" explicitly, OR provider is the
+  // default "auto" and a Cognito app client was fingerprinted from the target's own
+  // served bundles (fingerprintCognito, above — a normal in-scope TARGET fetch).
+  // provider:"form" never enters this branch even if a fingerprint would succeed.
+  //
+  // EGRESS: the Cognito IDP host `cognito-idp.<region>.amazonaws.com` is NOT part of
+  // SAHW_SCOPE — it is an explicit auth-provider egress, analogous to a real browser
+  // talking to AWS's hosted auth backend rather than the target app itself. cognitoAuthenticate
+  // below is therefore called with `fetchImpl` DIRECTLY, never wrapped in/gated by the
+  // `inScope` check used everywhere else in this function (and in fingerprintCognito's own
+  // bundle fetches, which ARE target-app requests and DO go through inScope). Only the
+  // eventual authenticated requests to the TARGET app — made later by the hunter's
+  // http_request tool, using the IdToken seeded into session "A" below — go through the
+  // normal in-scope path.
+  const provider = auth.provider ?? "auto";
+  let cognitoConfig: CognitoConfig | null = auth.cognito ?? null;
+  if (provider !== "form" && !cognitoConfig && opts.scopeOrigin) {
+    cognitoConfig = await fingerprintCognito({ scopeOrigin: opts.scopeOrigin, fetchImpl, inScope });
+  }
+  const useCognito = provider === "cognito" || (provider === "auto" && cognitoConfig !== null);
+  if (useCognito) {
+    if (!cognitoConfig) {
+      throw new Error("SAHW_AUTH_PROVIDER=cognito requires SAHW_COGNITO or a fingerprinted Cognito app client");
+    }
+    const username = login.email ?? login.username;
+    if (!username) throw new Error("cognito login requires login.email or login.username");
+    const totpSecret = typeof auth.totp === "string" ? auth.totp : auth.totp?.secret;
+    const authHeader = auth.authHeader ?? "x-safe-id-token";
+    const { tokens, fetchedSeed, challenge } = await cognitoAuthenticate({
+      config: cognitoConfig,
+      username,
+      password: login.password,
+      totpSecret,
+      enroll: auth.cognitoEnroll ?? false,
+      fetchImpl, // direct — NOT gated through inScope; see EGRESS note above
+      now: opts.now,
+      sleep: opts.sleep,
+    });
+    // Seed session A with the IdToken under the configured header (default
+    // x-safe-id-token) — same synthetic, non-PII SessionMeta.username convention as
+    // the form-login path below; the real username was only ever used above, in the
+    // Cognito request itself.
+    sessions.create({
+      credentials: { username: "auth-A", email: "", password: login.password, mobile: "" },
+      authMaterial: tokens.idToken,
+      authHeaderName: authHeader,
+    });
+    // SECRET HYGIENE: log only that a seed was fetched (boolean), never fetchedSeed's
+    // value — it stays in-process only, inside this closure, and is discarded once
+    // this function returns (never persisted to the spine).
+    if (fetchedSeed) console.error("[auth-record] cognito: fetched and now owns a new TOTP seed (MFA_SETUP enrollment)");
+    return {
+      login_url: `cognito://${cognitoConfig.region}/${cognitoConfig.clientId}`,
+      content_type: "json",
+      identifier_field: login.email ? "email" : "username",
+      password_field: "password",
+      auth_header_name: authHeader,
+      token_location: "body",
+      // "totp" whenever either MFA challenge was completed (both are TOTP-based —
+      // SOFTWARE_TOKEN_MFA against a known seed, MFA_SETUP against a freshly-fetched
+      // one); "none" when InitiateAuth returned tokens directly with no challenge.
+      two_factor: challenge ? "totp" : "none",
+    };
+  }
+
+  // --- FORM/JSON LOGIN PATH (unchanged) ---------------------------------------
   let loginUrl = login.loginUrl ?? "";
   if (!loginUrl) {
     if (!opts.scopeOrigin) throw new Error("login_url discovery not yet recorded; provide login.loginUrl");

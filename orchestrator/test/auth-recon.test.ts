@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse } from "../src/auth-recon.js";
+import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse, detectCognito } from "../src/auth-recon.js";
 
 test("candidateLoginRequests emits json-first email/username variants, cheap-first", () => {
   const a = candidateLoginRequests("https://t/login", { email: "e@x.io", password: "p" });
@@ -88,4 +88,21 @@ test("detectTwoFactor rejects challenge variants that are part of longer words",
     const result = detectTwoFactor(200, body).present;
     assert.equal(result, expected, `Failed for: ${body} - got ${result}, expected ${expected}`);
   }
+});
+
+test("detectCognito extracts {region, clientId} from an Amplify-style bundle snippet", () => {
+  const snippet = "const c={userPoolId:`us-east-1_Y4lomyxe9`,userPoolWebClientId:`4e4np8b76ra8uvf8ou2t6fmm9t`,region:`us-east-1`};";
+  const cfg = detectCognito(snippet);
+  assert.deepEqual(cfg, { region: "us-east-1", clientId: "4e4np8b76ra8uvf8ou2t6fmm9t" });
+});
+
+test("detectCognito derives region from the pool id's own prefix when region is not spelled out separately", () => {
+  const snippet = "userPoolId:'us-east-1_Y4lomyxe9',userPoolWebClientId:'4e4np8b76ra8uvf8ou2t6fmm9t'";
+  const cfg = detectCognito(snippet);
+  assert.deepEqual(cfg, { region: "us-east-1", clientId: "4e4np8b76ra8uvf8ou2t6fmm9t" });
+});
+
+test("detectCognito returns null when the bundle has no Cognito config", () => {
+  assert.equal(detectCognito("const x = 1; // nothing here"), null);
+  assert.equal(detectCognito("userPoolId:'us-east-1_abc'"), null); // no paired client id
 });

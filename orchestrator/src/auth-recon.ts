@@ -1,3 +1,5 @@
+import type { CognitoConfig } from "./auth-cognito.js";
+
 export const LOGIN_PATH_CANDIDATES = [
   "/api/login", "/api/auth/login", "/api/v1/auth/login", "/auth/login",
   "/login", "/api/session", "/session", "/api/signin", "/signin",
@@ -101,6 +103,27 @@ export function classifyLoginResponse(resp: { status: number; headers: Record<st
   if (twoFactor.present) return { outcome: "2fa_required_no_material", authMaterial: null, twoFactor };
   if (resp.status >= 400) return { outcome: "invalid", authMaterial: null, twoFactor };
   return { outcome: "unknown", authMaterial: null, twoFactor };
+}
+
+/**
+ * Fingerprint an AWS Cognito app client from a served JS bundle's own text — pure,
+ * no I/O. Amplify/amplify-js-style configs embed a literal `userPoolId`,
+ * `userPoolWebClientId`, and (usually) `region` as quoted object properties;
+ * `region` is optional in the source since it is recoverable from the pool id's
+ * own `<region>_<id>` prefix (Cognito pool ids are always shaped that way), so a
+ * bundle that sets region only implicitly is still detected. Requires BOTH
+ * `userPoolId` and `userPoolWebClientId` to be present (either alone is too weak a
+ * signal — `userPoolId` might appear without a paired client id in shared config
+ * boilerplate) before returning a config; returns null otherwise.
+ */
+export function detectCognito(bundleText: string): CognitoConfig | null {
+  const poolId = bundleText.match(/userPoolId\s*:\s*[`'"]([^`'"]+)[`'"]/);
+  const clientId = bundleText.match(/userPoolWebClientId\s*:\s*[`'"]([^`'"]+)[`'"]/);
+  if (!poolId || !clientId) return null;
+  const explicitRegion = bundleText.match(/(?<![a-zA-Z])region\s*:\s*[`'"]([^`'"]+)[`'"]/);
+  const region = explicitRegion?.[1] ?? poolId[1]!.split("_")[0];
+  if (!region) return null;
+  return { region, clientId: clientId[1]! };
 }
 
 // --- Login-endpoint DISCOVERY (deterministic; "envelope-from-error" idiom) ---
