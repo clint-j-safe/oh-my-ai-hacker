@@ -194,3 +194,10 @@ test("F-25 proof shape: required restoration WITHOUT proof downgrades to NEEDS_R
   );
   assert.equal(v.status, "NEEDS_REVIEW", v.reason);
 });
+
+test("parseAesCbcParams: also handles PHP openssl_encrypt (key,options,iv non-consecutive)", () => {
+  const php = `openssl_encrypt($otp, 'aes-256-cbc', "9bbc0d79e686e847bc305c9bd4cc2ea6", $options=OPENSSL_RAW_DATA, "0123456789abcdef")`;
+  const p = parseAesCbcParams(php);
+  assert.equal(p?.key, "9bbc0d79e686e847bc305c9bd4cc2ea6");
+  assert.equal(p?.iv, "0123456789abcdef");
+});

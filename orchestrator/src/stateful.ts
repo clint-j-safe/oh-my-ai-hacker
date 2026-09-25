@@ -163,8 +163,17 @@ export function buildXxeXml(fieldNames: string[], filePath = "file:///etc/passwd
  * a hex key, and a 16-char iv. This mirrors what F-18 (crypto_disclosure) recovers; using
  * it to decrypt an OTP is legitimate recon, not a hardcoded answer-key (the values come
  * from the target's own shipped code at runtime). Returns null if not found. */
-export function parseAesCbcParams(jsText: string): { key: string; iv: string } | null {
-  const m = /['"]aes-256-cbc['"]\s*,\s*['"]([0-9a-fA-F]{32,64})['"]\s*,\s*['"]([^'"]{16})['"]/i.exec(jsText);
-  if (!m) return null;
-  return { key: m[1], iv: m[2] };
+export function parseAesCbcParams(text: string): { key: string; iv: string } | null {
+  // Handle both the client's createDecipheriv(algo,key,iv) form (three CONSECUTIVE string
+  // literals) and PHP's openssl_encrypt(data,'aes-256-cbc',key,options,iv) form (key and iv
+  // separated by an options argument). Anchor on the algorithm, then take the next quoted
+  // 32-64 hex string as the key and the next quoted 16-char string after it as the iv.
+  const anchor = /['"]aes-256-cbc['"]/i.exec(text);
+  if (!anchor) return null;
+  const after = text.slice(anchor.index + anchor[0].length, anchor.index + anchor[0].length + 400);
+  const keyM = /['"]([0-9a-fA-F]{32,64})['"]/.exec(after);
+  if (!keyM) return null;
+  const ivM = /['"]([^'"]{16})['"]/.exec(after.slice(keyM.index + keyM[0].length));
+  if (!ivM) return null;
+  return { key: keyM[1], iv: ivM[1] };
 }
