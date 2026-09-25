@@ -22,6 +22,7 @@ import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelat
 import {
   candidateLoginRequests, classifyLoginResponse,
   extractScriptSrcs, extractApiHints, candidateLoginUrls, classifyLoginProbe, detectCognito,
+  extractApiRoutes, fillRouteTemplate, looksLikeRealEndpoint,
   type DiscoveredLogin,
 } from "./auth-recon.js";
 import { parseTotp, TotpEmitter } from "./totp.js";
@@ -1855,6 +1856,90 @@ export async function discoverLoginEndpoint(opts: {
 }
 
 /**
+ * SPA API-SURFACE discovery: crawls the SAME root->script-srcs->bundle-text path as
+ * discoverLoginEndpoint above (budget-capped, <=6 bundles by default), but instead of hunting
+ * for a single login route, mines EVERY bundle for the app's broader REST route map
+ * (auth-recon.ts's extractApiRoutes: static literals + template-function routes normalized to
+ * `{id}`), builds absolute candidate URLs against every discovered API base (falling back to
+ * `/api/v3`/`""` when none was found), and probes each with a single BENIGN GET — never a
+ * payload; the sweep does fuzzing later. A candidate is kept only when the app's own response
+ * says the route is REAL (auth-recon.ts's looksLikeRealEndpoint: JSON body, or a 4xx that isn't
+ * the SPA's own HTML catch-all — see isSpaFallback) rather than the SPA's index.html served for
+ * every unknown path. Also best-effort mines a bundle's own `<bundle>.js.map` when present (a
+ * real sourcemap's un-minified source often reveals more route literals than the minified
+ * bundle text alone) — a non-sourcemap or missing `.map` is silently skipped, never fatal.
+ *
+ * EVERY fetch (root, bundles, maps, and candidate probes) is gated through the caller's
+ * `inScope` exactly like discoverLoginEndpoint — this is a normal TARGET-app request path, not
+ * an egress exception. Budget-capped on both bundles (<=6) and probes (<=40) so a large SPA
+ * cannot blow the beat's time/request budget. Fails soft throughout: a transport error on any
+ * single fetch is logged and treated as "no data from that URL", never thrown.
+ */
+export async function discoverApiSurface(opts: {
+  scopeOrigin: string;
+  fetchImpl: typeof fetch;
+  inScope: (url: string) => boolean;
+  log?: (m: string) => void;
+  maxBundles?: number;   // default 6
+  maxProbes?: number;    // default 40
+}): Promise<Array<{ url: string; method: string }>> {
+  const { scopeOrigin, fetchImpl, inScope } = opts;
+  const log = opts.log ?? (() => {});
+  const readText = async (url: string): Promise<{ status: number; headers: Record<string, string>; body: string } | null> => {
+    if (!inScope(url)) return null;
+    try {
+      const r = await fetchImpl(url, { redirect: "manual" } as any);
+      const h: Record<string, string> = {};
+      r.headers.forEach((v: string, k: string) => { h[k] = v; });
+      return { status: r.status, headers: h, body: await r.text() };
+    } catch (e) { log(`[api-surface] fetch failed ${url}: ${String(e)}`); return null; }
+  };
+  // 1) root -> bundles -> routes + bases
+  const root = await readText(new URL("/", scopeOrigin).toString());
+  const bases = new Set<string>();
+  const routes = new Set<string>();
+  if (root) {
+    for (const s of extractScriptSrcs(root.body, scopeOrigin).slice(0, opts.maxBundles ?? 6)) {
+      const js = await readText(s);
+      if (!js) continue;
+      for (const b of extractApiHints(js.body).apiBases) bases.add(b);
+      for (const rt of extractApiRoutes(js.body)) routes.add(rt);
+      // best-effort sourcemap enrichment: fetch <bundle>.map; if it's a real sourcemap JSON, mine routes
+      const map = await readText(s + ".map");
+      if (map && /"version"\s*:\s*3/.test(map.body.slice(0, 200))) {
+        for (const rt of extractApiRoutes(map.body)) routes.add(rt);
+      }
+    }
+  }
+  // 2) build absolute candidate URLs (route may already include the base, or be under a base)
+  const baseList = bases.size ? [...bases] : ["/api/v3", ""];
+  const cands = new Set<string>();
+  for (const rt of routes) {
+    const filled = fillRouteTemplate(rt);
+    try { cands.add(new URL(filled, scopeOrigin).toString()); } catch { /* skip */ }
+    for (const b of baseList) {
+      if (!filled.startsWith(b)) {
+        try { cands.add(new URL(b + filled, scopeOrigin).toString()); } catch { /* skip */ }
+      }
+    }
+  }
+  // 3) probe (GET, benign) in-scope, budget-capped; keep only real endpoints (not SPA fallback)
+  const live: Array<{ url: string; method: string }> = [];
+  let probes = 0;
+  for (const url of cands) {
+    if (probes >= (opts.maxProbes ?? 40)) break;
+    if (!inScope(url)) continue;
+    probes++;
+    const r = await readText(url);
+    if (r && looksLikeRealEndpoint(r.status, r.headers, r.body)) {
+      live.push({ url, method: "GET" });
+      log(`[api-surface] live: ${url} (${r.status})`);
+    }
+  }
+  return live;
+}
+
+/**
  * Fingerprint a Cognito app client (region+clientId) from the target's OWN served
  * bundles — pure discovery, no credentials involved. Reuses the exact same
  * root->script-srcs->bundle-text crawl as discoverLoginEndpoint above (same budget
@@ -2200,6 +2285,36 @@ export async function runBeat(opts: {
   // is briefed on. Mutates in place. Fails soft.
   if (engagement.deep.enabled && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
     await runDnsRecon({ engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
+
+    // SPA API-SURFACE PRE-PASS (deep mode, first beat only, same gate as the DNS recon above):
+    // mine the app's own JS bundles for its REST route map and confirm each in-scope candidate
+    // with a single benign GET before adding it — closes the #1 capability gap where the
+    // pre-pass fetched bundles for login discovery but never fed the API route map into
+    // attack_surface, so the sweep + hunter never tested the API. Runs BEFORE the brief is
+    // built (same discipline as runDnsRecon) so discovered routes are visible to THIS beat, not
+    // just the next one. Add-only: seeds new SpineEndpoint rows deduped by "METHOD url" against
+    // what's already on the surface (mirrors spine.ts's mergeEndpoints key), never removes or
+    // overwrites an existing entry's richer status/content_type from a prior real probe.
+    const apiLog = (m: string) => { try { console.error(m); } catch { /* */ } };
+    const discoveredApiRoutes = await discoverApiSurface({
+      scopeOrigin: scopeOrigins[0]!,
+      fetchImpl: opts.fetchImpl ?? fetch,
+      inScope: (u) => inScope(engagement, u).allow,
+      log: apiLog,
+    });
+    if (discoveredApiRoutes.length) {
+      const known = new Set(spineLoad.spine.attack_surface.map((e) => `${e.method} ${e.url}`));
+      for (const { url, method } of discoveredApiRoutes) {
+        const key = `${method} ${url}`;
+        if (known.has(key)) continue;
+        known.add(key);
+        spineLoad.spine.attack_surface.push({
+          url, method, status: null, content_type: null,
+          semantic_role: "discovered-api-route",
+          notes: "SPA bundle-mined REST route, confirmed live by a benign GET probe (not the SPA HTML catch-all)",
+        });
+      }
+    }
   }
 
   // AUTH RECORD (auth-scan modes, EVERY beat): logs in with the operator's own

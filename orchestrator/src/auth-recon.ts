@@ -191,6 +191,50 @@ export function candidateLoginUrls(origin: string, apiBases: string[]): string[]
   return [...new Set(urls)];
 }
 
+// --- SPA API-surface DISCOVERY (deterministic; reuses extractScriptSrcs/extractApiHints) ---
+//
+// The deep-mode beat-1 pre-pass already fetches the SPA root + its JS bundles to discover the
+// login endpoint (see discoverLoginEndpoint in beat.ts). These helpers mine those SAME bundles
+// for the app's broader REST route map so discoverApiSurface (beat.ts) can feed live endpoints
+// into spine.attack_surface — otherwise the sweep + hunter never see the API at all.
+
+/** Extract candidate API route TEMPLATES from a JS bundle: static path literals AND
+ *  template-function routes (`/documents/${e}` -> `/documents/{id}`). Deduped, normalized. */
+export function extractApiRoutes(js: string): string[] {
+  const routes = new Set<string>();
+  // static path literals under an api-ish prefix
+  for (const m of js.matchAll(/["'`](\/(?:api\/v\d+|v\d+|users|documents|groups|incidents|notifications|locations|settings|filters|identity-provider|access-request|federate|reports|me|search|saas-apps)[a-zA-Z0-9/_-]*)["'`]/g)) {
+    routes.add(m[1]!);
+  }
+  // template-literal routes containing ${...} -> replace each ${...} with {id}
+  for (const m of js.matchAll(/`(\/[a-zA-Z0-9/_${}.-]*\$\{[^`]*)`/g)) {
+    const t = m[1]!.replace(/\$\{[^}]*\}/g, "{id}");
+    if (/^\/[a-zA-Z0-9/_{}-]+$/.test(t)) routes.add(t);
+  }
+  return [...routes];
+}
+
+/** Fill {id}/{...} placeholders with a benign sample so the route is requestable. */
+export function fillRouteTemplate(template: string, sample = "1"): string {
+  return template.replace(/\{[^}]*\}/g, sample);
+}
+
+/** True when a probe response is the SPA HTML catch-all (not a real API endpoint). */
+export function isSpaFallback(status: number, headers: Record<string, string>, body: string): boolean {
+  const ct = (headers["content-type"] ?? headers["Content-Type"] ?? "").toLowerCase();
+  return status >= 200 && status < 300 && ct.includes("text/html") && /<!doctype html/i.test(body.slice(0, 200));
+}
+
+/** True when a probe response indicates a REAL endpoint exists (JSON, or any 4xx that isn't the SPA fallback). */
+export function looksLikeRealEndpoint(status: number, headers: Record<string, string>, body: string): boolean {
+  if (isSpaFallback(status, headers, body)) return false;
+  const ct = (headers["content-type"] ?? headers["Content-Type"] ?? "").toLowerCase();
+  if (ct.includes("application/json")) return true;
+  // a 4xx/405 with a non-HTML body (e.g. API-gateway deny, validation) = endpoint exists
+  if (status === 400 || status === 401 || status === 403 || status === 405 || status === 422) return true;
+  return false;
+}
+
 /** Decide from a probe response whether this path is the login endpoint, and extract any
  * required identifier field the app's validation error reveals ("envelope-from-error"). */
 export function classifyLoginProbe(status: number, body: string): { isLogin: boolean; requiredFields: string[] } {
