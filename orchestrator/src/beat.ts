@@ -2,7 +2,7 @@ import { randomUUID, createDecipheriv } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import type { spawn } from "node:child_process";
-import { loadEngagement, type DeepConfig } from "./config.js";
+import { loadEngagement, type DeepConfig, type Engagement } from "./config.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
 import type { SessionStore } from "./session.js";
@@ -22,6 +22,10 @@ import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelat
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
 import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, decodePhpSerialized, swapLastPhpSerializedString, type FieldMap } from "./stateful.js";
+import { discoverVhosts, collectDnsNames, baseDomainOf, type VhostExec } from "./dns-recon.js";
+import { Resolver } from "node:dns/promises";
+import { connect as netConnect } from "node:net";
+import { appendFile } from "node:fs/promises";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -212,6 +216,79 @@ interface SweepObs {
 // XSS-family). ssti/command_injection have no benchmark class, so they are banked under
 // their own label (valid enterprise findings; scored non-canonical for the 28).
 const SWEEP_CLASS_MAP: Record<string, string> = { html_injection: "xss_reflected", dom_xss: "xss_reflected" };
+
+/** Raw-TCP AXFR (zone transfer) against <server>:53 for <domain>. Best-effort: returns the
+ * names it can reconstruct from the response, or [] on any failure/timeout. */
+async function axfrTcp(domain: string, server: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const socket = netConnect({ host: server, port: 53, timeout: 6000 });
+    const finish = (names: string[]) => { if (settled) return; settled = true; try { socket.destroy(); } catch { /* */ } resolve(names); };
+    socket.on("timeout", () => finish([]));
+    socket.on("error", () => finish([]));
+    socket.on("data", (d: Buffer | string) => chunks.push(Buffer.from(d)));
+    socket.on("close", () => {
+      const buf = Buffer.concat(chunks);
+      const base = baseDomainOf(domain) ?? domain;
+      finish(collectDnsNames(buf).filter((n) => n === base || n.endsWith(`.${base}`)));
+    });
+    socket.on("connect", () => {
+      const labels = domain.split(".").filter(Boolean);
+      const qname = Buffer.concat([...labels.map((l) => Buffer.concat([Buffer.from([l.length]), Buffer.from(l, "ascii")])), Buffer.from([0])]);
+      const header = Buffer.from([0x13, 0x37, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]); // id, flags=0, qd=1
+      const q = Buffer.concat([qname, Buffer.from([0x00, 0xfc, 0x00, 0x01])]); // AXFR(252) IN(1)
+      const msg = Buffer.concat([header, q]);
+      socket.write(Buffer.concat([Buffer.from([(msg.length >> 8) & 0xff, msg.length & 0xff]), msg]));
+    });
+  });
+}
+
+/**
+ * DNS-driven vhost discovery pre-pass. For each scoped IP: reverse-DNS -> base domain, AXFR
+ * -> subdomains, prefix-append -> candidates, then confirm each by a Host-routed differential
+ * against the IP's default response. Every confirmed FQDN is (a) mapped to the IP in the
+ * container's /etc/hosts so http://<fqdn> resolves, (b) added to the engagement scope so the
+ * Tether permits it, and (c) seeded onto the attack surface so the loop crawls it. Fails soft.
+ * Returns the discovered vhost origins (for logging/seed). No arbitrary hosts — every name
+ * traces to the IP's own DNS (PTR/AXFR) or a scoped domain.
+ */
+async function runDnsRecon(opts: {
+  runner: ToolRunner; engagement: Engagement; scopeOrigins: string[]; scopeUrls: string[]; attackSurface: SpineEndpoint[];
+}): Promise<string[]> {
+  const log = (m: string) => { try { console.error(`[dns-recon] ${m}`); } catch { /* */ } };
+  try {
+    const exec: VhostExec = {
+      ptr: async (ip) => {
+        try { const r = new Resolver(); r.setServers([ip]); return await r.reverse(ip); }
+        catch { return []; }
+      },
+      axfr: (domain, server) => axfrTcp(domain, server),
+      httpHost: async (ip, host) => {
+        const r = await opts.runner.execute("http_request", { method: "GET", url: `http://${ip}/`, headers: { Host: host } });
+        if (!r.ok) return { status: 0, body: "" };
+        const cap = r.result as HttpCapture;
+        return { status: cap.response.status, body: cap.response.body ?? "" };
+      },
+    };
+    const found = await discoverVhosts(opts.scopeOrigins, exec, log);
+    const seeded: string[] = [];
+    for (const { fqdn, ip } of found) {
+      const origin = `http://${fqdn}`;
+      try { await appendFile("/etc/hosts", `${ip} ${fqdn}\n`); } catch { /* non-fatal */ }
+      if (!opts.scopeOrigins.includes(origin)) {
+        try {
+          opts.engagement.scope.push(new URL(`${origin}/`)); opts.scopeOrigins.push(origin); opts.scopeUrls.push(`${origin}/`);
+          // Seed the attack surface so the hunter brief points the loop at the new vhost.
+          opts.attackSurface.push({ url: `${origin}/`, method: "GET", status: null, content_type: null, semantic_role: "discovered-vhost", notes: "DNS-discovered virtual host (reverse-DNS/AXFR of the target); crawl for login/app endpoints" });
+          seeded.push(origin);
+        } catch { /* */ }
+      }
+    }
+    if (seeded.length) log(`added vhosts to scope: ${seeded.join(", ")}`);
+    return seeded;
+  } catch (e) { log(`recon failed: ${(e as Error)?.message}`); return []; }
+}
 
 /**
  * Result of the sweep: the hunter directive (leads) AND the findings it banked DIRECTLY
@@ -1659,6 +1736,15 @@ export async function runBeat(opts: {
   // is refused outright and legitimately throws here, before any span opens — the
   // same posture as loadEngagement above.
   const spineLoad = await loadSpine({ workspace, authRef: engagement.authRef, scopeOrigins });
+
+  // DNS-RECON PRE-PASS (deep mode, first beat): discover virtual hosts the app hides behind
+  // (e.g. HTB Cronos's admin.cronos.htb) via reverse-DNS + AXFR + prefix-append of the
+  // TARGET'S OWN domain, confirmed by a Host-routed differential. Runs BEFORE the brief is
+  // built so discovered vhosts land in scope, /etc/hosts, and the attack surface the hunter
+  // is briefed on. Mutates in place. Fails soft.
+  if (engagement.deep.enabled && Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1))) <= 1) {
+    await runDnsRecon({ runner, engagement, scopeOrigins, scopeUrls, attackSurface: spineLoad.spine.attack_surface });
+  }
 
   // Registration phase (deterministic half) — runs BEFORE the brief is built so
   // the brief always reflects POST-registration state this beat, never the
