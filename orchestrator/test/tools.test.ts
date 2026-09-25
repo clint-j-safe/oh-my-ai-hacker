@@ -842,6 +842,43 @@ test("http_request with session:A injects auth material; the returned capture an
   assert.ok(!JSON.stringify(spanOut).includes("SECRET-TOKEN-A"));
 });
 
+test("http_request injects a session's SECONDARY secret headers (e.g. Cognito access token) on the wire, redacted in the capture", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sahw-"));
+  const store = new ArtifactStore(dir);
+  const sessions = new SessionStore({ maxAccounts: 2 });
+  sessions.create({
+    credentials: generateDisposableCredentials("A"),
+    authMaterial: "ID-TOKEN-SECRET",
+    authHeaderName: "x-safe-id-token",
+    extraHeaders: { authorization: "ACCESS-TOKEN-SECRET" },
+  });
+
+  let sentHeaders: Record<string, string> = {};
+  const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+    sentHeaders = (init?.headers as Record<string, string>) ?? {};
+    return new Response("OK", { status: 200, headers: { "content-type": "text/plain" } });
+  }) as unknown as typeof fetch;
+
+  const r = new ToolRunner({ engagement: E, store, fetchImpl, sessionStore: sessions });
+  const out = await r.execute("http_request", { method: "GET", url: "http://10.0.0.1:3000/api/v3/users", session: "A" });
+  assert.equal(out.ok, true);
+  if (!out.ok) throw new Error("unreachable");
+
+  // BOTH real tokens reach the wire, under their respective headers.
+  assert.equal(sentHeaders["x-safe-id-token"], "ID-TOKEN-SECRET");
+  assert.equal(sentHeaders["authorization"], "ACCESS-TOKEN-SECRET");
+
+  const cap = out.result as any;
+  // Both are redacted in the value handed back / stored.
+  assert.equal(cap.request.headers["x-safe-id-token"], "<redacted:session-A>");
+  assert.equal(cap.request.headers["authorization"], "<redacted:session-A>");
+  const artifactBytes = await store.get(cap.artifact.sha256);
+  for (const secret of ["ID-TOKEN-SECRET", "ACCESS-TOKEN-SECRET"]) {
+    assert.ok(!JSON.stringify(cap).includes(secret), `${secret} must not reach the model`);
+    assert.ok(!artifactBytes.toString("utf8").includes(secret), `${secret} must not be stored`);
+  }
+});
+
 test("http_request with session:B against a resource carries B's token, not A's (cross-user / IDOR mechanism)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sahw-"));
   const store = new ArtifactStore(dir);

@@ -73,6 +73,12 @@ interface SessionRecord {
   credentials: SessionCredentials;
   authMaterial: string | null;
   authHeaderName: string;
+  /** Additional SECRET auth headers injected alongside authMaterial (name -> value),
+   * for auth schemes that require more than one token per request — e.g. AWS Cognito
+   * apps that send the ID token in one header AND the access token in `authorization`.
+   * Treated exactly like authMaterial: real values reach the wire, are redacted in the
+   * recorded artifact, and never appear in SessionMeta. */
+  extraHeaders?: Record<string, string>;
   createdUtc: string;
 }
 
@@ -169,6 +175,7 @@ export class SessionStore {
     credentials: SessionCredentials;
     authMaterial: string | null;
     authHeaderName: string;
+    extraHeaders?: Record<string, string>;
     now?: Date;
   }): SessionMeta | null {
     const label = this.nextLabel();
@@ -178,6 +185,7 @@ export class SessionStore {
       credentials: opts.credentials,
       authMaterial: opts.authMaterial,
       authHeaderName: opts.authHeaderName,
+      extraHeaders: opts.extraHeaders && Object.keys(opts.extraHeaders).length > 0 ? { ...opts.extraHeaders } : undefined,
       createdUtc: (opts.now ?? new Date()).toISOString(),
     };
     this.records.set(label, record);
@@ -201,6 +209,14 @@ export class SessionStore {
    * at registration time from the target's own convention — never hardcoded). */
   authHeaderNameFor(label: string): string | null {
     return this.records.get(label)?.authHeaderName ?? null;
+  }
+
+  /** Additional SECRET auth headers for this session (name -> value), or {} if none.
+   * Same secret-handling contract as authMaterialFor: the only legitimate caller is
+   * tools.ts's http() executor, immediately before one outgoing fetch; the values must
+   * never be stored, logged, or returned to any other caller. */
+  extraHeadersFor(label: string): Record<string, string> {
+    return { ...(this.records.get(label)?.extraHeaders ?? {}) };
   }
 
   meta(label: string): SessionMeta | null {

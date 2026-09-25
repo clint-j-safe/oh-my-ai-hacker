@@ -1989,6 +1989,9 @@ export async function runAuthRecord(opts: {
    * for the cognito provider, to fingerprint a Cognito app client from the target's own
    * bundles when SAHW_COGNITO was not configured explicitly. */
   scopeOrigin?: string;
+  /** Process env, for optional auth knobs (e.g. SAHW_COGNITO_ACCESS_HEADER). Optional;
+   * when absent, defaults apply. */
+  env?: Record<string, string | undefined>;
 }): Promise<LoginSequenceShape> {
   const { auth, inScope, fetchImpl, sessions } = opts;
   if (auth.mode === "off" || !auth.login) throw new Error("runAuthRecord called without an auth login");
@@ -2040,6 +2043,10 @@ export async function runAuthRecord(opts: {
     if (!username) throw new Error("cognito login requires login.email or login.username");
     const totpSecret = typeof auth.totp === "string" ? auth.totp : auth.totp?.secret;
     const authHeader = auth.authHeader ?? "x-safe-id-token";
+    // Access-token header (secondary). Unset -> "authorization" (Amplify convention);
+    // explicitly "" -> disabled (id-token-only backends). See the sessions.create below.
+    const accessHeaderRaw = opts.env?.SAHW_COGNITO_ACCESS_HEADER;
+    const accessHeader = accessHeaderRaw === undefined ? "authorization" : accessHeaderRaw.trim();
 
     // FAIL SOFT (fix round 1): a Cognito authentication FAILURE AT RUNTIME — wrong
     // credentials (NotAuthorizedException etc.), a transport/network error reaching
@@ -2091,11 +2098,18 @@ export async function runAuthRecord(opts: {
     // Seed session A with the IdToken under the configured header (default
     // x-safe-id-token) — same synthetic, non-PII SessionMeta.username convention as
     // the form-login path below; the real username was only ever used above, in the
-    // Cognito request itself.
+    // Cognito request itself. Cognito/Amplify apps of this shape gate the API on BOTH
+    // the id token AND the access token (access token in `authorization`); injecting
+    // the id token alone yields an IAM "explicit deny" and the authenticated crawl sees
+    // nothing. So the access token rides as a secondary secret header. The access-token
+    // header name is configurable (SAHW_COGNITO_ACCESS_HEADER, default `authorization`,
+    // the Amplify convention); "" disables it for id-token-only backends.
+    const extraHeaders = accessHeader && tokens.accessToken ? { [accessHeader]: tokens.accessToken } : undefined;
     sessions.create({
       credentials: { username: "auth-A", email: "", password: login.password, mobile: "" },
       authMaterial: tokens.idToken,
       authHeaderName: authHeader,
+      extraHeaders,
     });
     // SECRET HYGIENE: log only that a seed was fetched (boolean), never fetchedSeed's
     // value — it stays in-process only, inside this closure, and is discarded once
@@ -2341,6 +2355,7 @@ export async function runBeat(opts: {
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       scopeOrigin: scopeOrigins[0],
+      env: opts.env,
     });
     spineLoad.spine.recovered_intel.login_sequence = shape;
   }

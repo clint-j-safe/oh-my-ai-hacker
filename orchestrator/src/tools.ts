@@ -980,6 +980,14 @@ export class ToolRunner {
       const headerName = this.sessions.authHeaderNameFor(label) ?? "Authorization";
       sendHeaders = { ...headers, [headerName]: material };
       recordHeaders = { ...headers, [headerName]: `<redacted:session-${label}>` };
+      // Secondary secret headers (e.g. a Cognito access token in `authorization`
+      // alongside the id token in `x-safe-id-token`). Same divergence discipline: the
+      // real value goes only into sendHeaders; recordHeaders (hashed into the artifact
+      // and handed back toward the model) gets a label-scoped placeholder per header.
+      for (const [name, value] of Object.entries(this.sessions.extraHeadersFor(label))) {
+        sendHeaders[name] = value;
+        recordHeaders[name] = `<redacted:session-${label}>`;
+      }
     }
 
     const started = Date.now();

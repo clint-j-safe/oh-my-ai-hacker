@@ -101,6 +101,27 @@ test("cognito provider (explicit config + custom header): seeds session A with t
   assert.equal(sessions.meta("A")!.auth_header_name, "x-custom-token");
   assert.equal(sessions.meta("A")!.has_auth_material, true);
   assert.equal(sessions.authMaterialFor("A"), "id-tok");
+  // The access token rides as a secondary secret header (default `authorization`) —
+  // this app's API gates on BOTH tokens; id-token-only yields an IAM explicit-deny.
+  assert.deepEqual(sessions.extraHeadersFor("A"), { authorization: "acc-tok" });
+});
+
+test("cognito provider: SAHW_COGNITO_ACCESS_HEADER=\"\" disables the secondary access-token header (id-token-only backend)", async () => {
+  const sessions = new SessionStore({ maxAccounts: 3 });
+  const IDP = "https://cognito-idp.us-east-1.amazonaws.com/";
+  const fetchImpl = routerFetch({
+    [`POST ${IDP} AWSCognitoIdentityProviderService.InitiateAuth`]: () => ({
+      status: 200, body: JSON.stringify({ AuthenticationResult: { IdToken: "id-tok", AccessToken: "acc-tok" } }),
+    }),
+  });
+  await runAuthRecord({
+    auth: { mode: "authenticated", provider: "cognito", login: { email: "u@x.io", password: "pw" }, totp: null,
+      cognito: { region: "us-east-1", clientId: "cid" }, authHeader: "x-safe-id-token" },
+    inScope: () => false, fetchImpl, sessions, now: () => 59_000, sleep: async () => {},
+    env: { SAHW_COGNITO_ACCESS_HEADER: "" },
+  });
+  assert.equal(sessions.authMaterialFor("A"), "id-tok");
+  assert.deepEqual(sessions.extraHeadersFor("A"), {}, "no secondary header when disabled");
 });
 
 test("cognito provider auto-fingerprinted from the target's own bundle; bundle fetches stay inScope, IDP calls bypass it", async () => {
