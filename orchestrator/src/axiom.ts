@@ -511,14 +511,18 @@ function deriveAuthBypassPre2fa(input: unknown): Verdict {
   if (!preReached) {
     return { status: "NEEDS_REVIEW", reason: `pre-2FA session did not reach the resource (status ${pre.status})` };
   }
-  const anonDenied = anon.status === 401 || anon.status === 403
-    || (anon.status >= 300 && anon.status < 400) || anon.body !== pre.body;
-  if (!anonDenied || anon.body === pre.body) {
-    return { status: "NEEDS_REVIEW", reason: "no anon-vs-pre-2FA differential: anonymous access was not demonstrably denied" };
+  // The anon request must NOT itself succeed (2xx) — a differing body alone (nonce,
+  // timestamp, requestId) is not proof of denial and must not trigger a spurious CONFIRMED.
+  const anonSucceeded = anon.status >= 200 && anon.status < 300;
+  if (anonSucceeded) {
+    return { status: "NEEDS_REVIEW", reason: `anonymous request also succeeded (status ${anon.status}); cannot distinguish a 2FA bypass from an unprotected resource` };
+  }
+  if (anon.body === pre.body) {
+    return { status: "NEEDS_REVIEW", reason: "anon and pre-2FA responses are identical; no differential" };
   }
   return {
     status: "CONFIRMED",
-    reason: `pre-2FA (password-only) session reached ${input.protectedResource} (status ${pre.status}) that the anonymous control did not (status ${anon.status}); second factor not enforced`,
+    reason: `pre-2FA (password-only) session reached ${input.protectedResource} (status ${pre.status}) that the anonymous control was denied (status ${anon.status}); second factor not enforced`,
   };
 }
 

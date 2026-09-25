@@ -39,3 +39,12 @@ test("NEEDS_REVIEW when the pre-2FA response did not reach protected content", (
 test("NEEDS_REVIEW on malformed input", () => {
   assert.notEqual(run({ protectedResource: "x" }).status, "CONFIRMED");
 });
+
+test("NEEDS_REVIEW when anon ALSO succeeded (200) even if bodies differ", () => {
+  const v = run({
+    protectedResource: "http://t/api/profile",
+    anonResponse: { status: 200, body: '{"ok":true,"requestId":"abc"}' },
+    pre2faResponse: { status: 200, body: '{"ok":true,"requestId":"xyz"}' },
+  });
+  assert.notEqual(v.status, "CONFIRMED");
+});
