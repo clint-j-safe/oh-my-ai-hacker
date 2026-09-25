@@ -337,7 +337,18 @@ async function runDeepSweep(opts: {
           const swapped = deser ? swapLastPhpSerializedString(deser, xss) : null;
           usedGadget = Boolean(swapped);
           const injectValue = swapped ? Buffer.from(swapped, "utf8").toString("base64") : xss;
-          persistBody = JSON.stringify(setAtPath(tmplObj, leaf, injectValue));
+          let obj = setAtPath(tmplObj, leaf, injectValue);
+          // Sibling fields in the captured template may hold fuzz values (e.g. amount=
+          // "sahwbenign") that fail the create endpoint's validators, so the row never
+          // persists. Coerce every OTHER string leaf whose current value is NON-NUMERIC to a
+          // benign numeric "100" — numeric validators (amount/roi/tenure) then pass, and a
+          // plain numeric string is broadly accepted by other field validators too.
+          for (const sib of jsonLeaves) {
+            if (sib === leaf) continue;
+            const v = readAtPath(obj, sib);
+            if (v !== null && !/^[0-9]+(\.[0-9]{1,2})?$/.test(v)) obj = setAtPath(obj, sib, "100");
+          }
+          persistBody = JSON.stringify(obj);
         } catch { continue; }
         const isLoan = /loan/i.test(createT.endpoint);
         if (isLoan) sxdbg(`leaf=${leaf} gadget=${usedGadget} shapes=${renderShapes.length}`);
