@@ -757,6 +757,19 @@ function evaluateFileCreatedThenDeleted(expression: string, evidence: EvidenceBu
 // still be able to CONFIRM as forced_browsing/info_disclosure.
 const STATIC_ASSET_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot)(?:\?|$)/i;
 
+// True when a response is an HTML document (a page/SPA shell), by content-type or a body
+// sniff of the leading bytes. Used by guardConfirmedVerdict to keep a marker found in a
+// public-by-design HTML page from confirming an info_/crypto_disclosure. Deliberately
+// narrow: it matches a document opener, not any body that merely contains an "<html>"
+// substring somewhere (e.g. a JSON field whose value quotes markup).
+function isHtmlDocumentResponse(cap: HttpCapture | null): boolean {
+  if (!cap) return false;
+  const ct = findHeaderValue(cap.response.headers ?? {}, "content-type");
+  if (ct && ct.toLowerCase().includes("text/html")) return true;
+  const head = (cap.response.body ?? "").slice(0, 256).trimStart().toLowerCase();
+  return head.startsWith("<!doctype html") || head.startsWith("<html");
+}
+
 /**
  * DETERMINISTIC, class-aware guard applied to a FINAL verdict (authoritative; runs after
  * adjudication). It can only DEMOTE a CONFIRMED/CONFIRMED_BY_ADJUDICATION to NEEDS_REVIEW
@@ -786,6 +799,28 @@ export function guardConfirmedVerdict(
     try { path = new URL(exploit?.request?.url ?? "").pathname; } catch { path = exploit?.request?.url ?? ""; }
     if (STATIC_ASSET_RE.test(path)) {
       return { status: "NEEDS_REVIEW", reason: `${vulnClass}: ${path} is a public-by-design static asset; needs human review before CONFIRMED` };
+    }
+  }
+
+  // info_disclosure / crypto_disclosure: a disclosure is sensitive DATA returned in a
+  // SUCCESS response. Two coarse-oracle false-positive shapes are demoted here (both
+  // observed live on demo.safeone.io, where body_contains confirmed a marker that merely
+  // differed between two responses):
+  //   G1 — a non-2xx response. A 403 "explicit deny", a 400 validation error, or a 404 is
+  //        a denial/error, not disclosed data; a marker inside it (a deny message, a field
+  //        name) is not a leak. Nothing sensitive is "disclosed" by a response that refused.
+  //   G2 — an HTML document / SPA shell body. A public-by-design HTML page (the SPA index,
+  //        a rendered app shell) is served to everyone by design; a marker in it is not a
+  //        data disclosure. Real JSON/data disclosures (and sensitive non-asset files) are
+  //        NOT HTML documents and pass through.
+  // Demote-only to NEEDS_REVIEW: a genuine disclosure that happens to arrive in a non-2xx or
+  // an HTML body is routed to human review, never dropped — no true positive can be lost.
+  if (vulnClass === "info_disclosure" || vulnClass === "crypto_disclosure") {
+    if (!(s >= 200 && s < 300)) {
+      return { status: "NEEDS_REVIEW", reason: `${vulnClass} requires a 2xx success response; observed status ${s} is a denial/error, not disclosed data` };
+    }
+    if (isHtmlDocumentResponse(exploit)) {
+      return { status: "NEEDS_REVIEW", reason: `${vulnClass}: exploit body is a public-by-design HTML document / SPA shell, not a data disclosure; needs human review before CONFIRMED` };
     }
   }
   return { status };
