@@ -80,6 +80,36 @@ test("looksLikeRealEndpoint: 404 text/html is NOT real", () => {
   );
 });
 
+// --- fix round 1: a 4xx HTML body (WAF block page / login-redirect page) is NOT a real endpoint ---
+
+test("looksLikeRealEndpoint: 403 text/html (WAF block page) is NOT real", () => {
+  assert.equal(
+    looksLikeRealEndpoint(403, { "content-type": "text/html" }, "<!doctype html><html>Forbidden</html>"),
+    false,
+  );
+});
+
+test("looksLikeRealEndpoint: 401 text/html (login-redirect page) is NOT real", () => {
+  assert.equal(
+    looksLikeRealEndpoint(401, { "content-type": "text/html" }, "<html>login</html>"),
+    false,
+  );
+});
+
+test("looksLikeRealEndpoint: 403 application/json explicit-deny is still real (unchanged)", () => {
+  assert.equal(
+    looksLikeRealEndpoint(403, { "content-type": "application/json" }, '{"Message":"...deny..."}'),
+    true,
+  );
+});
+
+test("looksLikeRealEndpoint: 400 with no content-type / plain-text body is still real (non-HTML 4xx)", () => {
+  assert.equal(
+    looksLikeRealEndpoint(400, {}, "missing field"),
+    true,
+  );
+});
+
 // ---- Part B: discoverApiSurface integration ----------------------------------------
 
 test("discoverApiSurface: mines routes from the bundle, probes candidates, keeps only real endpoints (drops the SPA fallback)", async () => {

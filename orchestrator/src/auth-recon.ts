@@ -225,12 +225,23 @@ export function isSpaFallback(status: number, headers: Record<string, string>, b
   return status >= 200 && status < 300 && ct.includes("text/html") && /<!doctype html/i.test(body.slice(0, 200));
 }
 
-/** True when a probe response indicates a REAL endpoint exists (JSON, or any 4xx that isn't the SPA fallback). */
+/**
+ * True when a probe response indicates a REAL endpoint exists (JSON, or a non-HTML 4xx that
+ * isn't the SPA fallback). FIX ROUND 1: the 4xx branch used to accept status alone, without
+ * checking the body wasn't HTML — a WAF-fronted 403 "Forbidden" page or a 401 login-redirect
+ * page (both plain HTML, not the SPA's own catch-all shape isSpaFallback checks for) would be
+ * misclassified as a real API endpoint and merged into attack_surface, polluting the hunt on
+ * WAF-fronted targets. Now ANY HTML body (2xx via isSpaFallback, or 4xx via the isHtml check
+ * below) is rejected; only a non-HTML 4xx (JSON, plain text, or no body/content-type at all —
+ * "endpoint exists but gated") is accepted.
+ */
 export function looksLikeRealEndpoint(status: number, headers: Record<string, string>, body: string): boolean {
   if (isSpaFallback(status, headers, body)) return false;
   const ct = (headers["content-type"] ?? headers["Content-Type"] ?? "").toLowerCase();
+  const isHtml = ct.includes("text/html") || /<!doctype html|<html[\s>]/i.test(body.slice(0, 200));
+  if (isHtml) return false; // any HTML response (2xx or 4xx) is not a real API endpoint
   if (ct.includes("application/json")) return true;
-  // a 4xx/405 with a non-HTML body (e.g. API-gateway deny, validation) = endpoint exists
+  // a non-HTML 4xx/405 body (e.g. API-gateway deny, validation, or no content-type at all) = endpoint exists
   if (status === 400 || status === 401 || status === 403 || status === 405 || status === 422) return true;
   return false;
 }
