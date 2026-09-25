@@ -44,7 +44,7 @@ runs `npm test` as a gate — a red test suite fails the build.
 
 ```bash
 # 1) archive the relevant trees and extract on the runner
-git archive HEAD orchestrator skills bench docs/bench > /tmp/sahw-src.tar
+git archive HEAD orchestrator skills > /tmp/sahw-src.tar
 scp /tmp/sahw-src.tar root@<RUNNER>:/tmp/sahw-src.tar
 ssh root@<RUNNER> 'cd /opt/sahw-src && tar -xf /tmp/sahw-src.tar \
   && docker build -f orchestrator/Dockerfile -t sahw-orchestrator .'
