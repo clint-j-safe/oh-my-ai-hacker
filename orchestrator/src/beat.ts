@@ -616,8 +616,9 @@ async function sweepNegativeTransfer(
 
   // Endpoint URL discovery from records (canonical API origin).
   const urlFor = (re: RegExp) => records.find((r) => re.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
-  const signupTemplate = (() => { const r = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && extractAssignedId(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
-  const loginTemplate = (() => { const r = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && extractJwt(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
+  const jsonBody = (x: RawRecord) => typeof x.request?.body === "string" && x.request.body.trim().startsWith("{");
+  const signupTemplate = (() => { const r = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractAssignedId(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
+  const loginTemplate = (() => { const r = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractJwt(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
   const signupUrl = urlFor(/(signup|register)/), loginUrl = urlFor(/\/login(\/|\?|$)/);
   const payUrl = urlFor(/beneficiary\/pay/), listUrl = urlFor(/beneficiary\/list/);
   const otpGetUrl = urlFor(/otp\/get/), otpVerifyUrl = urlFor(/otp\/verify/), detailsUrl = urlFor(/account\/details/);
