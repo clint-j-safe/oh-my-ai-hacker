@@ -484,12 +484,51 @@ function deriveNoSecondaryFactorBeforeOtp(input: unknown): Verdict {
   };
 }
 
+// --- auth_bypass_pre_2fa -------------------------------------------------------------------
+// Proves a password-only (pre-2FA) session reaches a protected resource that an ANONYMOUS
+// session cannot — i.e. the second factor is not enforced on that resource. SOUND via a
+// control differential over two real responses:
+//   (1) the anonymous request is DENIED (401/403, or a login-redirect 3xx, or a body that
+//       lacks the protected marker), AND
+//   (2) the pre-2FA session request SUCCEEDS (2xx) and returns protected content the
+//       anonymous response does not. Missing either side => NEEDS_REVIEW, never a pass.
+interface AuthBypassInput {
+  protectedResource: string;
+  anonResponse: { status: number; body: string };
+  pre2faResponse: { status: number; body: string };
+}
+function isAuthBypassInput(x: unknown): x is AuthBypassInput {
+  return isRecord(x) && typeof x.protectedResource === "string"
+    && isRecord(x.anonResponse) && typeof x.anonResponse.status === "number" && typeof x.anonResponse.body === "string"
+    && isRecord(x.pre2faResponse) && typeof x.pre2faResponse.status === "number" && typeof x.pre2faResponse.body === "string";
+}
+function deriveAuthBypassPre2fa(input: unknown): Verdict {
+  if (!isAuthBypassInput(input)) {
+    return { status: "NEEDS_REVIEW", reason: "auth_bypass_pre_2fa requires { protectedResource, anonResponse:{status,body}, pre2faResponse:{status,body} }" };
+  }
+  const anon = input.anonResponse, pre = input.pre2faResponse;
+  const preReached = pre.status >= 200 && pre.status < 300 && pre.body.trim().length > 0;
+  if (!preReached) {
+    return { status: "NEEDS_REVIEW", reason: `pre-2FA session did not reach the resource (status ${pre.status})` };
+  }
+  const anonDenied = anon.status === 401 || anon.status === 403
+    || (anon.status >= 300 && anon.status < 400) || anon.body !== pre.body;
+  if (!anonDenied || anon.body === pre.body) {
+    return { status: "NEEDS_REVIEW", reason: "no anon-vs-pre-2FA differential: anonymous access was not demonstrably denied" };
+  }
+  return {
+    status: "CONFIRMED",
+    reason: `pre-2FA (password-only) session reached ${input.protectedResource} (status ${pre.status}) that the anonymous control did not (status ${anon.status}); second factor not enforced`,
+  };
+}
+
 const DERIVERS: Record<string, Deriver> = {
   hs256_weak_key: deriveHs256WeakKey,
   aes_cbc_decrypt_matches: deriveAesCbcDecryptMatches,
   jwt_payload_contains: deriveJwtPayloadContains,
   tls_unavailable: deriveTlsUnavailable,
   no_secondary_factor_before_otp: deriveNoSecondaryFactorBeforeOtp,
+  auth_bypass_pre_2fa: deriveAuthBypassPre2fa,
 };
 
 function evaluateDerived(expression: string, evidence: EvidenceBundle | undefined): Verdict {
