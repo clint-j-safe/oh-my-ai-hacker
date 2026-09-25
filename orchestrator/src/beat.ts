@@ -278,53 +278,11 @@ async function runDeepSweep(opts: {
       return r.ok ? (r.result as HttpCapture) : null;
     };
 
-    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
     const targetByEndpoint = new Map(targets.map((t) => [t.endpoint, t]));
     const proved: ProvedEntry[] = [];
 
-    // BANK strong field hits directly through the Axiom (deterministic, not via the LLM).
-    for (const hit of fieldHits) {
-      if (hit.strength !== "strong") continue;
-      const t = targetByEndpoint.get(hit.endpoint);
-      if (!t) continue;
-      const exploit = stash.get(stashKey(t, hit.param, hit.payload));
-      const control = stash.get(stashKey(t, hit.param, null));
-      if (!exploit || !control) continue;
-      const banked = await bankIfConfirmed(opts, hit.vuln_class, hit.endpoint, hit.observed, exploit, control);
-      if (banked) proved.push(banked);
-    }
-
-    // XXE whole-body probe (field-injection can't express an external entity).
-    const xxeHits = await sweepXxe(targets, opts.runner);
-    for (const xh of xxeHits) {
-      if (!xh.exploit || !xh.control) continue;
-      const banked = await bankIfConfirmed(opts, "xxe", xh.endpoint, xh.observed, xh.exploit, xh.control);
-      if (banked) proved.push(banked);
-    }
-
-    // DEBUG-PAGE probe (F-09 shape): a valid envelope with `data` EMPTIED omits required
-    // fields -> unhandled framework error leaking internals. Exploit vs the normal body
-    // as control; a debug signature in the exploit but not the control is info_disclosure.
-    for (const t of targets.slice(0, 50)) {
-      if (!t.bodyTemplate || (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH")) continue;
-      let emptied: string; let normal: string;
-      try {
-        const obj = JSON.parse(t.bodyTemplate);
-        emptyDataInPlace(obj);
-        emptied = JSON.stringify(obj);
-        normal = t.bodyTemplate;
-      } catch { continue; }
-      const hdr = { "Content-Type": "application/json" };
-      const exploit = await fire(t.method, t.endpoint, hdr, emptied);
-      if (!exploit) continue;
-      const sig = detectDebugSignature(exploit.response.body ?? "");
-      if (!sig) continue;
-      const control = await fire(t.method, t.endpoint, hdr, normal);
-      if (!control || (control.response.body ?? "").includes(sig)) continue; // control also shows it -> not a differential
-      const banked = await bankIfConfirmed(opts, "info_disclosure", t.endpoint, sig, exploit, control);
-      if (banked) proved.push(banked);
-    }
-
+    // Run the FAST, high-value stateful/multi-step probes FIRST — before the large
+    // field sweep — so a long field sweep can never starve them of the phase budget.
     // STORED-XSS probe (F-19 shape): persist a canary via a create endpoint, then render
     // it via the paired list/view endpoint; the canary returned UNESCAPED there is stored
     // XSS. The render endpoint's METHOD/body is NOT always GET — F-19's listing is a
@@ -400,6 +358,52 @@ async function runDeepSweep(opts: {
     // Bounded + reversible (compensating positive transfer); recovers the OTP key generically.
     const txProved = await sweepNegativeTransfer(opts, fire, records as RawRecord[], opts.scopeOrigins);
     proved.push(...txProved);
+
+    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
+
+    // BANK strong field hits directly through the Axiom (deterministic, not via the LLM).
+    for (const hit of fieldHits) {
+      if (hit.strength !== "strong") continue;
+      const t = targetByEndpoint.get(hit.endpoint);
+      if (!t) continue;
+      const exploit = stash.get(stashKey(t, hit.param, hit.payload));
+      const control = stash.get(stashKey(t, hit.param, null));
+      if (!exploit || !control) continue;
+      const banked = await bankIfConfirmed(opts, hit.vuln_class, hit.endpoint, hit.observed, exploit, control);
+      if (banked) proved.push(banked);
+    }
+
+    // XXE whole-body probe (field-injection can't express an external entity).
+    const xxeHits = await sweepXxe(targets, opts.runner);
+    for (const xh of xxeHits) {
+      if (!xh.exploit || !xh.control) continue;
+      const banked = await bankIfConfirmed(opts, "xxe", xh.endpoint, xh.observed, xh.exploit, xh.control);
+      if (banked) proved.push(banked);
+    }
+
+    // DEBUG-PAGE probe (F-09 shape): a valid envelope with `data` EMPTIED omits required
+    // fields -> unhandled framework error leaking internals. Exploit vs the normal body
+    // as control; a debug signature in the exploit but not the control is info_disclosure.
+    for (const t of targets.slice(0, 50)) {
+      if (!t.bodyTemplate || (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH")) continue;
+      let emptied: string; let normal: string;
+      try {
+        const obj = JSON.parse(t.bodyTemplate);
+        emptyDataInPlace(obj);
+        emptied = JSON.stringify(obj);
+        normal = t.bodyTemplate;
+      } catch { continue; }
+      const hdr = { "Content-Type": "application/json" };
+      const exploit = await fire(t.method, t.endpoint, hdr, emptied);
+      if (!exploit) continue;
+      const sig = detectDebugSignature(exploit.response.body ?? "");
+      if (!sig) continue;
+      const control = await fire(t.method, t.endpoint, hdr, normal);
+      if (!control || (control.response.body ?? "").includes(sig)) continue; // control also shows it -> not a differential
+      const banked = await bankIfConfirmed(opts, "info_disclosure", t.endpoint, sig, exploit, control);
+      if (banked) proved.push(banked);
+    }
+
 
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
