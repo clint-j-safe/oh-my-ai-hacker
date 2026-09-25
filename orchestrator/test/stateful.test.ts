@@ -201,3 +201,17 @@ test("parseAesCbcParams: also handles PHP openssl_encrypt (key,options,iv non-co
   assert.equal(p?.key, "9bbc0d79e686e847bc305c9bd4cc2ea6");
   assert.equal(p?.iv, "0123456789abcdef");
 });
+
+import { swapLastPhpSerializedString, decodePhpSerialized } from "../src/stateful.js";
+
+test("swapLastPhpSerializedString: swaps logdata payload, fixes length prefix", () => {
+  const s = 'O:8:"LogWrite":2:{s:7:"logfile";s:1:"x";s:7:"logdata";s:2:"L1";}';
+  const out = swapLastPhpSerializedString(s, "<script>sahw1</script>");
+  assert.equal(out, 'O:8:"LogWrite":2:{s:7:"logfile";s:1:"x";s:7:"logdata";s:22:"<script>sahw1</script>";}');
+});
+
+test("decodePhpSerialized: detects a base64 LogWrite gadget", () => {
+  const b64 = Buffer.from('O:8:"LogWrite":2:{s:7:"logfile";s:1:"x";s:7:"logdata";s:2:"L1";}').toString("base64");
+  assert.ok(decodePhpSerialized(b64)?.startsWith('O:8:"LogWrite"'));
+  assert.equal(decodePhpSerialized("just a plain string"), null);
+});
