@@ -33,3 +33,10 @@ results/
 # Engagement reports & benchmarking data — stay local, never tracked (live findings/PII)
 docs/htb/
 human-test/
+
+# Scorer, benchmark ground-truth, and design/prompt docs — local only, not needed to OPERATE the framework
+bench/
+docs/bench/
+docs/PROMPTS.md
+docs/LOOP.md
+docs/research/
