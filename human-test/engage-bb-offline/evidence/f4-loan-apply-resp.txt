@@ -1,2 +1,0 @@
-HTTP 200 POST /api/loan/apply
-{"status":"Success","status_code":"LOAN05","message":"Loan Successfully Applied","timestamp":1789883451,"data":{}}

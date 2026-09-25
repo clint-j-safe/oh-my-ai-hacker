@@ -1,6 +1,0 @@
-HTTP 200  POST /api/login
-  Server: Apache/2.4.33 (Unix)
-  X-Powered-By: PHP/7.2.7
-  Access-Control-Allow-Origin: *
-  Access-Control-Allow-Credentials: true
-{"status":"Success","status_code":"LGN002","message":"Login Success","timestamp":1789881682,"data":{"token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhY2N0Tm8iOiI5MTE3Nzc4ODcwNDEiLCJhY2N0QmFsYW5jZSI6Ijk1NjkyMi4yOSIsImluY29tZVRheE51bWJlciI6Ijc2NzQ0NzU2ODEiLCJhY2N0T3BlbmluZ0RhdGUiOiIyMDI2LTA5LTIwIDAwOjAwOjAwIiwiY3VycmVuY3kiOiJJTlIiLCJmbmFtZSI6IkJldGEiLCJsbmFtZSI6IkJldGEiLCJhZGRyZXNzIjoiMiBCYiBTdHJlZXQiLCJkb2IiOiIxOTkxLTAyLTAyIiwibW9iaWxlTm8iOiI5MTExMTExMTIyIiwiZW1haWwiOiJiYmJldGEyNjA5MjAwNTE1QGJidGVzdC5pbyIsImFhZGhhcklkIjoiOTQ4NjgwMjI1MzAxIiwicGFuQ2FyZElkIjoiMDMwMTE5OTk2OCIsIndhbGxldElkIjoiNzUwNzA1NDMwNCIsImdlbmRlciI6IjEiLCJjb3VudHJ5SWQiOiJJTkQiLCJleHAiOjE3OTA0ODY0ODJ9.k0gGl1Ocin5kJm5_1bhSADAbPFba0tchTsn9j69TZoc","acctNo":"911777887041","acctBalance":"956922.29","incomeTaxNumber":"7674475681","acctOpeningDate":"2026-09-20 00:00:00","currency":"INR","fname":"Beta","lname":"Beta","address":"2 Bb Street","dob":"1991-02-02","mobileNo":"9111111122","email":"bbbeta2609200515@bbtest.io","aadharId":"948680225301","panCardId":"0301199968","walletId":"7507054304","gender":"1","countryId":"IND","userid":"BNK00623"}}

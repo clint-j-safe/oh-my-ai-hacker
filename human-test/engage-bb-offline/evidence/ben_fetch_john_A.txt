@@ -1,2 +1,0 @@
-HTTP 200 /api/beneficiary/fetch
-{"status":"Success","status_code":"BNF012","message":"Bank Details of Beneficiary","timestamp":1789884014,"data":{"alias":"John","accountNumber":"175040403372","ifscCode":"IFSC00009","creationDateTime":"2026-09-20 05:18:52"}}

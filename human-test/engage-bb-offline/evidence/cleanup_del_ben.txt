@@ -1,2 +1,0 @@
-HTTP 200 /api/beneficiary/delete
-{"status":"Success","status_code":"BNF014","message":"Beneficiary Deleted Successfully","timestamp":1789884005,"data":{}}

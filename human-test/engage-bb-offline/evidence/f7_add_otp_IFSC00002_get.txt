@@ -1,2 +1,0 @@
-HTTP 200 /api/otp/get
-{"status":"Success","status_code":"OTP001","message":"OTP Generated Successfully","timestamp":1789883551,"data":{"response":"DSx3L83jYAyYDbopyc1\/9w=="}}

@@ -1,2 +1,0 @@
-HTTP 200 /api/account/statement
-{"status":"Success","status_code":"SMT001","message":"Account statement fetched Successfully","timestamp":1789884006,"data":{"statement":[{"tDate":"2026-09-20","fromToAcc":"911777887041","remarks":"bb negative amount test","amount":"-1","referenceNo":"6825005384","type":"DEBIT"},{"tDate":"2026-09-20","fromToAcc":"911777887041","remarks":"restore balance after test","amount":"1","referenceNo":"4797157263","type":"DEBIT"}]}}

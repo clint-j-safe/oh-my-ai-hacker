@@ -1,2 +1,0 @@
-HTTP 200 /api/editUser/editUserDetails
-{"status":"Failed","status_code":"EDIT12","message":"Profile Picture link is invalid","timestamp":1789882128,"data":{}}

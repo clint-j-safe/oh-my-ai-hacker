@@ -1,2 +1,0 @@
-HTTP 200 /api/password/reset
-{"status":"Success","status_code":"PSW004","message":"Password Reset Successful","timestamp":1789883638,"data":{}}
