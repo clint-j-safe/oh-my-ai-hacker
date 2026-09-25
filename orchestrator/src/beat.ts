@@ -21,7 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
-import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, type FieldMap } from "./stateful.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, decodePhpSerialized, swapLastPhpSerializedString, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -268,7 +268,10 @@ async function runDeepSweep(opts: {
     // authenticated; it takes precedence over any session.
     const fire = async (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string): Promise<HttpCapture | null> => {
       const h = { ...headers }; delete h.Authorization; delete h.authorization;
-      const args: Record<string, unknown> = { method, url, headers: h, body };
+      // The http_request schema types `body` as a string, so a null body (e.g. a GET) must
+      // be OMITTED, not sent as null — sending null fails arg validation and the whole
+      // request silently returns not-ok.
+      const args: Record<string, unknown> = body === null ? { method, url, headers: h } : { method, url, headers: h, body };
       if (authToken) { h.Authorization = authToken; }
       else { const useLabel = sess === undefined ? sessionLabel : sess; if (useLabel) args.session = useLabel; }
       const r = await opts.runner.execute("http_request", args);
@@ -351,9 +354,21 @@ async function runDeepSweep(opts: {
       for (const leaf of jsonLeaves) {
         if (banked) break;
         const canary = `sahwSTOR${randomUUID().slice(0, 6)}`;
+        const xss = `<script>${canary}</script>`;
         let persistBody: string;
-        try { persistBody = JSON.stringify(setAtPath(JSON.parse(createT.bodyTemplate), leaf, `<script>${canary}</script>`)); }
-        catch { continue; }
+        try {
+          const tmplObj = JSON.parse(createT.bodyTemplate);
+          // If this field's CAPTURED value is a base64 PHP-serialized gadget (the app
+          // unserializes it and stores one string property — e.g. a loan `type` carrying a
+          // LogWrite whose `logdata` is persisted+rendered), inject the canary INTO that
+          // gadget's payload string rather than replacing the field with a bare tag; a bare
+          // tag unserializes to nothing and never persists. Reuses the app's own structure.
+          const orig = readAtPath(tmplObj, leaf);
+          const deser = orig ? decodePhpSerialized(orig) : null;
+          const swapped = deser ? swapLastPhpSerializedString(deser, xss) : null;
+          const injectValue = swapped ? Buffer.from(swapped, "utf8").toString("base64") : xss;
+          persistBody = JSON.stringify(setAtPath(tmplObj, leaf, injectValue));
+        } catch { continue; }
         for (const shape of renderShapes) {
           const baseline = await fire(shape.method, renderEp, shape.hdr, shape.body);
           if (!baseline) continue;
