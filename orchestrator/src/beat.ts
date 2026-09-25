@@ -7,7 +7,7 @@ import { ArtifactStore } from "./artifacts.js";
 import { ToolRunner, TOOL_SCHEMAS, buildSkillRunTool, type HttpCapture, type SkillRunOutcome } from "./tools.js";
 import { SessionStore } from "./session.js";
 import { runAgent, type MinimalClient } from "./agent.js";
-import { evaluate, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
+import { evaluate, guardConfirmedVerdict, type Invariant, type InvariantType, type EvidenceBundle } from "./axiom.js";
 import { judgeClaim } from "./judge.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
@@ -3031,14 +3031,22 @@ export async function runBeat(opts: {
               : gated.status !== axiom.status
                 ? `${axiom.reason} — provenance-gated to ${gated.status} (missing: ${gated.missing.join(", ") || "n/a"})`
                 : (axiom.reason || ""));
+
+          // DETERMINISTIC class guard — authoritative, runs AFTER adjudication so it also
+          // overrides a promotion. Can only demote CONFIRMED/CONFIRMED_BY_ADJUDICATION ->
+          // NEEDS_REVIEW.
+          const guarded = guardConfirmedVerdict(claim.vuln_class, adjudicatedStatus, exploit);
+          const finalStatus = guarded.status;
+          const finalReason = guarded.status !== adjudicatedStatus ? boundReason(guarded.reason ?? "class guard demotion") : verdictReason;
+
           const row: FindingRow = {
             engagement_id: engagement.authRef,
             finding_id: `SAHW-${randomUUID().slice(0, 8)}`,
             vuln_class: claim.vuln_class,
             endpoint: claim.endpoint,
-            verdict: adjudicatedStatus,
+            verdict: finalStatus,
             invariant_type: effectiveInvariantType,
-            verdict_reason: verdictReason,
+            verdict_reason: finalReason,
             langfuse_trace_id: langfuseTraceId,
             utc: new Date().toISOString(),
           };

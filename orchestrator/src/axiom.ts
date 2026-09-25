@@ -751,3 +751,42 @@ function evaluateFileCreatedThenDeleted(expression: string, evidence: EvidenceBu
     reason: `unexpected presence pattern (before=${p0}, during=${p1}, after=${p2}) — not a create-then-delete cycle: ${marker}`,
   };
 }
+
+// Public-by-design frontend static assets — serving these is not a vulnerability.
+// Deliberately does NOT include sensitive files (.env/.sql/.bak/.git/...), which must
+// still be able to CONFIRM as forced_browsing/info_disclosure.
+const STATIC_ASSET_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot)(?:\?|$)/i;
+
+/**
+ * DETERMINISTIC, class-aware guard applied to a FINAL verdict (authoritative; runs after
+ * adjudication). It can only DEMOTE a CONFIRMED/CONFIRMED_BY_ADJUDICATION to NEEDS_REVIEW
+ * when the class's evidence is semantically insufficient — it NEVER sets FALSE_POSITIVE and
+ * never upgrades. Encodes what a status/endpoint must MEAN for the class, closing the gap
+ * where a mechanically-true differential (e.g. status_in 502-vs-403) confirmed a class it
+ * does not actually demonstrate.
+ */
+export function guardConfirmedVerdict(
+  vulnClass: string,
+  status: string,
+  exploit: HttpCapture | null,
+): { status: string; reason?: string } {
+  if (status !== "CONFIRMED" && status !== "CONFIRMED_BY_ADJUDICATION") return { status };
+  const s = exploit?.response?.status ?? 0;
+
+  // rate_limit_absence: proven only if a burst KEPT SUCCEEDING (2xx). A 4xx/5xx burst is
+  // not evidence that rate limiting is absent (a 502 is a server error, a 403 is a block).
+  if (vulnClass === "rate_limit_absence" && !(s >= 200 && s < 300)) {
+    return { status: "NEEDS_REVIEW", reason: `rate_limit_absence requires a 2xx success burst; observed status ${s} is not success — not evidence of absent rate limiting` };
+  }
+
+  // forced_browsing / info_disclosure: a public-by-design static asset (JS/CSS/map/image/
+  // font) being served is not a finding. Sensitive non-asset files are NOT excluded.
+  if (vulnClass === "forced_browsing" || vulnClass === "info_disclosure") {
+    let path = "";
+    try { path = new URL(exploit?.request?.url ?? "").pathname; } catch { path = exploit?.request?.url ?? ""; }
+    if (STATIC_ASSET_RE.test(path)) {
+      return { status: "NEEDS_REVIEW", reason: `${vulnClass}: ${path} is a public-by-design static asset; needs human review before CONFIRMED` };
+    }
+  }
+  return { status };
+}
