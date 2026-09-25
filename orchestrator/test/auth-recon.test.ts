@@ -39,3 +39,9 @@ test("classifyLoginResponse: 403 => blocked; 401 no material => invalid", () => 
   assert.equal(classifyLoginResponse({ status: 403, headers: {}, body: "forbidden" }).outcome, "blocked");
   assert.equal(classifyLoginResponse({ status: 401, headers: {}, body: '{"error":"bad creds"}' }).outcome, "invalid");
 });
+
+test("detectTwoFactor does not false-positive on ordinary words containing 'otp' etc.", () => {
+  for (const w of ["footpath", "hotpot", "rootPath", "hotpatch"]) {
+    assert.equal(detectTwoFactor(200, JSON.stringify({ note: w })).present, false);
+  }
+});
