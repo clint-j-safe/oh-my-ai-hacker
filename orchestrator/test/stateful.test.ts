@@ -161,3 +161,36 @@ test("F-13 deriver: FALSE_POSITIVE when exploit and control responses are identi
   );
   assert.equal(v.status, "FALSE_POSITIVE", v.reason);
 });
+
+import { parseAesCbcParams } from "../src/stateful.js";
+
+test("parseAesCbcParams: recovers key+iv from a createDecipheriv call site", () => {
+  const js = 'function(e,a,t,n){var r=xe.a.createDecipheriv(a,t,n);return r}(e.data,"AES-256-CBC","9bbc0d79e686e847bc305c9bd4cc2ea6","0123456789abcdef")';
+  const p = parseAesCbcParams(js);
+  assert.equal(p?.key, "9bbc0d79e686e847bc305c9bd4cc2ea6");
+  assert.equal(p?.iv, "0123456789abcdef");
+  assert.equal(parseAesCbcParams("no crypto here"), null);
+});
+
+test("F-25 proof shape: field balance b0->b1 CONFIRMS with restoration proof", () => {
+  const before = cap(200, '{"status":"Success","data":{"accountBalance":"711550.18"}}');
+  const pay = cap(200, '{"status":"Success","status_code":"BNF015","data":{"updated_balance":716550.18}}');
+  const after = cap(200, '{"status":"Success","data":{"accountBalance":"716550.18"}}');
+  const restoreProof = cap(200, '{"status":"Success","status_code":"BNF015"}');
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "field:data.accountBalance;from:711550.18;to:716550.18" },
+    after, null, { captures: [before, pay, after], restoration: { required: true, performed: true, proof: restoreProof } },
+  );
+  assert.equal(v.status, "CONFIRMED", v.reason);
+});
+
+test("F-25 proof shape: required restoration WITHOUT proof downgrades to NEEDS_REVIEW", () => {
+  const before = cap(200, '{"data":{"accountBalance":"100.00"}}');
+  const pay = cap(200, '{"status_code":"BNF015"}');
+  const after = cap(200, '{"data":{"accountBalance":"200.00"}}');
+  const v = evaluate(
+    { statement: "s", type: "state_changed", expression: "field:data.accountBalance;from:100.00;to:200.00" },
+    after, null, { captures: [before, pay, after], restoration: { required: true, performed: false } },
+  );
+  assert.equal(v.status, "NEEDS_REVIEW", v.reason);
+});
