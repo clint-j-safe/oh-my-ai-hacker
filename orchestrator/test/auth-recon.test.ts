@@ -45,3 +45,9 @@ test("detectTwoFactor does not false-positive on ordinary words containing 'otp'
     assert.equal(detectTwoFactor(200, JSON.stringify({ note: w })).present, false);
   }
 });
+
+test("detectTwoFactor detects camelCase 2FA keys", () => {
+  for (const k of ["otpRequired", "mfaEnabled", "twoFactorRequired", "totpEnabled", "2faRequired", "challengeRequired"]) {
+    assert.equal(detectTwoFactor(200, JSON.stringify({ [k]: true })).present, true);
+  }
+});

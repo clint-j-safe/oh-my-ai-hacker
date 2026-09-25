@@ -14,8 +14,8 @@ const TOKEN_KEYS = [
   "access_token", "accessToken", "token", "id_token", "idToken",
   "jwt", "authToken", "auth_token", "bearerToken", "session_token",
 ];
-const TWO_FACTOR = /(?<![a-zA-Z])(otp|totp|two[\s-]?factor|2fa|mfa|authenticator|verification\s*code|one[\s-]?time|challenge)(?![a-zA-Z])/i;
-const SMS = /(?<![a-zA-Z])(sms|text\s*message|phone\s*code)(?![a-zA-Z])/i;
+const TWO_FACTOR = /(?<![a-zA-Z])([Oo][Tt][Pp]|[Tt][Oo][Tt][Pp]|[Tt]wo[\s-]?[Ff]actor|2fa|[Mm][Ff][Aa]|[Aa]uthenticator|[Vv]erification\s*[Cc]ode|one[\s-]?[Tt]ime|[Cc]hallenge)(?![a-z])/;
+const SMS = /(?<![a-zA-Z])([Ss][Mm][Ss]|[Tt]ext\s*[Mm]essage|[Pp]hone\s*[Cc]ode)(?![a-z])/;
 
 export function candidateLoginRequests(
   loginUrl: string,
