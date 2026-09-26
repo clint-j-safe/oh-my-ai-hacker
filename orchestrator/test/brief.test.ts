@@ -28,6 +28,13 @@ test("the brief is well-formed: opens and closes with the root tag, one concern 
   }
 });
 
+test("the brief directs the hunter to authenticate its exploration (attach session), unauth only as a control/bypass", () => {
+  const xml = buildHunterBrief(EMPTY_STATE);
+  assert.match(xml, /AUTHENTICATE YOUR EXPLORATION/);
+  assert.match(xml, /attach it as `session` on EVERY http_request/);
+  assert.match(xml, /control MUST stay unauth or the differential is/i);
+});
+
 test("beat 1 (empty spine): state-derived sections are EMPTY but carry an explicit populate instruction, not omitted", () => {
   const xml = buildHunterBrief(EMPTY_STATE);
 
