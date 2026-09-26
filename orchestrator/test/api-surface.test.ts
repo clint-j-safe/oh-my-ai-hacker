@@ -137,6 +137,31 @@ test("discoverApiSurface: mines routes from the bundle, probes candidates, keeps
   for (const u of inScopeCalls) assert.ok(u.startsWith(origin), `fetched out-of-scope url: ${u}`);
 });
 
+test("discoverApiSurface: ingests a published OpenAPI spec and adds documented endpoints directly (bypassing the unauth probe-gate)", async () => {
+  const origin = "https://demo.safeone.io";
+  const rootHtml = `<!doctype html><html><head><script type="module" crossorigin src="/assets/index.js"></script></head><body></body></html>`;
+  const bundleJs = "const cfg={baseURL:`/api/v3`};";
+  const spec = JSON.stringify({
+    openapi: "3.0.0",
+    paths: {
+      "/api/v3/assets": { get: {}, post: {} },
+      "/api/v3/assets/{id}": { get: {}, delete: {} },
+      "/api/v3/groups/{id}/trend": { get: {} },
+    },
+  });
+  const fetchImpl = fetchMap({
+    "GET https://demo.safeone.io/": { status: 200, headers: { "content-type": "text/html" }, body: rootHtml },
+    "GET https://demo.safeone.io/assets/index.js": { status: 200, headers: { "content-type": "application/javascript" }, body: bundleJs },
+    "GET https://demo.safeone.io/api/v3/api-docs": { status: 200, headers: { "content-type": "application/json" }, body: spec },
+  });
+  const live = await discoverApiSurface({ scopeOrigin: origin, fetchImpl, inScope: (u) => u.startsWith(origin) });
+  const set = new Set(live.map((e) => `${e.method} ${e.url}`));
+  assert.ok(set.has("GET https://demo.safeone.io/api/v3/assets"), "spec GET collection added");
+  assert.ok(set.has("POST https://demo.safeone.io/api/v3/assets"), "spec POST added");
+  assert.ok(set.has("DELETE https://demo.safeone.io/api/v3/assets/1"), "spec {id} DELETE added, param filled");
+  assert.ok(set.has("GET https://demo.safeone.io/api/v3/groups/1/trend"), "nested {id} path added");
+});
+
 test("discoverApiSurface: never fetches or returns an out-of-scope candidate", async () => {
   const origin = "https://demo.safeone.io";
   const rootHtml = `<!doctype html><html><head><script type="module" crossorigin src="/assets/index-EIlpuBYm.js"></script></head><body></body></html>`;

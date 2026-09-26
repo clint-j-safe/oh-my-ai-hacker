@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse, detectCognito, detectTokenHeaders } from "../src/auth-recon.js";
+import { candidateLoginRequests, extractAuthMaterial, detectTwoFactor, classifyLoginResponse, detectCognito, detectTokenHeaders, detectOpenApiPaths } from "../src/auth-recon.js";
 
 test("candidateLoginRequests emits json-first email/username variants, cheap-first", () => {
   const a = candidateLoginRequests("https://t/login", { email: "e@x.io", password: "p" });
@@ -117,6 +117,40 @@ test("detectTokenHeaders omits keys that are absent or not header-name-shaped (n
   assert.deepEqual(detectTokenHeaders("idTokenHeader:`not a header name`"), {});
   // partial mapping: only what's present and valid
   assert.deepEqual(detectTokenHeaders("idTokenHeader:'x-id'"), { idTokenHeader: "x-id" });
+});
+
+test("detectOpenApiPaths parses a raw OpenAPI spec, incl. {param} paths and multiple methods", () => {
+  const spec = JSON.stringify({
+    openapi: "3.0.0", info: { title: "X" },
+    paths: {
+      "/api/v3/assets": { get: {}, post: {} },
+      "/api/v3/assets/{id}": { get: {}, delete: {}, put: {} },
+      "/api/v3/groups/{id}/trend": { get: {} },
+    },
+  });
+  const eps = detectOpenApiPaths(spec);
+  const set = new Set(eps.map((e) => `${e.method} ${e.path}`));
+  assert.ok(set.has("GET /api/v3/assets") && set.has("POST /api/v3/assets"));
+  assert.ok(set.has("GET /api/v3/assets/{id}") && set.has("DELETE /api/v3/assets/{id}") && set.has("PUT /api/v3/assets/{id}"));
+  assert.ok(set.has("GET /api/v3/groups/{id}/trend"));
+  assert.equal(eps.length, 6);
+});
+
+test("detectOpenApiPaths extracts the spec embedded in a swagger-ui-init.js wrapper (braces inside {id} keys handled)", () => {
+  const js = 'window.onload=function(){var options={"swaggerDoc":{"openapi":"3.0.0","paths":' +
+    '{"/a/{id}":{"get":{"summary":"has } brace in desc","description":"x{y}z"}},"/b":{"post":{}}}},' +
+    '"customOptions":{}};};';
+  const eps = detectOpenApiPaths(js);
+  const set = new Set(eps.map((e) => `${e.method} ${e.path}`));
+  assert.ok(set.has("GET /a/{id}"), "path with {id} key must parse");
+  assert.ok(set.has("POST /b"));
+  assert.equal(eps.length, 2);
+});
+
+test("detectOpenApiPaths returns [] when there is no OpenAPI paths object", () => {
+  assert.deepEqual(detectOpenApiPaths("const x = 1;"), []);
+  assert.deepEqual(detectOpenApiPaths('{"paths": "not an object"}'), []);
+  assert.deepEqual(detectOpenApiPaths('{"paths": {"noleadingslash": {"get":{}}}}'), []);
 });
 
 test("detectCognito returns null when the bundle has no Cognito config", () => {

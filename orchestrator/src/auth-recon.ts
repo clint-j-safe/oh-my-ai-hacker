@@ -158,6 +158,63 @@ export function detectTokenHeaders(bundleText: string): DiscoveredTokenHeaders {
   return out;
 }
 
+/** One documented API operation from an OpenAPI/Swagger spec. */
+export interface OpenApiEndpoint { path: string; method: string; }
+const OPENAPI_METHODS = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
+
+// String-aware matching-brace finder: returns the index of the '}' that closes the '{' at
+// openIdx, counting braces ONLY outside string literals. Essential because OpenAPI path keys
+// like "/assets/{id}" and free-text descriptions contain braces inside strings that a naive
+// depth counter would miscount. Returns -1 if unbalanced.
+function matchBraceAware(s: string, openIdx: number): number {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = openIdx; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** Extract documented endpoints from an OpenAPI/Swagger spec — whether raw spec JSON or a
+ * spec embedded in a swagger-ui-init.js wrapper (`"swaggerDoc": { ... }`). Finds the `paths`
+ * object (string-aware brace match, so `{id}` path keys parse), and returns one entry per
+ * (path, HTTP method). Pure; returns [] when no usable paths object is present. */
+export function detectOpenApiPaths(text: string): OpenApiEndpoint[] {
+  const re = /"paths"\s*:\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const open = text.indexOf("{", m.index + '"paths"'.length);
+    if (open < 0) continue;
+    const close = matchBraceAware(text, open);
+    if (close < 0) continue;
+    let obj: unknown;
+    try { obj = JSON.parse(text.slice(open, close + 1)); } catch { continue; }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
+    const rec = obj as Record<string, unknown>;
+    const keys = Object.keys(rec);
+    if (!keys.some((k) => k.startsWith("/"))) continue; // paths keys are URL paths
+    const out: OpenApiEndpoint[] = [];
+    for (const p of keys) {
+      if (!p.startsWith("/")) continue;
+      const ops = rec[p];
+      if (!ops || typeof ops !== "object") continue;
+      for (const meth of Object.keys(ops as Record<string, unknown>)) {
+        if (OPENAPI_METHODS.has(meth.toLowerCase())) out.push({ path: p, method: meth.toUpperCase() });
+      }
+    }
+    if (out.length) return out;
+  }
+  return [];
+}
+
 export function detectCognito(bundleText: string): CognitoConfig | null {
   const poolId = bundleText.match(/userPoolId\s*:\s*[`'"]([^`'"]+)[`'"]/);
   const clientId = bundleText.match(/userPoolWebClientId\s*:\s*[`'"]([^`'"]+)[`'"]/);
