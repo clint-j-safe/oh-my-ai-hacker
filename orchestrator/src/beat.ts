@@ -405,6 +405,15 @@ export async function authenticatedBaselinePass(opts: {
   return fired;
 }
 
+// Verbs the BLIND payload field-fuzzers may fire. Un-restorable state-changers
+// (PUT/PATCH/DELETE) are excluded — fuzzing them hundreds of times mutates a live target
+// with no restore. POST is allowed (long-standing, high-value injection surface). Mutating
+// writes go ONLY through the restore-controlled mutation sweep, never the blind fuzzers.
+const FIELD_FUZZ_EXCLUDED_VERBS = new Set(["PUT", "PATCH", "DELETE"]);
+export function isFieldFuzzableVerb(method: string | undefined): boolean {
+  return !FIELD_FUZZ_EXCLUDED_VERBS.has((method || "GET").toUpperCase());
+}
+
 async function runDeepSweep(opts: {
   runner: ToolRunner; workspace: string; scopeOrigins: string[];
   canon: (u: string) => string; budget: number; obs: SweepObs; engagementId: string;
@@ -419,6 +428,15 @@ async function runDeepSweep(opts: {
     const sessionLabel = opts.runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
     const targets = deriveTargets(records, inScope, opts.canon) as SweepTargetWithBody[];
     if (targets.length === 0) return empty;
+
+    // SAFETY: the blind payload fuzzers below (runSweep, the empty-data/debug probe, XXE)
+    // must NEVER fuzz un-restorable state-changing verbs — a captured PUT/PATCH/DELETE fuzzed
+    // hundreds of times is un-restored data mutation on a live target (observed: 454 PUTs to
+    // one endpoint after mutation testing seeded a PUT capture). POST is KEPT (long-standing,
+    // high-value injection surface — sqli/xss/xxe in login/search/create bodies). Mutating
+    // writes are exercised ONLY via the restore-controlled mutation sweep (sweepMutations),
+    // never here. The specialized restore-aware flow probes below keep the full target list.
+    const fuzzTargets = targets.filter((t) => isFieldFuzzableVerb(t.method));
 
     // Stash the full HttpCapture for every probe so a strong hit can be re-verified by the
     // Axiom (marker in exploit, absent in baseline) without re-firing.
@@ -617,7 +635,7 @@ async function runDeepSweep(opts: {
     const loginProved = await sweepLoginBypass(opts, targets, fire);
     proved.push(...loginProved);
 
-    const fieldHits = await runSweep({ targets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
+    const fieldHits = await runSweep({ targets: fuzzTargets, payloadsFor: (c) => SWEEP_PAYLOADS[c] ?? [], send, budget: opts.budget });
 
     // BANK strong field hits directly through the Axiom (deterministic, not via the LLM).
     for (const hit of fieldHits) {
@@ -632,7 +650,7 @@ async function runDeepSweep(opts: {
     }
 
     // XXE whole-body probe (field-injection can't express an external entity).
-    const xxeHits = await sweepXxe(targets, opts.runner);
+    const xxeHits = await sweepXxe(fuzzTargets, opts.runner);
     for (const xh of xxeHits) {
       if (!xh.exploit || !xh.control) continue;
       const banked = await bankIfConfirmed(opts, "xxe", xh.endpoint, xh.observed, xh.exploit, xh.control);
@@ -642,8 +660,10 @@ async function runDeepSweep(opts: {
     // DEBUG-PAGE probe (F-09 shape): a valid envelope with `data` EMPTIED omits required
     // fields -> unhandled framework error leaking internals. Exploit vs the normal body
     // as control; a debug signature in the exploit but not the control is info_disclosure.
-    for (const t of targets.slice(0, 50)) {
-      if (!t.bodyTemplate || (t.method !== "POST" && t.method !== "PUT" && t.method !== "PATCH")) continue;
+    for (const t of fuzzTargets.slice(0, 50)) {
+      // fuzzTargets already excludes PUT/PATCH/DELETE; only POST bodies reach here (safe,
+      // long-standing). The method check stays for the JSON-body precondition.
+      if (!t.bodyTemplate || t.method !== "POST") continue;
       let emptied: string; let normal: string;
       try {
         const obj = JSON.parse(t.bodyTemplate);
