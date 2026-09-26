@@ -13,6 +13,7 @@ import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
 import { attemptsFromRecords } from "./obs/clickhouse.js";
+import { buildMutationPlan, noopRoundTripRestorable, massAssignmentAccepted, restoreVerified } from "./mutation-probe.js";
 import { VULN_CLASSES, isVulnClass, type VulnClass } from "./vuln-classes.js";
 import {
   loadSpine, saveSpine, updateSpine,
@@ -665,6 +666,77 @@ async function runDeepSweep(opts: {
     const leadsHits = [...fieldHits.filter((h) => h.strength === "strong"), ...xxeHits];
     return { leads: renderSweepLeads(leadsHits), proved };
   } catch { return empty; }
+}
+
+/** Mass-assignment mutation sweep — GATED OFF by default (SAHW_MUTATION_TESTING=1). For each
+ * documented PUT endpoint with a concrete instance, it: GET original -> NOOP round-trip
+ * (PUT original, GET, prove restorable) -> only if restorable, PUT original+probe fields ->
+ * GET -> if a probe field was accepted, a mass_assignment finding -> ALWAYS restore (PUT
+ * original) and VERIFY. A probe it cannot prove it restored is recorded NEEDS_REVIEW with a
+ * manual-cleanup log line. PUT full-replace only (no POST-create, no DELETE). All decision
+ * logic is the unit-tested pure core in mutation-probe.ts. Fail-soft; capped. */
+async function sweepMutations(opts: {
+  runner: ToolRunner; surface: Array<{ url?: string; method?: string } | string>;
+  inScope: (u: string) => boolean; sessionLabel: string; canon: (u: string) => string;
+  recordFinding: (r: FindingRow) => Promise<void>; traceId: () => string | null;
+  engagementId: string; cap: number;
+}): Promise<void> {
+  const puts = (Array.isArray(opts.surface) ? opts.surface : [])
+    .map((e) => (typeof e === "string" ? { url: e, method: "GET" } : e))
+    .filter((e): e is { url: string; method: string } => !!e?.url && (e.method || "").toUpperCase() === "PUT" && opts.inScope(e.url));
+  const seen = new Set<string>();
+  let done = 0;
+  const get = async (url: string): Promise<{ status: number; body: string } | null> => {
+    const r = await opts.runner.execute("http_request", { method: "GET", url, session: opts.sessionLabel });
+    if (!r.ok) return null;
+    const cap = r.result as HttpCapture;
+    return { status: cap.response.status, body: cap.response.body ?? "" };
+  };
+  const put = async (url: string, body: string): Promise<number> => {
+    const r = await opts.runner.execute("http_request", { method: "PUT", url, session: opts.sessionLabel, headers: { "content-type": "application/json" }, body });
+    return r.ok ? (r.result as HttpCapture).response.status : 0;
+  };
+  for (const { url } of puts) {
+    if (done >= opts.cap) break;
+    const key = opts.canon(url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const original = await get(url);
+      if (!original || original.status !== 200) continue;
+      const plan = buildMutationPlan(original.body);
+      if (!plan) continue; // not a bare JSON object, or nothing safe to inject
+      // NOOP restorability gate: PUT the verbatim original, read back — only proceed if the
+      // entity is byte-equal to the original. If not, we cannot prove we could undo a probe.
+      await put(url, plan.restoreBody);
+      const afterNoop = await get(url);
+      if (!afterNoop || afterNoop.status !== 200 || !noopRoundTripRestorable(original.body, afterNoop.body)) continue;
+      done++;
+      // PROBE
+      await put(url, plan.probeBody);
+      const afterProbe = await get(url);
+      const accepted = !!afterProbe && afterProbe.status === 200 && massAssignmentAccepted(afterProbe.body, plan.injectedKeys);
+      // RESTORE (always) + verify
+      await put(url, plan.restoreBody);
+      const afterRestore = await get(url);
+      const restored = !!afterRestore && restoreVerified(original.body, afterRestore.body, plan.injectedKeys);
+      if (!accepted) continue;
+      const ep = opts.canon(url);
+      const findingId = `SAHW-${fnv1a(`massassign#${ep}`).toString(16).padStart(8, "0").slice(0, 8)}`;
+      if (!restored) {
+        console.error(`[mutation] WARNING mass-assignment on PUT ${ep} could NOT be auto-restored — manual cleanup may be needed (injected: ${plan.injectedKeys.join(",")})`);
+      }
+      await opts.recordFinding({
+        engagement_id: opts.engagementId, finding_id: findingId, vuln_class: "mass_assignment",
+        endpoint: ep, invariant_type: "state_changed",
+        verdict: restored ? "CONFIRMED" : "NEEDS_REVIEW",
+        verdict_reason: restored
+          ? `mass-assignment: server accepted unexpected privileged field(s) [${plan.injectedKeys.join(",")}] on PUT; change verified and restored`
+          : `mass-assignment: server accepted privileged field(s) [${plan.injectedKeys.join(",")}] on PUT but restoration could NOT be verified — needs human review/cleanup`,
+        langfuse_trace_id: opts.traceId(), utc: new Date().toISOString(),
+      });
+    } catch (e) { console.error(`[mutation] ${url} failed (continuing): ${(e as Error).message}`); }
+  }
 }
 
 /** Empty every object-valued key named "data" (the request envelope's field bag), so a
@@ -2540,6 +2612,24 @@ export async function runBeat(opts: {
           canon: canonicalizeEndpoint, alreadyCaptured: captured, cap: 150,
         });
       } catch { /* fail-soft: coverage pass must never abort the beat */ }
+    }
+  }
+
+  // MUTATION TESTING — write-surface coverage (mass-assignment). GATED OFF by default; only
+  // runs under an explicit SAHW_MUTATION_TESTING=1 because it issues authenticated PUT writes
+  // to a live target (with noop-restorability gate + restore-verify safety rails). Beat-1,
+  // needs a usable session.
+  if (sweepBeatNo <= 1 && (opts.env.SAHW_MUTATION_TESTING?.trim() === "1")) {
+    const mutSession = runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
+    if (mutSession) {
+      await sweepMutations({
+        runner, surface: spineLoad.spine.attack_surface as Array<{ url?: string; method?: string }>,
+        inScope: (u) => inScope(engagement, u).allow, sessionLabel: mutSession, canon: canonicalizeEndpoint,
+        recordFinding: (r) => obs.recordFinding(r), traceId: () => obs.traceId(),
+        engagementId: engagement.authRef, cap: numEnv(opts.env, "SAHW_MUTATION_CAP", 15),
+      });
+    } else {
+      console.error("[mutation] SAHW_MUTATION_TESTING=1 but no usable session; skipping write-surface tests");
     }
   }
 
