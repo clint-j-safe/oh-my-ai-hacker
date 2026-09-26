@@ -757,6 +757,14 @@ function evaluateFileCreatedThenDeleted(expression: string, evidence: EvidenceBu
 // still be able to CONFIRM as forced_browsing/info_disclosure.
 const STATIC_ASSET_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot)(?:\?|$)/i;
 
+// Classes whose CONFIRMED verdict rests on a status/reachability DIFFERENTIAL ("exploit
+// status differs from control"). For these, a 5xx exploit response (server error / gateway
+// timeout) is never a clean proof — the action did not succeed. Injection classes are
+// excluded on purpose: a 5xx can be legitimate error-based evidence there.
+const DIFFERENTIAL_REACHABILITY_CLASSES = new Set([
+  "business_logic", "forced_browsing", "auth_bypass", "idor", "open_redirect", "cors_misconfig",
+]);
+
 // True when a response is an HTML document (a page/SPA shell), by content-type or a body
 // sniff of the leading bytes. Used by guardConfirmedVerdict to keep a marker found in a
 // public-by-design HTML page from confirming an info_/crypto_disclosure. Deliberately
@@ -822,6 +830,16 @@ export function guardConfirmedVerdict(
     if (isHtmlDocumentResponse(exploit)) {
       return { status: "NEEDS_REVIEW", reason: `${vulnClass}: exploit body is a public-by-design HTML document / SPA shell, not a data disclosure; needs human review before CONFIRMED` };
     }
+  }
+
+  // Status-differential "reachability/logic" classes must not confirm on a 5xx exploit
+  // response. A 500/502/503/504 is a server error or gateway TIMEOUT — the request did NOT
+  // succeed, so a "status differs from control" oracle firing on it is not a proven exploit
+  // (observed live: business_logic CONFIRMED on a 504-vs-400 differential from a JWT alg:none
+  // probe — the 504 was a timeout, not a bypass). Injection classes (sqli/cmdi/xss/ssrf) are
+  // deliberately NOT here: a 5xx CAN be genuine error-based evidence for them. Demote-only.
+  if (DIFFERENTIAL_REACHABILITY_CLASSES.has(vulnClass) && s >= 500 && s < 600) {
+    return { status: "NEEDS_REVIEW", reason: `${vulnClass}: exploit returned ${s} (server error/timeout), which is not a successful action — a 5xx differential is not a proven exploit; needs human review` };
   }
   return { status };
 }

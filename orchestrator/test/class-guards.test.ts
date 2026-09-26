@@ -84,6 +84,29 @@ test("info/crypto_disclosure at 2xx with JSON data (not HTML) is NOT demoted by 
   assert.equal(g.status, "CONFIRMED");
 });
 
+// --- 5xx guard: a status-differential class cannot confirm on a server error / gateway
+// timeout (observed FP: business_logic CONFIRMED on a 504-vs-400 differential).
+test("status-differential classes are demoted when the exploit response is 5xx", () => {
+  for (const s of [500, 502, 503, 504]) {
+    for (const cls of ["business_logic", "forced_browsing", "auth_bypass", "idor", "open_redirect", "cors_misconfig"]) {
+      const g = guardConfirmedVerdict(cls, "CONFIRMED", cap("http://t/api/v3/users?token=x", s));
+      assert.equal(g.status, "NEEDS_REVIEW", `${cls} @ ${s} should demote`);
+      assert.match(g.reason ?? "", /5xx|server error|timeout/);
+    }
+  }
+});
+
+test("a status-differential class with a 2xx exploit is NOT demoted by the 5xx guard", () => {
+  assert.equal(guardConfirmedVerdict("business_logic", "CONFIRMED", cap("http://t/api/v3/x", 200)).status, "CONFIRMED");
+  assert.equal(guardConfirmedVerdict("auth_bypass", "CONFIRMED", cap("http://t/api/v3/x", 302)).status, "CONFIRMED");
+});
+
+test("injection classes are NOT demoted on 5xx (a 5xx can be error-based evidence)", () => {
+  for (const cls of ["sqli", "cmdi"]) {
+    assert.equal(guardConfirmedVerdict(cls, "CONFIRMED", cap("http://t/api/v3/x", 500)).status, "CONFIRMED", `${cls} 5xx must stay CONFIRMED`);
+  }
+});
+
 test("guard is authoritative over CONFIRMED_BY_ADJUDICATION too, and never yields FALSE_POSITIVE", () => {
   const g = guardConfirmedVerdict("rate_limit_absence", "CONFIRMED_BY_ADJUDICATION", cap("http://t/x", 502));
   assert.equal(g.status, "NEEDS_REVIEW");

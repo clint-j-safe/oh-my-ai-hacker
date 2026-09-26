@@ -36,7 +36,7 @@ import { setFormParam, authBypassMarker, LOGIN_BYPASS_PAYLOADS } from "./sweep-f
 import { classifyField } from "./stateful.js";
 import { Resolver } from "node:dns/promises";
 import { connect as netConnect } from "node:net";
-import { appendFile, readFile } from "node:fs/promises";
+import { appendFile } from "node:fs/promises";
 
 // Re-exported for backward compatibility: existing callers (and test/beat.test.ts)
 // import these from beat.js. The vocabulary itself now lives in vuln-classes.ts so
@@ -377,14 +377,14 @@ async function sweepLoginBypass(
  * field/injection oracles. GET-only (no state change), budget-capped, fail-soft per endpoint.
  * Returns the count fired. Reads the surface from the spine so it needs no extra plumbing. */
 export async function authenticatedBaselinePass(opts: {
-  runner: ToolRunner; workspace: string; inScope: (u: string) => boolean; sessionLabel: string;
+  runner: ToolRunner; surface: Array<{ url?: string; method?: string } | string>;
+  inScope: (u: string) => boolean; sessionLabel: string;
   canon: (u: string) => string; alreadyCaptured: Set<string>; cap: number;
 }): Promise<number> {
-  let surface: Array<{ url?: string; method?: string } | string> = [];
-  try {
-    const spine = JSON.parse(await readFile(join(opts.workspace, "spine", "progress.json"), "utf8"));
-    surface = Array.isArray(spine?.attack_surface) ? spine.attack_surface : [];
-  } catch { return 0; }
+  // The surface is passed IN-MEMORY (from the live spine this beat) — NOT read from disk:
+  // discovery's freshly-ingested endpoints are only persisted to progress.json at beat end,
+  // so a disk read here (the sweep runs mid-beat) would miss them entirely.
+  const surface = Array.isArray(opts.surface) ? opts.surface : [];
   let fired = 0;
   const firedKeys = new Set<string>();
   for (const e of surface) {
@@ -409,23 +409,12 @@ async function runDeepSweep(opts: {
 }): Promise<{ leads: string; proved: ProvedEntry[] }> {
   const empty = { leads: "", proved: [] as ProvedEntry[] };
   try {
-    let records = await readArtifactRecords(join(opts.workspace, "artifacts"));
+    // The authenticated baseline pass (deterministic authed coverage of the documented
+    // surface) runs in runBeat BEFORE this — every beat, with the live in-memory surface —
+    // so its captures are already on disk here and feed deriveTargets/the oracles below.
+    const records = await readArtifactRecords(join(opts.workspace, "artifacts"));
     const inScope = (u: string) => { try { return opts.scopeOrigins.includes(new URL(u).origin); } catch { return false; } };
     const sessionLabel = opts.runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
-    // Authenticated baseline pass (deterministic coverage): when a session exists, sweep the
-    // documented/surface endpoints authenticated so they are actually tested and feed the
-    // oracles below — closing the gap where seeded-but-never-requested endpoints were invisible.
-    if (sessionLabel) {
-      const captured = new Set(
-        records.filter((r) => (r as any)?.request?.url)
-          .map((r) => `${(((r as any).request.method as string) || "GET").toUpperCase()} ${opts.canon((r as any).request.url)}`),
-      );
-      const fired = await authenticatedBaselinePass({
-        runner: opts.runner, workspace: opts.workspace, inScope, sessionLabel,
-        canon: opts.canon, alreadyCaptured: captured, cap: 150,
-      });
-      if (fired) records = await readArtifactRecords(join(opts.workspace, "artifacts"));
-    }
     const targets = deriveTargets(records, inScope, opts.canon) as SweepTargetWithBody[];
     if (targets.length === 0) return empty;
 
@@ -2528,6 +2517,31 @@ export async function runBeat(opts: {
   let sweepLeads = "";
   let sweepProved: ProvedEntry[] = [];
   const sweepBeatNo = Math.max(0, Math.trunc(numEnv(opts.env, "SAHW_BEAT_NO", 1)));
+
+  // AUTHENTICATED BASELINE PASS — deterministic authed coverage of the documented surface.
+  // Runs EVERY beat (not just the beat-1 sweep) so a beat that lost its session (e.g. a TOTP
+  // window blocking a fresh code) does not leave the surface permanently untested. Uses the
+  // LIVE in-memory surface (this beat's discovery already populated spineLoad.spine.attack_
+  // surface) — NOT a disk read, which would miss endpoints not yet persisted. Dedupes on
+  // already-captured endpoints, so after the first beat its cost is ~0. Feeds the sweep below.
+  {
+    const baselineSession = runner.getSessionMeta().find((m) => m.has_auth_material)?.label;
+    if (baselineSession) {
+      try {
+        const prior = await readArtifactRecords(join(workspace, "artifacts"));
+        const captured = new Set(
+          prior.filter((r) => (r as any)?.request?.url)
+            .map((r) => `${(((r as any).request.method as string) || "GET").toUpperCase()} ${canonicalizeEndpoint((r as any).request.url)}`),
+        );
+        await authenticatedBaselinePass({
+          runner, surface: spineLoad.spine.attack_surface as Array<{ url?: string; method?: string }>,
+          inScope: (u) => inScope(engagement, u).allow, sessionLabel: baselineSession,
+          canon: canonicalizeEndpoint, alreadyCaptured: captured, cap: 150,
+        });
+      } catch { /* fail-soft: coverage pass must never abort the beat */ }
+    }
+  }
+
   if (engagement.deep.enabled && sweepBeatNo <= 1) {
     const sw = await runDeepSweep({
       runner, workspace, scopeOrigins, canon: canonicalizeEndpoint,
