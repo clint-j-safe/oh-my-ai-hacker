@@ -1,5 +1,5 @@
 import neo4j, { type Driver } from "neo4j-driver";
-import type { FindingRow } from "./clickhouse.js";
+import type { FindingRow, AttemptRow } from "./clickhouse.js";
 
 export class Neo4jWriter {
   constructor(private readonly driver: Driver, private readonly database: string) {}
@@ -37,6 +37,27 @@ export class Neo4jWriter {
        MERGE (e:Endpoint {url: $endpoint})
        MERGE (f)-[:AFFECTS]->(e)`,
       row as unknown as Record<string, unknown>);
+  }
+
+  /** Embed coverage parsed from the artifacts onto the graph — the coverage SOURCE OF TRUTH.
+   * Each (method, endpoint) probe upserts its Endpoint node and marks it tested, records the
+   * last observed status, and sets `authenticated = true` once ANY authenticated probe hit it
+   * (a sticky OR — an endpoint proven reachable authenticated stays so even if a later unauth
+   * probe is also recorded). "Which documented endpoints were never tested / never tested
+   * authenticated?" then becomes a Cypher query over Endpoint nodes. Batched via UNWIND;
+   * a no-op on an empty batch. */
+  async mergeCoverage(rows: AttemptRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    await this.write(
+      `UNWIND $rows AS r
+       MERGE (e:Endpoint {url: r.endpoint, method: r.method})
+         ON CREATE SET e.first_seen = datetime()
+       SET e.tested = true,
+           e.last_status = r.status,
+           e.last_tested = datetime(),
+           e.coverage_source = r.source,
+           e.authenticated = coalesce(e.authenticated, false) OR (r.authenticated = 1)`,
+      { rows: rows as unknown as Record<string, unknown>[] });
   }
 
   async close(): Promise<void> { await this.driver.close(); }

@@ -12,6 +12,7 @@ import { judgeClaim, verifyGenuineFinding } from "./judge.js";
 import { gateProvenance } from "./provenance.js";
 import { isStalled, loadStallConfig } from "./stall.js";
 import { initObservability, type FindingRow } from "./obs/index.js";
+import { attemptsFromRecords } from "./obs/clickhouse.js";
 import { VULN_CLASSES, isVulnClass, type VulnClass } from "./vuln-classes.js";
 import {
   loadSpine, saveSpine, updateSpine,
@@ -3285,6 +3286,22 @@ export async function runBeat(opts: {
     });
   } finally {
     clearTimeout(timer);
+    // COVERAGE SOURCE OF TRUTH: parse this beat's artifacts and embed per-endpoint coverage
+    // (tested / authenticated / last_status) into the Neo4j graph, so "which documented
+    // endpoints were never tested — or never tested authenticated?" is a Cypher query, not an
+    // artifact reconstruction. Runs in the finally so it captures coverage even if the beat
+    // body threw. Fail-soft: never blocks shutdown.
+    try {
+      const covRecords = await readArtifactRecords(join(workspace, "artifacts"));
+      const covRows = attemptsFromRecords(covRecords as unknown as Parameters<typeof attemptsFromRecords>[0], {
+        engagementId: engagement.authRef,
+        runId: opts.env.SAHW_RUN_ID?.trim() || engagement.authRef,
+        source: "artifact",
+        canon: canonicalizeEndpoint,
+        utc: new Date().toISOString(),
+      });
+      await obs.recordCoverage(covRows);
+    } catch (e) { console.error("[coverage] graph embed failed (continuing):", (e as Error).message); }
     // Runs AFTER the "beat" span (and every child span opened inside it) has
     // already ended, so shutdown flushes a complete trace rather than racing it.
     await obs.shutdown();

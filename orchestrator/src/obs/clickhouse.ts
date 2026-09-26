@@ -16,6 +16,21 @@ export interface FindingRow {
   utc: string;
 }
 
+/** One probe the engine actually made — coverage telemetry parsed from the artifacts and
+ * embedded into the Neo4j graph (the coverage source of truth), so "was this endpoint
+ * tested, and authenticated?" is a graph query rather than an artifact reconstruction.
+ * One row per distinct (method, endpoint, authenticated). */
+export interface AttemptRow {
+  engagement_id: string;
+  run_id: string;
+  method: string;
+  endpoint: string;      // canonicalized (path params normalized) so coverage dedupes cleanly
+  authenticated: number; // 0 | 1 — whether the probe carried a session/auth material
+  status: number;        // observed HTTP status (0 if the request never completed)
+  source: string;        // "baseline" | "sweep" | "hunter" | "discovery" | ...
+  utc: string;
+}
+
 export class ClickHouseWriter {
   constructor(private readonly client: ClickHouseClient) {}
 
@@ -53,4 +68,30 @@ export class ClickHouseWriter {
   }
 
   async close(): Promise<void> { await this.client.close(); }
+}
+
+/** Build deduped attempt rows from captured request/response records. One row per distinct
+ * (method, canonical endpoint, authenticated) — the authenticated flag is set when the
+ * recorded request carried a session/auth header (the http() injector redacts these as
+ * "<redacted:session-…>", which is exactly the marker we detect). Pure + unit-testable. */
+export function attemptsFromRecords(
+  records: Array<{ request?: { method?: string; url?: string; headers?: Record<string, string> }; response?: { status?: number } }>,
+  opts: { engagementId: string; runId: string; source: string; canon: (u: string) => string; utc: string },
+): AttemptRow[] {
+  const byKey = new Map<string, AttemptRow>();
+  for (const rec of records) {
+    const url = rec.request?.url;
+    if (!url) continue;
+    const method = (rec.request?.method || "GET").toUpperCase();
+    const endpoint = opts.canon(url);
+    const authenticated = Object.values(rec.request?.headers ?? {}).some((v) => String(v).includes("redacted:session")) ? 1 : 0;
+    const status = typeof rec.response?.status === "number" ? rec.response.status : 0;
+    const key = `${method} ${endpoint} ${authenticated}`;
+    // Prefer the row with a real (non-zero) status if we see the same probe twice.
+    const existing = byKey.get(key);
+    if (!existing || (existing.status === 0 && status !== 0)) {
+      byKey.set(key, { engagement_id: opts.engagementId, run_id: opts.runId, method, endpoint, authenticated, status, source: opts.source, utc: opts.utc });
+    }
+  }
+  return [...byKey.values()];
 }

@@ -1,10 +1,10 @@
-import { ClickHouseWriter, type FindingRow } from "./clickhouse.js";
+import { ClickHouseWriter, type FindingRow, type AttemptRow } from "./clickhouse.js";
 import { Neo4jWriter } from "./neo4j.js";
 import { LangfuseTracing } from "./langfuse.js";
 
 export type { ClickHouseWriter, Neo4jWriter };
 
-export type { FindingRow };
+export type { FindingRow, AttemptRow };
 
 export interface Observability {
   /** Exposed so a caller (and a test) can substitute a writer without casting. */
@@ -14,6 +14,9 @@ export interface Observability {
   recordFinding(r: FindingRow): Promise<void>;
   mergeEndpoint(url: string, method: string): Promise<void>;
   mergeFinding(r: FindingRow): Promise<void>;
+  /** Embed coverage (parsed from artifacts) into the Neo4j graph — the coverage source of
+   * truth. Fail-soft like the rest; a graph outage never takes the run down. */
+  recordCoverage(rows: AttemptRow[]): Promise<void>;
   shutdown(): Promise<void>;
 }
 
@@ -46,6 +49,9 @@ export async function initObservability(
     },
     mergeFinding: async (r) => {
       if (obs.graph) await safe("neo4j.mergeFinding", () => obs.graph!.mergeFinding(r));
+    },
+    recordCoverage: async (rows) => {
+      if (obs.graph) await safe("neo4j.mergeCoverage", () => obs.graph!.mergeCoverage(rows));
     },
     shutdown: async () => {
       await safe("langfuse.shutdown", () => tracing?.shutdown() ?? Promise.resolve());
